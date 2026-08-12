@@ -8,6 +8,9 @@ Cargo.lock.tmp
 /book
 /.idea
 
+# windows launcher: packaged output of windows/package-dist.ps1
+/dist
+
 # hwbridge: track source, vendored DLLs (see hwbridge/NOTICE.md), and notice; exclude build output
 /hwbridge/*
 !/hwbridge/*.cs

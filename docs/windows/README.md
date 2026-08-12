@@ -24,6 +24,11 @@ The binaries will be located in `.\target\release\`.
 Unlike Linux, no extra build dependencies (`libudev-dev` etc.) are required — the serial port and sysinfo crates
 use native Windows APIs.
 
+Note for `aster-launcher`: its `requireAdministrator` manifest is linked into every binary built from that crate,
+including the unit-test harness, so `cargo test -p aster-launcher` fails with "requires elevation" (os error 740)
+in a normal shell. Run it from an elevated shell, or prefix it with `__COMPAT_LAYER=RunAsInvoker` (PowerShell:
+`$env:__COMPAT_LAYER = "RunAsInvoker"`) to let the harness start without elevation.
+
 ### hwbridge
 
 `aster-sysinfo` can only read the sensors exposed by the [sysinfo](https://github.com/GuillaumeGomez/sysinfo) crate.
@@ -65,8 +70,19 @@ and `HwBridge.exe` as described above, assemble a self-contained folder:
 ```
 
 This creates `dist\` containing `aster-launcher.exe` and everything it needs: the other 2 Rust
-binaries (in `dist\bin\`), `hwbridge\`, `cfg\`, and a default `launcher.toml`. The `dist\` folder
-can be run in place or copied/zipped to another machine.
+binaries (in `dist\bin\`), `hwbridge\`, `cfg\`, `fonts\`, and a default `launcher.toml`. The
+`dist\` folder can be run in place or copied/zipped to another machine. Re-running the script
+keeps an existing `dist\launcher.toml` and `dist\logs\`, so your edits and logs survive a rebuild;
+quit a running `aster-launcher.exe` first, or the script will stop with an error.
+
+> **Security: put `dist\` somewhere only Administrators can write.**
+> `aster-launcher.exe` elevates once and its 3 children inherit that Administrator token, so
+> *every* file under `dist\` — the binaries in `bin\`, `hwbridge\*.exe`/`*.dll`, and the paths
+> named in `launcher.toml` — effectively runs with full Administrator rights. If `dist\` lives in
+> a user-writable location such as `Downloads\`, `Desktop\`, or anywhere under your profile, any
+> non-elevated process (or malware running as your user) can replace those files and get a free
+> elevation the next time you start the launcher. Install it under `C:\Program Files\` (or another
+> directory whose ACL grants write access only to Administrators) and keep it there.
 
 Double-click `dist\aster-launcher.exe` to start `aster-sysinfo`, `asterctl`, and `hwbridge` as
 hidden background processes — no console windows, no manually starting 3 separate tools.
@@ -79,5 +95,11 @@ Edit `dist\launcher.toml` to change the monitor config file name or the refresh 
 restart `aster-launcher.exe` to apply changes.
 
 Each process's own output goes to `dist\logs\aster-sysinfo.log`, `dist\logs\asterctl.log`, and
-`dist\logs\hwbridge.log`. If a process crashes while the launcher is running, it's automatically
-restarted and a marker line is appended to its log.
+`dist\logs\hwbridge.log`; these are truncated at every launcher start, so a log always covers just
+the current run. If a process crashes while the launcher is running, it's automatically restarted
+and a marker line is appended to its log. The launcher's own problems (e.g. it couldn't create the
+tray icon) go to `dist\logs\launcher.log` — it has no console window to print them to.
+
+Only one launcher can run at a time: it holds `dist\.launcher.lock` while running, and a second
+instance (an accidental double-click, say) notes that in `launcher.log` and exits without starting
+a duplicate set of children.
