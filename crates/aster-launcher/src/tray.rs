@@ -41,27 +41,16 @@ fn wait_for_quit(quit: &Arc<AtomicBool>) {
 pub fn run(handles: &[ChildHandle], quit: Arc<AtomicBool>) {
     let initial_label = status_label(handles);
 
-    // `IconSource::Resource(name)` is the only usable variant here. On
-    // Windows, `tray-item` 0.10.0's `IconSource` has just two variants:
-    // `Resource(&str)` (looks up a named icon resource embedded in *this*
-    // exe via `LoadImageW`) and `RawIcon(HICON)` (needs an already-built
-    // Win32 icon handle). Building a `HICON` from raw pixel bytes requires
-    // unsafe FFI (`CreateIconIndirect`/`CreateIcon`), which this crate has
-    // no safe wrapper for and which `main.rs`'s crate-level
-    // `#![deny(unsafe_code)]` forbids us from calling directly; the
-    // `IconSource::Data { .. }` variant that would otherwise take raw bytes
-    // is `#[cfg(any(target_os = "macos", ...))]` only and doesn't exist for
-    // Windows at all (confirmed by reading the crate's source directly,
-    // since docs.rs failed to build docs for this version). So there is no
-    // way to construct a tray icon from in-memory bytes on this platform
-    // without either unsafe code or a bundled `.ico` resource.
-    //
-    // No icon resource named "aster-launcher" is currently embedded (see
-    // `build.rs`, which only embeds the manifest) so this will realistically
-    // return `Err` until a future task adds one via
-    // `winresource::WindowsResource::set_icon(...)`. The `Err` arm below
-    // degrades gracefully (log + keep running without a tray) rather than
-    // panicking, so that gap doesn't take down child-process supervision.
+    // `build.rs` embeds `aster-launcher.ico` into this exe as a named icon
+    // resource via `res.set_icon_with_id("aster-launcher.ico",
+    // "aster-launcher")`, matching the resource name `LoadImageW` looks up
+    // here (Windows resource name lookup is case-insensitive, so the
+    // compiler-normalized `'ASTER-LAUNCHER'` resource name still matches
+    // this lowercase string). The `Err` arm below is still a real, live
+    // fallback path (not just a leftover from before the icon existed): a
+    // corrupted resource section or an icon load failure on some odd
+    // environment shouldn't take down child-process supervision, so this
+    // degrades to running without a tray rather than panicking.
     let mut tray = match TrayItem::new(&initial_label, IconSource::Resource("aster-launcher")) {
         Ok(tray) => tray,
         Err(err) => {
