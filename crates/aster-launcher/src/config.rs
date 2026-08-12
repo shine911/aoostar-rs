@@ -26,7 +26,13 @@ impl LauncherConfig {
     /// there is no valid state for the launcher to refuse to start in.
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_default(),
+            Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
+                crate::logging::append_line(
+                    &path.with_file_name("launcher.log"),
+                    &format!("launcher.toml is invalid, using defaults: {err}"),
+                );
+                Self::default()
+            }),
             Err(_) => Self::default(),
         }
     }
