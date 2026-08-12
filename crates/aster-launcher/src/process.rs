@@ -159,6 +159,19 @@ pub fn spawn_and_watch(
                     healthy.store(true, Ordering::SeqCst);
                     *current_child.lock().unwrap() = Some(child);
 
+                    // Re-check quit immediately after storing the child: if a
+                    // shutdown's kill attempt ran while spawn_child() was
+                    // doing I/O (before the child existed to be killed), it
+                    // would have no-op'd on a still-None current_child. This
+                    // re-check guarantees we self-kill instead of leaking an
+                    // orphaned hidden process.
+                    if quit.load(Ordering::SeqCst) {
+                        if let Some(child) = current_child.lock().unwrap().as_mut() {
+                            let _ = child.kill();
+                        }
+                        break;
+                    }
+
                     // Block until the child exits, without holding the lock
                     // (so a quit-triggered kill() from another thread can
                     // still reach it).
