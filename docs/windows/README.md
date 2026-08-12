@@ -55,14 +55,29 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /r:LibreHardware
 See [sensor-mapping.cfg](https://github.com/shine911/aoostar-rs/blob/main/cfg/sensor-mapping.cfg) for an example
 mapping between AOOSTAR-X panel sensor labels and the labels `aster-sysinfo`/`hwbridge` produce on Windows.
 
-## Running
+## Packaging and running
 
-`aster-sysinfo`, `asterctl`, and `hwbridge` are three separate long-running processes. Instead of starting each
-one by hand in its own terminal, run:
+After building `asterctl`, `aster-sysinfo`, and `aster-launcher` with `cargo build --release`,
+and `HwBridge.exe` as described above, assemble a self-contained folder:
 
 ```powershell
-.\windows\start-services.ps1
+.\windows\package-dist.ps1
 ```
 
-This launches all three in separate windows (`hwbridge`'s window is elevated, since it requires Administrator
-privileges). See `Get-Help .\windows\start-services.ps1 -Full` for parameters (config file name, refresh intervals).
+This creates `dist\` containing `aster-launcher.exe` and everything it needs: the other 2 Rust
+binaries (in `dist\bin\`), `hwbridge\`, `cfg\`, and a default `launcher.toml`. The `dist\` folder
+can be run in place or copied/zipped to another machine.
+
+Double-click `dist\aster-launcher.exe` to start `aster-sysinfo`, `asterctl`, and `hwbridge` as
+hidden background processes — no console windows, no manually starting 3 separate tools.
+Windows will show a single Administrator prompt (hwbridge needs it to read hardware sensors,
+and the other 2 inherit the same elevated process so nothing else needs its own prompt). A tray
+icon appears once running; right-click it to see status (running / degraded) or choose
+"Quit All" to stop everything.
+
+Edit `dist\launcher.toml` to change the monitor config file name or the refresh intervals, then
+restart `aster-launcher.exe` to apply changes.
+
+Each process's own output goes to `dist\logs\aster-sysinfo.log`, `dist\logs\asterctl.log`, and
+`dist\logs\hwbridge.log`. If a process crashes while the launcher is running, it's automatically
+restarted and a marker line is appended to its log.
