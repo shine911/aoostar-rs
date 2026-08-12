@@ -8,7 +8,7 @@ Check out the **[User Guide](https://zehnm.github.io/aoostar-rs)** for a list of
 
 ## Features
 
-- Control the AOOSTAR WTR MAX and GEM12+ PRO second screen from Linux.
+- Control the AOOSTAR WTR MAX and GEM12+ PRO second screen from Linux or Windows.
 - Switch the display on or off.
     - Also possible with standard [Linux shell commands](docs/shell_commands.md).
     - [Linux systemd Service](docs/linux/README.md) to automatically switch off the LCD at boot up.
@@ -16,6 +16,8 @@ Check out the **[User Guide](https://zehnm.github.io/aoostar-rs)** for a list of
 - Render dynamic sensor panels defined from the AOOSTAR-X software.
     - Update sensor values from simple text files.
     - Rotate through multiple panels in a defined interval.
+    - On Windows, [hwbridge](hwbridge/HwBridge.cs) supplements `aster-sysinfo` with CPU/GPU/motherboard/memory
+      temperatures and GPU load (via `LibreHardwareMonitorLib.dll`), data aster-sysinfo cannot read on Windows alone.
 - USB device/serial port selection.
 
 ## Disclaimer
