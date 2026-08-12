@@ -9,7 +9,7 @@
 2. Checkout project:
 
 ```shell
-git clone https://github.com/zehnm/aoostar-rs.git
+git clone https://github.com/shine911/aoostar-rs.git
 cd aoostar-rs
 ```
 
@@ -28,7 +28,7 @@ use native Windows APIs.
 
 `aster-sysinfo` can only read the sensors exposed by the [sysinfo](https://github.com/GuillaumeGomez/sysinfo) crate.
 On Windows, this does not include per-component temperatures, GPU load, or motherboard/memory sensors.
-[hwbridge](https://github.com/zehnm/aoostar-rs/blob/main/hwbridge/HwBridge.cs) is a small standalone tool that
+[hwbridge](https://github.com/shine911/aoostar-rs/blob/main/hwbridge/HwBridge.cs) is a small standalone tool that
 loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X itself uses, and writes those additional sensor values into
 a text file that `asterctl` picks up like any other sensor source (see
 [Text File Data Source](../sensor/provider/text_file.md)).
@@ -52,5 +52,5 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /r:LibreHardware
 3. Run `HwBridge.exe` **as Administrator** — required because the underlying `LibreHardwareMonitorLib`/PawnIO stack
    needs elevated access to read hardware registers, the same requirement AOOSTAR-X itself has.
 
-See [sensor-mapping.cfg](https://github.com/zehnm/aoostar-rs/blob/main/cfg/sensor-mapping.cfg) for an example
+See [sensor-mapping.cfg](https://github.com/shine911/aoostar-rs/blob/main/cfg/sensor-mapping.cfg) for an example
 mapping between AOOSTAR-X panel sensor labels and the labels `aster-sysinfo`/`hwbridge` produce on Windows.

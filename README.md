@@ -4,7 +4,7 @@ Reverse engineering the [AOOSTAR WTR MAX](https://aoostar.com/products/aoostar-w
 display protocol, with a proof-of-concept application written in Rust.  
 It has only been tested on the WTR MAX, but should also support the GEM12+ PRO device.
 
-Check out the **[User Guide](https://zehnm.github.io/aoostar-rs)** for a list of features and installation and usage information.
+Check out the **[User Guide](https://shine911.github.io/aoostar-rs)** for a list of features and installation and usage information.
 
 ## Features
 
@@ -38,8 +38,8 @@ Note: Multiple attempts to contact the manufacturer for documentation have recei
 
 With that out of the way, on to the fun stuff!
 
-- Browse the source code or read the [User Guide](https://zehnm.github.io/aoostar-rs)
-- See [releases](https://github.com/zehnm/aoostar-rs/releases) for binary Linux x64 releases. A Debian package for easy installation is planned for the future!
+- Browse the source code or read the [User Guide](https://shine911.github.io/aoostar-rs)
+- See [releases](https://github.com/shine911/aoostar-rs/releases) for binary Linux x64 releases. A Debian package for easy installation is planned for the future!
 
 ## Contributing
 
@@ -47,6 +47,12 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 
 Please note that this software is currently in its initial development and will have major changes until the mentioned
 goals above are reached!
+
+## Credits
+
+This is a fork of [zehnm/aoostar-rs](https://github.com/zehnm/aoostar-rs), the original project by
+[Markus Zehnder](https://github.com/zehnm) reverse-engineering the AOOSTAR display protocol. All credit for the
+original work goes to the upstream project; this fork adds Windows support on top of it.
 
 ## License
 

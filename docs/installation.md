@@ -7,7 +7,7 @@ for build steps and the additional `hwbridge` sensor tool.
 
 ## Pre-compiled binaries
 
-Executable binaries are available for download on the [GitHub Releases page](https://github.com/zehnm/aoostar-rs/releases).
+Executable binaries are available for download on the [GitHub Releases page](https://github.com/shine911/aoostar-rs/releases).
 Download the binary for your platform (only Linux available at the moment) and extract the archive.
 The archive contains the `asterctl` and `aster-sysinfo` executables which you can run.
 
@@ -31,7 +31,7 @@ sudo apt install build-essential git pkg-config libudev-dev
 2. Checkout project:
 
 ```shell
-git clone https://github.com/zehnm/aoostar-rs.git
+git clone https://github.com/shine911/aoostar-rs.git
 cd aoostar-rs
 ```
 
