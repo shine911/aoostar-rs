@@ -97,3 +97,109 @@ mod tests {
         }
     }
 }
+
+#[cfg(windows)]
+pub struct ChildHandle {
+    pub name: &'static str,
+    pub healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub current_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&spec.log_path)?;
+    let log_file_err = log_file.try_clone()?;
+
+    std::process::Command::new(&spec.exe_path)
+        .args(&spec.args)
+        .current_dir(&spec.base_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(log_file)
+        .stderr(log_file_err)
+        .spawn()
+}
+
+/// Spawns `spec` in a background thread that keeps it running: on
+/// unexpected exit it logs a restart marker and relaunches, until `quit`
+/// is set. Returns immediately with a handle to observe health / reach the
+/// current child for a forced kill.
+#[cfg(windows)]
+pub fn spawn_and_watch(
+    spec: ChildSpec,
+    quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ChildHandle {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let healthy = Arc::new(AtomicBool::new(false));
+    let current_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+
+    let handle = ChildHandle {
+        name: spec.name,
+        healthy: healthy.clone(),
+        current_child: current_child.clone(),
+    };
+
+    std::thread::spawn(move || {
+        loop {
+            if quit.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match spawn_child(&spec) {
+                Ok(child) => {
+                    healthy.store(true, Ordering::SeqCst);
+                    *current_child.lock().unwrap() = Some(child);
+
+                    // Block until the child exits, without holding the lock
+                    // (so a quit-triggered kill() from another thread can
+                    // still reach it).
+                    let status = loop {
+                        let mut guard = current_child.lock().unwrap();
+                        match guard.as_mut() {
+                            Some(child) => match child.try_wait() {
+                                Ok(Some(status)) => break Some(status),
+                                Ok(None) => {}
+                                Err(_) => break None,
+                            },
+                            None => break None,
+                        }
+                        drop(guard);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    };
+
+                    *current_child.lock().unwrap() = None;
+                    healthy.store(false, Ordering::SeqCst);
+
+                    if quit.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    crate::logging::append_line(
+                        &spec.log_path,
+                        &format!("--- {} exited ({status:?}), restarting ---", spec.name),
+                    );
+                }
+                Err(err) => {
+                    healthy.store(false, Ordering::SeqCst);
+                    crate::logging::append_line(
+                        &spec.log_path,
+                        &format!("failed to start {}: {err}", spec.name),
+                    );
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+
+    handle
+}
