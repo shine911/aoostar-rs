@@ -2,7 +2,8 @@
 
 There are multiple ways to install the `asterctl` CLI tool. Choose any one of the methods below that best suit your needs.
 
-Please note that only Linux has been tested so far.
+Please note that Linux has been tested most thoroughly; Windows support is newer, see [Windows](windows/README.md)
+for build steps and the additional `hwbridge` sensor tool.
 
 ## Pre-compiled binaries
 
