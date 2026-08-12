@@ -1,6 +1,6 @@
 # aster-sysinfo Tool
 
-The Rust based [aster-sysinfo](https://github.com/zehnm/aoostar-rs/blob/main/crates/sysinfo) tool gathers many more system sensor values with the help of
+The Rust based [aster-sysinfo](https://github.com/shine911/aoostar-rs/blob/main/crates/sysinfo) tool gathers many more system sensor values with the help of
 the [sysinfo](https://github.com/GuillaumeGomez/sysinfo) crate.
 
 It supports FreeBSD, Linux, macOS, Windows and other OSes, but it has only been tested on Linux so far.
