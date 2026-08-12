@@ -2,7 +2,7 @@
 
 ## Switch Off LCD on Boot
 
-The systemd unit [lcd-off.service](https://github.com/zehnm/aoostar-rs/blob/main/linux/lcd-off.service)
+The systemd unit [lcd-off.service](https://github.com/shine911/aoostar-rs/blob/main/linux/lcd-off.service)
 can be installed to automatically switch off the embedded LCD on boot.
 
 The unit file has been tailored to Debian-based Linux distros and has been tested on Proxmox 8.4 and Ubuntu 25.04.
@@ -130,7 +130,7 @@ _TODO_
 
 ‼️ Work in progress. This also requires the `asterctl` daemon running. 
 
-The systemd unit [aster-sysinfo.service](https://github.com/zehnm/aoostar-rs/blob/main/linux/aster-sysinfo.service)
+The systemd unit [aster-sysinfo.service](https://github.com/shine911/aoostar-rs/blob/main/linux/aster-sysinfo.service)
 can be installed to automatically collect system sensor information for `asterctl`.
 
 ### Install

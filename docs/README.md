@@ -36,7 +36,7 @@ The display remains on continuously (24×7) if the official software is not runn
 ## Development
 
 - [Reverse engineered LCD protocol](lcd_protocol.md)
-- [GitHub project](https://github.com/zehnm/aoostar-rs)
+- [GitHub project](https://github.com/shine911/aoostar-rs)
 
 ## Contributing
 
