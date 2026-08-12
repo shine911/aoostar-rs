@@ -54,3 +54,15 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /r:LibreHardware
 
 See [sensor-mapping.cfg](https://github.com/shine911/aoostar-rs/blob/main/cfg/sensor-mapping.cfg) for an example
 mapping between AOOSTAR-X panel sensor labels and the labels `aster-sysinfo`/`hwbridge` produce on Windows.
+
+## Running
+
+`aster-sysinfo`, `asterctl`, and `hwbridge` are three separate long-running processes. Instead of starting each
+one by hand in its own terminal, run:
+
+```powershell
+.\windows\start-services.ps1
+```
+
+This launches all three in separate windows (`hwbridge`'s window is elevated, since it requires Administrator
+privileges). See `Get-Help .\windows\start-services.ps1 -Full` for parameters (config file name, refresh intervals).
