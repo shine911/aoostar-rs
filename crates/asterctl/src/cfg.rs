@@ -130,8 +130,24 @@ pub struct MonitorConfig {
 
 impl MonitorConfig {
     pub fn get_next_active_panel(&mut self) -> Option<&Panel> {
+        // Wraparound must be based on how many panels are actually marked active
+        // ("mianban" entries > 0), not the total number of defined panels. AOOSTAR-X
+        // configs commonly define more panels (`diy`) than are actually enabled --
+        // e.g. 8 defined panels but only 1 active. Using `self.panels.len()` here
+        // meant the index kept climbing past the single active slot and never found
+        // a match again, so every panel switch after the first returned None and the
+        // whole run_sensor_panel loop aborted with "No active panel".
+        let active_count = self
+            .active_panels
+            .iter()
+            .filter(|&&active| active > 0)
+            .count();
+        if active_count == 0 {
+            return None;
+        }
+
         let mut active_panel_idx = self.active_panel_idx.unwrap_or(0) + 1;
-        if active_panel_idx > self.panels.len() {
+        if active_panel_idx > active_count {
             active_panel_idx = 1;
         }
 
