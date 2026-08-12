@@ -4,6 +4,8 @@
 mod config;
 mod logging;
 mod process;
+#[cfg(windows)]
+mod tray;
 
 fn main() {
     #[cfg(windows)]
