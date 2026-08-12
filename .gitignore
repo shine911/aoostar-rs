@@ -8,9 +8,11 @@ Cargo.lock.tmp
 /book
 /.idea
 
-# hwbridge: track source only, exclude compiled/vendored binaries
+# hwbridge: track source, vendored DLLs (see hwbridge/NOTICE.md), and notice; exclude build output
 /hwbridge/*
 !/hwbridge/*.cs
+!/hwbridge/*.dll
+!/hwbridge/NOTICE.md
 
 # private sensor value files
 /cfg/sensors/sysinfo.txt
