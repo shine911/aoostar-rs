@@ -26,9 +26,7 @@ impl LauncherConfig {
     /// there is no valid state for the launcher to refuse to start in.
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|_err| {
-                Self::default()
-            }),
+            Ok(text) => toml::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
@@ -63,7 +61,10 @@ mod tests {
         let cfg = LauncherConfig::load(file.path());
         assert_eq!(cfg.sysinfo_refresh, 9);
         assert_eq!(cfg.monitor_config, LauncherConfig::default().monitor_config);
-        assert_eq!(cfg.hwbridge_refresh, LauncherConfig::default().hwbridge_refresh);
+        assert_eq!(
+            cfg.hwbridge_refresh,
+            LauncherConfig::default().hwbridge_refresh
+        );
     }
 
     #[test]
