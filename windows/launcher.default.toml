@@ -1,0 +1,11 @@
+# aster-launcher configuration. Edit these values, then restart
+# aster-launcher.exe to apply them.
+
+# AOOSTAR-X panel config file passed to asterctl's --config option.
+monitor_config = "Monitor3.json"
+
+# aster-sysinfo refresh interval, in seconds.
+sysinfo_refresh = 2
+
+# hwbridge refresh interval, in seconds.
+hwbridge_refresh = 5
