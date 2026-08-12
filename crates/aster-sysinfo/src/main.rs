@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
 use std::io::{BufWriter, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
@@ -136,18 +137,22 @@ fn write_sensor_file(
         exit(1);
     }
 
-    // make sure our sensor file can be read by everyone
-    let all_read_perm = fs::Permissions::from_mode(0o664);
+    // make sure our sensor file can be read by everyone (POSIX only -- Windows
+    // uses a different, ACL-based permission model, so there's nothing
+    // equivalent to set here; the file is already readable by the user that
+    // created it, which is sufficient for a single-user Windows setup)
+    let mut builder = Builder::new();
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o664));
+
     let tmp_file = if let Some(temp_path) = temp_dir {
         fs::create_dir_all(temp_path)?;
 
         debug!("Creating a new named temp file in {temp_path:?}");
-        Builder::new()
-            .permissions(all_read_perm)
-            .tempfile_in(temp_path)?
+        builder.tempfile_in(temp_path)?
     } else {
         debug!("Creating a new named temp file");
-        Builder::new().permissions(all_read_perm).tempfile()?
+        builder.tempfile()?
     };
 
     debug!("Writing sensor temp file...");
@@ -409,8 +414,13 @@ impl SysinfoSource {
         // Network interfaces name, total data received and total data transmitted:
         for (interface_name, data) in &self.networks {
             // only consider specific interfaces
+            // NOTE: the original prefix list ("eth", "en", "em", "wlan", "wlp", "wlo") only
+            // matches Linux/BSD interface names (e.g. eth0, wlan0, wlp2s0). On Windows the
+            // sysinfo crate reports the adapter's friendly name instead (e.g. "Ethernet",
+            // "Wi-Fi"), so "Wi-Fi" never matched any prefix and was silently dropped --
+            // added "wi-fi"/"wifi"/"wireless" to also cover Windows Wi-Fi adapters.
             let if_name = interface_name.to_lowercase();
-            if !["eth", "en", "em", "wlan", "wlp", "wlo"]
+            if !["eth", "en", "em", "wlan", "wlp", "wlo", "wi-fi", "wifi", "wireless"]
                 .iter()
                 .any(|i| if_name.starts_with(*i))
             {
