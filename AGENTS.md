@@ -44,8 +44,8 @@ on Windows a small C# bridge (`hwbridge`) fills in sensors `aster-sysinfo` canno
   `MemoryMappedFile.CreateOrOpen`); POSIX shm backend used by unit tests. The only unsafe code lives here
   (binaries keep `#![deny(unsafe_code)]`).
 - `crates/aster-sysinfo` — `SysinfoSource` (sysinfo crate: cpu/mem/swap/disks/net/temps) + Linux-only
-  per-disk storage/`smartctl` sensors. Writes `label: value` text file atomically (a later milestone moves
-  it to the shared-memory SysInfo slot).
+  per-disk storage/`smartctl` sensors. Writes `label: value` text file atomically, or with `--shm`
+  into the shared-memory SysInfo slot (the launcher's Windows default).
 - `crates/asterctl` — LCD display: parses AOOSTAR-X `Monitor*.json` panels, renders, rotates, reads sensor
   values from text files and (with `--shm`) from the shared-memory region, speaks the serial protocol (`asterctl-lcd`).
 - `hwbridge/HwBridge.cs` — loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X uses, writes

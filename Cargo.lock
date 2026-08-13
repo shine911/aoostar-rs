@@ -163,6 +163,7 @@ dependencies = [
 name = "aster-sysinfo"
 version = "0.2.0"
 dependencies = [
+ "aster-hwstats",
  "clap",
  "env_logger",
  "itertools 0.14.0",

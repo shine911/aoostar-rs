@@ -23,10 +23,7 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
             base_dir: base_dir.to_path_buf(),
             exe_path: base_dir.join("bin").join("aster-sysinfo.exe"),
             args: vec![
-                "--out".to_string(),
-                "cfg\\sensors\\sysinfo.txt".to_string(),
-                "--temp-dir".to_string(),
-                "cfg\\sensors".to_string(),
+                "--shm".to_string(),
                 "--refresh".to_string(),
                 cfg.sysinfo_refresh_effective().to_string(),
             ],
@@ -322,7 +319,14 @@ mod tests {
             base_dir.join("bin").join("aster-sysinfo.exe")
         );
         // the shared refresh_time wins over the legacy per-process keys
-        assert_eq!(specs[0].args.last().unwrap(), "10");
+        assert_eq!(
+            specs[0].args,
+            vec![
+                "--shm".to_string(),
+                "--refresh".to_string(),
+                "10".to_string()
+            ]
+        );
         assert_eq!(
             specs[0].log_path,
             base_dir.join("logs").join("aster-sysinfo.log")
