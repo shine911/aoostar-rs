@@ -69,7 +69,10 @@ Reverse-engineered from the installed `C:\Program Files (x86)\AOOSTAR-X`
 - New method `MonitorConfig::apply_theme(&mut self, theme: i32)`: computes
   the panels; if all referenced panels exist in `self.panels`, replaces
   `active_panels`; otherwise keeps the config's own `mianban` and logs a
-  warning (guards configs with fewer than 8 panels).
+  warning (guards configs with fewer than 8 panels). Also keeps `mianban`
+  with a warning when the theme would select no panels at all (both
+  `controlParams` and `controlDiskTemp` off/absent) — an empty panel set
+  would otherwise make `run_sensor_panel` abort with "No active panel".
 
 `main.rs`:
 
