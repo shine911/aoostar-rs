@@ -80,6 +80,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 struct PowerState {
     suspended: Arc<AtomicBool>,
     handles: Arc<Vec<ChildHandle>>,
+    restart_uart_on_resume: bool,
     log_path: PathBuf,
 }
 
@@ -102,6 +103,7 @@ thread_local! {
 pub(crate) fn start(
     suspended: Arc<AtomicBool>,
     handles: Arc<Vec<ChildHandle>>,
+    restart_uart_on_resume: bool,
     log_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -118,6 +120,7 @@ pub(crate) fn start(
             *slot.borrow_mut() = Some(PowerState {
                 suspended,
                 handles,
+                restart_uart_on_resume,
                 log_path,
             });
         });
@@ -207,12 +210,41 @@ fn handle_power_event(state: &PowerState, wparam: usize) {
             crate::process::kill_all(&state.handles);
         }
         PowerEvent::Resume => {
+            // Only the first Resume after a Suspend may act: Windows can
+            // send several Resume wParams for one wake (e.g. 7 then 18),
+            // and a second pass would disable the UART while asterctl
+            // already has the COM port open again. The swap also records
+            // the Suspend→Resume transition.
+            if !state.suspended.swap(false, Ordering::SeqCst) {
+                crate::logging::append_line(
+                    &state.log_path,
+                    "power: resume already handled, ignoring",
+                );
+                return;
+            }
             crate::logging::append_line(
                 &state.log_path,
                 "power: wake detected, waiting for USB stack",
             );
             std::thread::sleep(std::time::Duration::from_secs(RESUME_SETTLE_SECS));
-            state.suspended.store(false, Ordering::SeqCst);
+            if state.restart_uart_on_resume {
+                crate::logging::append_line(
+                    &state.log_path,
+                    "power: restarting AOOSTAR USB UART (disable/enable)",
+                );
+                match crate::device::restart_uart(
+                    crate::device::AOOSTAR_UART_VID,
+                    crate::device::AOOSTAR_UART_PID,
+                ) {
+                    Ok(()) => {
+                        crate::logging::append_line(&state.log_path, "power: USB UART restarted")
+                    }
+                    Err(e) => crate::logging::append_line(
+                        &state.log_path,
+                        &format!("power: USB UART restart failed: {e:?}"),
+                    ),
+                }
+            }
             crate::logging::append_line(&state.log_path, "power: resuming children");
         }
         PowerEvent::Other => {}

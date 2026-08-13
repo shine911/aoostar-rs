@@ -5,6 +5,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod config;
+mod device;
 mod logging;
 mod power;
 mod process;
@@ -115,9 +116,9 @@ fn windows_main() {
     let _power_thread = power::start(
         suspended.clone(),
         Arc::new(handles.clone()),
+        cfg.restart_uart_on_resume,
         launcher_log.clone(),
     );
-    // The restart_uart_on_resume flag arrives in Task 2.
 
     tray::run(&handles, quit.clone(), &launcher_log);
 

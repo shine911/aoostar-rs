@@ -277,6 +277,7 @@ mod tests {
             monitor_config: "Custom.json".to_string(),
             sysinfo_refresh: 7,
             hwbridge_refresh: 11,
+            restart_uart_on_resume: true,
         };
 
         let specs = child_specs(base_dir, &cfg);

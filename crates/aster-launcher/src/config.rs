@@ -9,6 +9,11 @@ pub struct LauncherConfig {
     pub monitor_config: String,
     pub sysinfo_refresh: u16,
     pub hwbridge_refresh: u16,
+    /// On wake from sleep, disable + re-enable the AOOSTAR USB UART (force
+    /// re-enumeration) before respawning children — the automated version of
+    /// the manual Device Manager fix. Set false if Task 1's fresh-open is
+    /// already sufficient on your hardware.
+    pub restart_uart_on_resume: bool,
 }
 
 impl Default for LauncherConfig {
@@ -17,6 +22,7 @@ impl Default for LauncherConfig {
             monitor_config: "Monitor3.json".to_string(),
             sysinfo_refresh: 2,
             hwbridge_refresh: 5,
+            restart_uart_on_resume: true,
         }
     }
 }
@@ -79,5 +85,19 @@ mod tests {
     fn malformed_file_returns_defaults() {
         let file = write_temp("sysinfo_refresh = \"not a number\"\n");
         assert_eq!(LauncherConfig::load(file.path()), LauncherConfig::default());
+    }
+
+    #[test]
+    fn partial_file_defaults_restart_uart_on_resume() {
+        let file = write_temp("sysinfo_refresh = 9\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert!(cfg.restart_uart_on_resume);
+    }
+
+    #[test]
+    fn restart_uart_can_be_disabled_in_config() {
+        let file = write_temp("restart_uart_on_resume = false\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert!(!cfg.restart_uart_on_resume);
     }
 }
