@@ -10,6 +10,8 @@
 
 **Spec:** `docs/reasonix/specs/2026-08-13-themes-menu-design.md`
 
+**Environment notes (WSL):** all cargo test/check commands run in the Debian docker container; asterctl builds need `pkg-config libudev-dev` in the container's apt install line (added to the commands below). If `git add`/`git commit` fails with `.git/index.lock` errors (read-only `/mnt/c` mount for new files), fall back to Windows Git: `GITEXE="/mnt/c/Users/huynh/scoop/apps/git/current/cmd/git.exe" && "$GITEXE" -c safe.directory='*' -c commit.gpgSign=false -C "C:/Users/huynh/aoostar-rs" commit -m "<msg>"`. `crates/aster-launcher/src/tray.rs:210` has a pre-existing rustfmt diff (multi-line `append_line` call) — Task 7 must run rustfmt on tray.rs so the repo ends fmt-clean.
+
 ---
 
 ## File Structure
@@ -76,8 +78,8 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl active_panels"`
-Expected: FAIL with `error[E0425]: cannot find function active_panels_for_theme in this scope`.
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl theme_maps_panels"`
+Expected: FAIL with `error[E0425]: cannot find function active_panels_for_theme in this scope`. (Note: asterctl builds libudev-sys, so the container needs `pkg-config libudev-dev`.)
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -111,7 +113,7 @@ pub fn active_panels_for_theme(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl active_panels"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl theme_maps_panels"`
 Expected: PASS (16 assertions).
 
 - [ ] **Step 5: Commit**
