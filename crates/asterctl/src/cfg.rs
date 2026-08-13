@@ -142,6 +142,7 @@ pub fn active_panels_for_theme(
     control_params: bool,
     control_disk_temp: bool,
 ) -> Vec<u32> {
+    debug_assert!((0..=3).contains(&theme), "theme index out of range: {theme}");
     let first = (1 + 2 * theme) as u32;
     let second = first + 1;
     match (control_params, control_disk_temp) {
@@ -200,7 +201,8 @@ impl MonitorConfig {
     ///
     /// Keeps the config's own `mianban` unchanged (with a logged warning)
     /// when the theme is out of range or the config does not define all
-    /// referenced panels.
+    /// referenced panels, or when the theme would select no panels (both
+    /// flags off).
     pub fn apply_theme(&mut self, theme: i32) {
         if !(0..=3).contains(&theme) {
             warn!("Invalid theme {theme}, expected 0-3; keeping the configured active panels");
@@ -211,6 +213,12 @@ impl MonitorConfig {
             self.setup.control_params.unwrap_or(false),
             self.setup.control_disk_temp.unwrap_or(false),
         );
+        if panels.is_empty() {
+            warn!(
+                "Theme {theme} selects no panels (controlParams and controlDiskTemp both off); keeping the configured active panels"
+            );
+            return;
+        }
         if panels.iter().all(|&p| (p as usize) <= self.panels.len()) {
             self.active_panels = panels;
         } else {
@@ -769,6 +777,33 @@ mod tests {
     fn apply_theme_keeps_mianban_for_out_of_range_theme() {
         let mut cfg = config_with_panels(8, None, true, true);
         cfg.apply_theme(7);
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
+
+    #[test]
+    fn apply_theme_keeps_mianban_when_no_panel_flags() {
+        let mut cfg = config_with_panels(8, Some(1), false, false);
+        cfg.apply_theme(1);
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
+
+    #[test]
+    fn apply_theme_defaults_missing_flags_to_off() {
+        // no controlParams/controlDiskTemp keys in the JSON at all
+        let panels: Vec<String> = (1..=8)
+            .map(|i| {
+                format!(
+                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": -1, "pic": "", "x": 10, "y": 10}}]}}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"setup": {{"refresh": 1, "theme": 2}}, "mianban": [1], "diy": [{}]}}"#,
+            panels.join(",")
+        );
+        let mut cfg: MonitorConfig = serde_json::from_str(&json).unwrap();
+        cfg.apply_theme(2);
+        // both flags default to false -> empty set -> keep mianban
         assert_eq!(cfg.active_panels, vec![1]);
     }
 }
