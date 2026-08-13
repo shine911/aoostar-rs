@@ -6,6 +6,7 @@
 
 mod config;
 mod logging;
+mod power;
 mod process;
 #[cfg(windows)]
 mod tray;
@@ -100,13 +101,23 @@ fn windows_main() {
     let specs = process::child_specs(&base_dir, &cfg);
 
     let quit = Arc::new(AtomicBool::new(false));
+    let suspended = Arc::new(AtomicBool::new(false));
     let mut handles: Vec<process::ChildHandle> = Vec::with_capacity(specs.len());
     let mut watchers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
     for spec in specs {
-        let (handle, watcher) = process::spawn_and_watch(spec, quit.clone());
+        let (handle, watcher) = process::spawn_and_watch(spec, quit.clone(), suspended.clone());
         handles.push(handle);
         watchers.push(watcher);
     }
+
+    // Power monitor: kills children on sleep, respawns them after wake.
+    // The thread is a daemon (see `power::start`) and is never joined.
+    let _power_thread = power::start(
+        suspended.clone(),
+        Arc::new(handles.clone()),
+        launcher_log.clone(),
+    );
+    // The restart_uart_on_resume flag arrives in Task 2.
 
     tray::run(&handles, quit.clone(), &launcher_log);
 
@@ -115,13 +126,7 @@ fn windows_main() {
     // thread stops trying to restart, then force-kill whichever child is
     // currently running.
     quit.store(true, Ordering::SeqCst);
-    for handle in &handles {
-        if let Ok(mut guard) = handle.current_child.lock()
-            && let Some(child) = guard.as_mut()
-        {
-            let _ = child.kill();
-        }
-    }
+    process::kill_all(&handles);
 
     // Then wait for each watcher thread to actually observe `quit` and exit.
     // Without this, `main` could return — tearing the process down — while a
