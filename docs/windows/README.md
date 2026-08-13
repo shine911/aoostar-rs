@@ -88,8 +88,9 @@ Double-click `dist\aster-launcher.exe` to start `aster-sysinfo`, `asterctl`, and
 hidden background processes — no console windows, no manually starting 3 separate tools.
 Windows will show a single Administrator prompt (hwbridge needs it to read hardware sensors,
 and the other 2 inherit the same elevated process so nothing else needs its own prompt). A tray
-icon appears once running; right-click it to see status (running / degraded) or choose
-"Quit All" to stop everything.
+icon appears once running; right-click it to see status (running / degraded), pick a refresh
+interval from the `Refresh time` sub-menu, or choose "Quit" at the bottom of the menu to stop
+everything.
 
 Edit `dist\launcher.toml` to change the monitor config file name or the sensor refresh interval, then
 restart `aster-launcher.exe` to apply changes. `refresh_time` sets the refresh interval in seconds for

@@ -73,9 +73,9 @@ fn apply_refresh(
     current.store(secs, Ordering::SeqCst);
 }
 
-/// Shows the tray icon (status label, "Refresh time" sub-menu, "Quit All"
+/// Shows the tray icon (status label, "Refresh time" sub-menu, "Quit"
 /// item) and blocks, refreshing the status label and the hover tooltip every
-/// 2 seconds, until `quit` becomes `true` — either because "Quit All" was
+/// 2 seconds, until `quit` becomes `true` — either because "Quit" was
 /// clicked (this function wires that up itself) or because the caller set it
 /// for another reason.
 ///
@@ -147,18 +147,6 @@ pub fn run(
         }
     };
 
-    {
-        let quit_for_menu = quit.clone();
-        if let Err(err) = tray.add_menu_item("Quit All", move || {
-            quit_for_menu.store(true, Ordering::SeqCst);
-        }) {
-            crate::logging::append_line(
-                log_path,
-                &format!("failed to add tray Quit All item: {err}"),
-            );
-        }
-    }
-
     // "Refresh time" sub-menu: picking an interval persists it to
     // launcher.toml and restarts aster-sysinfo + hwbridge so it applies
     // immediately. The active interval carries a native check mark.
@@ -213,6 +201,20 @@ pub fn run(
             log_path,
             &format!("failed to add tray Refresh time submenu: {err}"),
         ),
+    }
+
+    // "Quit" item at the bottom of the menu: stops all children and exits
+    // the launcher (each child watcher observes `quit` and shuts down).
+    {
+        let quit_for_menu = quit.clone();
+        if let Err(err) = tray.add_menu_item("Quit", move || {
+            quit_for_menu.store(true, Ordering::SeqCst);
+        }) {
+            crate::logging::append_line(
+                log_path,
+                &format!("failed to add tray Quit item: {err}"),
+            );
+        }
     }
 
     let mut last_label = initial_label;

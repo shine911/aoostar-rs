@@ -138,7 +138,7 @@ fn windows_main() {
         &cfg,
     );
 
-    // tray::run returned because quit was set (Quit All clicked) or because
+    // tray::run returned because quit was set (Quit clicked) or because
     // the tray icon could not be created at all — make sure every watcher
     // thread stops trying to restart, then force-kill whichever child is
     // currently running.
