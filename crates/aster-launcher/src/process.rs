@@ -406,4 +406,31 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn refresh_and_theme_flow_through_together() {
+        let base_dir = Path::new("C:\\dist");
+        let cfg = LauncherConfig {
+            monitor_config: "Monitor3.json".to_string(),
+            refresh_time: Some(10),
+            sysinfo_refresh: None,
+            hwbridge_refresh: None,
+            restart_uart_on_resume: true,
+            theme: Some(2),
+        };
+
+        let specs = child_specs(base_dir, &cfg);
+
+        assert_eq!(specs[0].args.last().unwrap(), "10");
+        assert_eq!(
+            specs[1].args,
+            vec![
+                "--config".to_string(),
+                "Monitor3.json".to_string(),
+                "--shm".to_string(),
+                "--theme".to_string(),
+                "2".to_string()
+            ]
+        );
+    }
 }

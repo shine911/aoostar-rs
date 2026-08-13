@@ -139,7 +139,6 @@ fn windows_main() {
         &launcher_log,
         &config_path,
         &base_dir,
-        &cfg,
     );
 
     // tray::run returned because quit was set (Quit clicked) or because
