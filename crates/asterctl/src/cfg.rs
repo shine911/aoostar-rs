@@ -128,6 +128,30 @@ pub struct MonitorConfig {
     pub sensor_filter: Option<Vec<Regex>>,
 }
 
+/// Maps a theme index (0-3) plus the two panel-type flags to the 1-based
+/// active panel indices, mirroring the official AOOSTAR-X save-config logic:
+///
+/// | theme | both flags     | controlParams only | controlDiskTemp only | neither |
+/// |-------|----------------|--------------------|----------------------|---------|
+/// | 0     | [1, 2]         | [1]                | [2]                  | []      |
+/// | 1     | [3, 4]         | [3]                | [4]                  | []      |
+/// | 2     | [5, 6]         | [5]                | [6]                  | []      |
+/// | 3     | [7, 8]         | [7]                | [8]                  | []      |
+pub fn active_panels_for_theme(
+    theme: i32,
+    control_params: bool,
+    control_disk_temp: bool,
+) -> Vec<u32> {
+    let first = (1 + 2 * theme) as u32;
+    let second = first + 1;
+    match (control_params, control_disk_temp) {
+        (true, true) => vec![first, second],
+        (true, false) => vec![first],
+        (false, true) => vec![second],
+        (false, false) => vec![],
+    }
+}
+
 impl MonitorConfig {
     pub fn get_next_active_panel(&mut self) -> Option<&Panel> {
         // Wraparound must be based on how many panels are actually marked active
@@ -636,4 +660,39 @@ where
 {
     let rounded = f32::deserialize(deserializer).map(f32::round)?;
     Ok(rounded as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_maps_panels_exactly_like_official_software() {
+        // (theme, controlParams, controlDiskTemp) -> expected active panels
+        let cases: &[(i32, bool, bool, &[u32])] = &[
+            (0, true, true, &[1, 2]),
+            (0, true, false, &[1]),
+            (0, false, true, &[2]),
+            (0, false, false, &[]),
+            (1, true, true, &[3, 4]),
+            (1, true, false, &[3]),
+            (1, false, true, &[4]),
+            (1, false, false, &[]),
+            (2, true, true, &[5, 6]),
+            (2, true, false, &[5]),
+            (2, false, true, &[6]),
+            (2, false, false, &[]),
+            (3, true, true, &[7, 8]),
+            (3, true, false, &[7]),
+            (3, false, true, &[8]),
+            (3, false, false, &[]),
+        ];
+        for (theme, params, disk, expected) in cases {
+            assert_eq!(
+                active_panels_for_theme(*theme, *params, *disk),
+                *expected,
+                "theme={theme} controlParams={params} controlDiskTemp={disk}"
+            );
+        }
+    }
 }
