@@ -73,8 +73,53 @@ fn apply_refresh(
     current.store(secs, Ordering::SeqCst);
 }
 
+/// Tray "Themes" click handler: persists `theme` to `launcher.toml`,
+/// rebuilds the child specs with the new theme, and restarts asterctl so it
+/// applies immediately (its watcher reads the specs fresh on every spawn).
+/// `current` is updated so the tray menu can move the check mark.
+#[cfg(windows)]
+fn apply_theme(
+    theme: u16,
+    config_path: &Path,
+    base_dir: &Path,
+    cfg: &LauncherConfig,
+    specs: &Mutex<[ChildSpec; 3]>,
+    handles: &[ChildHandle],
+    log_path: &Path,
+    current: &AtomicU16,
+) {
+    // 1. persist the choice so it survives a launcher restart
+    if let Err(err) = crate::config::set_theme(config_path, theme) {
+        crate::logging::append_line(
+            log_path,
+            &format!(
+                "failed to write theme={theme} to {}: {err}",
+                config_path.display()
+            ),
+        );
+        return;
+    }
+    crate::logging::append_line(
+        log_path,
+        &format!("tray: theme set to {theme}; restarting asterctl"),
+    );
+
+    // 2. rebuild the specs with the new theme
+    let mut new_cfg = cfg.clone();
+    new_cfg.theme = Some(theme);
+    if let Ok(mut guard) = specs.lock() {
+        *guard = crate::process::child_specs(base_dir, &new_cfg);
+    }
+
+    // 3. kill asterctl; its watcher respawns it with the updated args
+    crate::process::kill_named(handles, &["asterctl"]);
+
+    current.store(theme, Ordering::SeqCst);
+}
+
 /// Shows the tray icon (status label, "Refresh time" sub-menu, "Quit"
-/// item) and blocks, refreshing the status label and the hover tooltip every
+/// item; plus a "Themes" sub-menu that switches the LCD theme) and blocks,
+/// refreshing the status label and the hover tooltip every
 /// 2 seconds, until `quit` becomes `true` — either because "Quit" was
 /// clicked (this function wires that up itself) or because the caller set it
 /// for another reason.
@@ -96,6 +141,7 @@ pub fn run(
     handles: &[ChildHandle],
     specs: Arc<Mutex<[ChildSpec; 3]>>,
     current_refresh: Arc<AtomicU16>,
+    current_theme: Arc<AtomicU16>,
     quit: Arc<AtomicBool>,
     log_path: &Path,
     config_path: &Path,
@@ -203,6 +249,65 @@ pub fn run(
         ),
     }
 
+    // "Themes" sub-menu: picking a theme persists it to launcher.toml and
+    // restarts asterctl so it applies immediately (the watcher respawns it
+    // with the new `--theme` argument). The active theme carries a check mark.
+    let active_theme = current_theme.load(Ordering::SeqCst);
+    let mut theme_submenu: Option<u32> = None;
+    let mut theme_ids = [0u32; crate::config::THEME_OPTIONS.len()];
+    match tray.inner_mut().add_submenu("Themes") {
+        Ok(sub) => {
+            theme_submenu = Some(sub);
+            for (i, (idx, label)) in crate::config::THEME_OPTIONS.iter().enumerate() {
+                let idx = *idx;
+                let config_path = config_path.to_path_buf();
+                let base_dir = base_dir.to_path_buf();
+                let cfg = cfg.clone();
+                let specs = specs.clone();
+                let handles = handles.to_vec();
+                let log_path = log_path.to_path_buf();
+                // separate clone for the error arm below (the original is
+                // moved into the menu closure)
+                let log_path_err = log_path.clone();
+                let current = current_theme.clone();
+                let label = label.to_string();
+                match tray
+                    .inner_mut()
+                    .add_submenu_item_with_id(sub, &label, move || {
+                        apply_theme(
+                            idx,
+                            &config_path,
+                            &base_dir,
+                            &cfg,
+                            &specs,
+                            &handles,
+                            &log_path,
+                            &current,
+                        );
+                    }) {
+                    Ok(id) => theme_ids[i] = id,
+                    Err(err) => crate::logging::append_line(
+                        &log_path_err,
+                        &format!("failed to add tray theme menu item ({label}): {err}"),
+                    ),
+                }
+            }
+            // Check the currently active theme.
+            if let Some(pos) = crate::config::THEME_OPTIONS
+                .iter()
+                .position(|&(idx, _)| idx == active_theme)
+            {
+                let _ = tray
+                    .inner_mut()
+                    .set_submenu_item_checked(sub, theme_ids[pos], true);
+            }
+        }
+        Err(err) => crate::logging::append_line(
+            log_path,
+            &format!("failed to add tray Themes submenu: {err}"),
+        ),
+    }
+
     // "Quit" item at the bottom of the menu: stops all children and exits
     // the launcher (each child watcher observes `quit` and shuts down).
     {
@@ -210,15 +315,13 @@ pub fn run(
         if let Err(err) = tray.add_menu_item("Quit", move || {
             quit_for_menu.store(true, Ordering::SeqCst);
         }) {
-            crate::logging::append_line(
-                log_path,
-                &format!("failed to add tray Quit item: {err}"),
-            );
+            crate::logging::append_line(log_path, &format!("failed to add tray Quit item: {err}"));
         }
     }
 
     let mut last_label = initial_label;
     let mut last_refresh = active_refresh;
+    let mut last_theme = active_theme;
     while !quit.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(2));
 
@@ -244,6 +347,30 @@ pub fn run(
                 }
             }
             last_refresh = refresh;
+        }
+
+        // Move the check mark when the theme changed (e.g. the user picked a
+        // different one from the "Themes" submenu).
+        let theme = current_theme.load(Ordering::SeqCst);
+        if theme != last_theme {
+            if let Some(sub) = theme_submenu {
+                for (i, id) in theme_ids.iter().enumerate() {
+                    if *id != 0
+                        && let Err(err) = tray.inner_mut().set_submenu_item_checked(
+                            sub,
+                            *id,
+                            crate::config::THEME_OPTIONS[i].0 == theme,
+                        )
+                    {
+                        crate::logging::append_line(
+                            log_path,
+                            &format!("failed to update theme menu check mark: {err}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            last_theme = theme;
         }
 
         let label = status_label(handles);
