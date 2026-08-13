@@ -78,7 +78,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl theme_maps_panels"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl theme_maps_panels"`
 Expected: FAIL with `error[E0425]: cannot find function active_panels_for_theme in this scope`. (Note: asterctl builds libudev-sys, so the container needs `pkg-config libudev-dev`.)
 
 - [ ] **Step 3: Write minimal implementation**
@@ -113,7 +113,7 @@ pub fn active_panels_for_theme(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl theme_maps_panels"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl theme_maps_panels"`
 Expected: PASS (16 assertions).
 
 - [ ] **Step 5: Commit**
@@ -187,7 +187,7 @@ Inside the `mod tests` block added in Task 1, add this helper plus tests:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl apply_theme"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl apply_theme"`
 Expected: FAIL with `error[E0599]: no method named apply_theme found for struct MonitorConfig` (and `error[E0609]: no field theme on type Setup`).
 
 - [ ] **Step 3: Implement**
@@ -253,7 +253,7 @@ Then add this method to `impl MonitorConfig` (next to `get_next_active_panel`):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl"`
 Expected: PASS (all asterctl tests, including the Task 1 ones).
 
 - [ ] **Step 5: Commit**
@@ -353,7 +353,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl cli_theme_overrides_json_theme"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl cli_theme_overrides_json_theme"`
 Expected: FAIL with `error[E0061]: this function takes 4 arguments but 5 were supplied` for `load_configuration`.
 
 - [ ] **Step 3: Implement**
@@ -411,7 +411,7 @@ fn load_configuration<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl"`
 Expected: PASS (3 new tests + all previous).
 
 - [ ] **Step 5: Commit**
@@ -476,7 +476,7 @@ Inside the existing `mod tests` in `crates/aster-launcher/src/config.rs`, add:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher set_theme"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher set_theme"`
 Expected: FAIL with `error[E0425]: cannot find function set_theme in this scope` / `error[E0609]: no field theme on type LauncherConfig`.
 
 - [ ] **Step 3: Implement**
@@ -605,7 +605,7 @@ pub fn set_theme(path: &Path, theme: u16) -> std::io::Result<()> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher"`
 Expected: PASS (all config tests incl. the existing `set_refresh_time_*` ones, which now go through `set_toml_value`).
 
 - [ ] **Step 5: Commit**
@@ -656,7 +656,7 @@ Inside the existing `mod tests` in `crates/aster-launcher/src/process.rs`, add:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher theme_flag_flows_through_to_asterctl_args"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher theme_flag_flows_through_to_asterctl_args"`
 Expected: FAIL to compile — `error[E0063]: missing field theme in initializer of LauncherConfig` (both this test and the two existing literal constructions in `builds_specs_relative_to_base_dir_using_config_values` / `legacy_refresh_values_flow_through_when_no_shared_refresh_time`).
 
 - [ ] **Step 3: Implement**
@@ -690,7 +690,7 @@ In `crates/aster-launcher/src/process.rs`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p aster-launcher"`
 Expected: PASS. The existing `builds_specs_relative_to_base_dir_using_config_values` still asserts asterctl args WITHOUT `--theme` (its literal has `theme: None`).
 
 - [ ] **Step 5: Commit**
@@ -737,7 +737,7 @@ In `crates/aster-launcher/src/main.rs`:
 
 - [ ] **Step 2: Verify it still compiles (cross-platform test)**
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo check -p aster-launcher"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo check -p aster-launcher"`
 Expected: PASS — but note this only type-checks the non-Windows path; the Windows `tray::run` signature change is checked in Task 7.
 
 - [ ] **Step 3: Commit**
@@ -1023,7 +1023,7 @@ Expected: PASS for `aster-launcher` and `aster-sysinfo`.
 Then run the asterctl tests in the container (the script's `test` action does
 not cover asterctl):
 
-Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl"`
+Run: `docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target debian:bookworm-slim bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq gcc curl pkg-config libudev-dev >/dev/null 2>&1 && curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97 >/dev/null 2>&1 && export PATH=\$HOME/.cargo/bin:\$PATH && cd /work && cargo test -p asterctl"`
 Expected: PASS (theme mapping, apply_theme, and CLI precedence tests).
 
 - [ ] **Step 3: Windows type-check**
