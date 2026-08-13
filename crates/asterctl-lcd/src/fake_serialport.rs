@@ -12,6 +12,8 @@ pub struct FakeSerialPort {
     parity: Parity,
     stop_bits: StopBits,
     timeout: Duration,
+    /// Number of upcoming writes that will fail (test injection).
+    fail_writes: u32,
 }
 
 impl Default for FakeSerialPort {
@@ -29,7 +31,15 @@ impl FakeSerialPort {
             parity: Parity::None,
             stop_bits: StopBits::One,
             timeout: Default::default(),
+            fail_writes: 0,
         }
+    }
+
+    /// Simulates a wedged serial port: the next `fail_writes` writes fail
+    /// with a broken-pipe error, then the port behaves normally again.
+    pub fn with_failures(mut self, fail_writes: u32) -> FakeSerialPort {
+        self.fail_writes = fail_writes;
+        self
     }
 }
 
@@ -42,6 +52,13 @@ impl std::io::Read for FakeSerialPort {
 
 impl std::io::Write for FakeSerialPort {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fail_writes > 0 {
+            self.fail_writes -= 1;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected write failure",
+            ));
+        }
         // just some approximation, additional overhead like flushing etc is not considered
         let byte_rate =
             self.baud_rate / (1 + u8::from(self.data_bits) + u8::from(self.stop_bits)) as u32;
