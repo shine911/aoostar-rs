@@ -106,6 +106,9 @@ fn windows_main() {
     let specs: Arc<Mutex<[process::ChildSpec; 3]>> =
         Arc::new(Mutex::new(process::child_specs(&base_dir, &cfg)));
     let current_refresh = Arc::new(AtomicU16::new(cfg.sysinfo_refresh_effective()));
+    // Active theme for the tray "Themes" check mark; Default (0) is the
+    // effective fallback when launcher.toml does not configure a theme.
+    let current_theme = Arc::new(AtomicU16::new(cfg.theme.unwrap_or(0)));
 
     let quit = Arc::new(AtomicBool::new(false));
     let suspended = Arc::new(AtomicBool::new(false));
@@ -131,6 +134,7 @@ fn windows_main() {
         &handles,
         specs,
         current_refresh,
+        current_theme,
         quit.clone(),
         &launcher_log,
         &config_path,
