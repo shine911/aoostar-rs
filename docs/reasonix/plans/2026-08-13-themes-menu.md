@@ -141,7 +141,7 @@ Inside the `mod tests` block added in Task 1, add this helper plus tests:
         let panels: Vec<String> = (1..=n)
             .map(|i| {
                 format!(
-                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "x": 10, "y": 10}}]}}"#
+                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": -1, "pic": "", "x": 10, "y": 10}}]}}"#
                 )
             })
             .collect();
@@ -288,7 +288,7 @@ mod tests {
         let panels: Vec<String> = (1..=8)
             .map(|i| {
                 format!(
-                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "x": 10, "y": 10}}]}}"#
+                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": -1, "pic": "", "x": 10, "y": 10}}]}}"#
                 )
             })
             .collect();
