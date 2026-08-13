@@ -12,6 +12,7 @@ repository.workspace = true
 
 [dependencies]
 asterctl-lcd = { path = "../asterctl-lcd", version = "0.2.0" }
+aster-hwstats = { path = "../aster-hwstats", version = "0.1.0" }
 
 anyhow = "1.0.98"
 clap = { version = "4.5.42", features = ["derive"] }

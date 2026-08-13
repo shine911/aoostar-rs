@@ -14,10 +14,12 @@ Check out the **[User Guide](https://shine911.github.io/aoostar-rs)** for a list
     - [Linux systemd Service](docs/linux/README.md) to automatically switch off the LCD at boot up.
 - Display images (with automatic scaling and partial update support).
 - Render dynamic sensor panels defined from the AOOSTAR-X software.
-    - Update sensor values from simple text files.
+    - Update sensor values from simple text files and/or the `AOOSTAR_HW_STATS` shared memory region.
     - Rotate through multiple panels in a defined interval.
     - On Windows, [hwbridge](hwbridge/HwBridge.cs) supplements `aster-sysinfo` with CPU/GPU/motherboard/memory
       temperatures and GPU load (via `LibreHardwareMonitorLib.dll`), data aster-sysinfo cannot read on Windows alone.
+      In `--shm` mode (used by the launcher) it publishes sensor values into the `AOOSTAR_HW_STATS` shared memory
+      region, which `asterctl --shm` reads directly — no file I/O in the hot path.
 - USB device/serial port selection.
 
 ## Disclaimer

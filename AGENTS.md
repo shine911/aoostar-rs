@@ -9,7 +9,8 @@ on Windows a small C# bridge (`hwbridge`) fills in sensors `aster-sysinfo` canno
   `aster-launcher.exe` (tray icon) to run all children hidden + elevated; C# `.NET Framework` for `HwBridge.exe`.
 - Entry points: `crates/asterctl` (LCD control, sensor panels), `crates/aster-sysinfo` (sensor provider → text
   files in `cfg/sensors/`), `crates/aster-launcher` (Windows-only supervisor), `crates/asterctl-lcd` (serial
-  protocol library), `hwbridge/HwBridge.cs` (Windows-only hardware sensors).
+  protocol library), `crates/aster-hwstats` (shared-memory sensor protocol), `hwbridge/HwBridge.cs`
+  (Windows-only hardware sensors).
 - Runtime config: `dist/launcher.toml` (built from `windows/launcher.default.toml`). `dist/` is gitignored
   (output of `windows/package-dist.ps1`).
 
@@ -29,19 +30,27 @@ on Windows a small C# bridge (`hwbridge`) fills in sensors `aster-sysinfo` canno
 - hwbridge (C#, built on Windows, not from WSL):
   `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs`
 - aster-sysinfo flags: `--out <file> --temp-dir <dir> --refresh <2|5|10|30> [--disk-refresh <secs>] [--smartctl] [--console]`
-- asterctl: `asterctl --config Monitor3.json` (configs + images in `cfg/`, sensor files in `cfg/sensors/`).
+- asterctl: `asterctl --config Monitor3.json` (configs + images in `cfg/`, sensor files in `cfg/sensors/`);
+  add `--shm` to also read the `AOOSTAR_HW_STATS` shared-memory region (HwBridge slot).
 
 ## Architecture
 
 - `crates/aster-launcher` — Windows supervisor: tray with status + live refresh-interval menu (`tray.rs`),
   power sleep/resume (`power.rs`), child restart-with-backoff watchers reading shared specs (`process.rs`),
   UART re-enumeration on wake (`device.rs`), `launcher.toml` loading (`config.rs`), never-panic logging (`logging.rs`).
+- `crates/aster-hwstats` — shared-memory sensor protocol (named region `AOOSTAR_HW_STATS`, two fixed
+  producer slots, per-slot header `magic/version/sequence/timestamp_ms` + `label: value` payload). Windows
+  backend is a pagefile-backed named file mapping (`CreateFileMappingW`/`MapViewOfFile`, matching C#
+  `MemoryMappedFile.CreateOrOpen`); POSIX shm backend used by unit tests. The only unsafe code lives here
+  (binaries keep `#![deny(unsafe_code)]`).
 - `crates/aster-sysinfo` — `SysinfoSource` (sysinfo crate: cpu/mem/swap/disks/net/temps) + Linux-only
-  per-disk storage/`smartctl` sensors. Writes `label: value` text file atomically.
+  per-disk storage/`smartctl` sensors. Writes `label: value` text file atomically (a later milestone moves
+  it to the shared-memory SysInfo slot).
 - `crates/asterctl` — LCD display: parses AOOSTAR-X `Monitor*.json` panels, renders, rotates, reads sensor
-  values from text files, speaks the serial protocol (`asterctl-lcd`).
+  values from text files and (with `--shm`) from the shared-memory region, speaks the serial protocol (`asterctl-lcd`).
 - `hwbridge/HwBridge.cs` — loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X uses, writes
-  CPU/GPU/mobo/memory temps + GPU load to `cfg/sensors/hwbridge.txt`; needs Administrator.
+  CPU/GPU/mobo/memory temps + GPU load. `--shm` mode (used by the launcher) publishes into the
+  `AOOSTAR_HW_STATS` region slot 0; legacy mode writes `cfg/sensors/hwbridge.txt`; needs Administrator.
 - `cfg/` — `Monitor3.json` (default panel config), `sensor-mapping.cfg`, `sensors/*.txt` (runtime output,
   gitignored).
 

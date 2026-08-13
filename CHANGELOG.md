@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 _Changes in the next release_
 
 ### Added
+- New `aster-hwstats` crate: shared-memory hardware stats protocol (Windows named file mapping
+  `AOOSTAR_HW_STATS`, two producer slots with per-slot `magic`/`version`/`sequence`/`timestamp` header and a
+  `label: value` payload). `HwBridge.exe --shm` publishes its sensors there and `asterctl --shm` reads them,
+  replacing the `hwbridge.txt` file hand-off; a sequence number plus timestamp let asterctl detect fresh vs.
+  stale data (useful after sleep/resume). The legacy text-file mode remains as fallback (`asterctl` still
+  reads `cfg/sensors/*.txt`; `HwBridge` without `--shm` still writes `hwbridge.txt`).
 - `aster-launcher` suspends all children while Windows sleeps and respawns them after wake (power-event monitor).
 - On wake, the launcher optionally disables + re-enables the AOOSTAR USB UART before respawning children
   (`restart_uart_on_resume`, default `true`) — automates the old manual Device Manager fix.

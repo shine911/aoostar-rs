@@ -36,7 +36,11 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
             name: "asterctl",
             base_dir: base_dir.to_path_buf(),
             exe_path: base_dir.join("bin").join("asterctl.exe"),
-            args: vec!["--config".to_string(), cfg.monitor_config.clone()],
+            args: vec![
+                "--config".to_string(),
+                cfg.monitor_config.clone(),
+                "--shm".to_string(),
+            ],
             log_path: logs_dir.join("asterctl.log"),
         },
         ChildSpec {
@@ -44,7 +48,7 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
             base_dir: base_dir.to_path_buf(),
             exe_path: base_dir.join("hwbridge").join("HwBridge.exe"),
             args: vec![
-                "cfg\\sensors\\hwbridge.txt".to_string(),
+                "--shm".to_string(),
                 cfg.hwbridge_refresh_effective().to_string(),
             ],
             log_path: logs_dir.join("hwbridge.log"),
@@ -328,7 +332,11 @@ mod tests {
         assert_eq!(specs[1].exe_path, base_dir.join("bin").join("asterctl.exe"));
         assert_eq!(
             specs[1].args,
-            vec!["--config".to_string(), "Custom.json".to_string()]
+            vec![
+                "--config".to_string(),
+                "Custom.json".to_string(),
+                "--shm".to_string()
+            ]
         );
 
         assert_eq!(specs[2].name, "hwbridge");
@@ -336,10 +344,7 @@ mod tests {
             specs[2].exe_path,
             base_dir.join("hwbridge").join("HwBridge.exe")
         );
-        assert_eq!(
-            specs[2].args,
-            vec!["cfg\\sensors\\hwbridge.txt".to_string(), "10".to_string()]
-        );
+        assert_eq!(specs[2].args, vec!["--shm".to_string(), "10".to_string()]);
 
         for spec in &specs {
             assert_eq!(spec.base_dir, base_dir);
@@ -360,9 +365,6 @@ mod tests {
         let specs = child_specs(base_dir, &cfg);
 
         assert_eq!(specs[0].args.last().unwrap(), "2");
-        assert_eq!(
-            specs[2].args,
-            vec!["cfg\\sensors\\hwbridge.txt".to_string(), "30".to_string()]
-        );
+        assert_eq!(specs[2].args, vec!["--shm".to_string(), "30".to_string()]);
     }
 }

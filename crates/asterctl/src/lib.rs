@@ -10,5 +10,6 @@ mod format_value;
 pub mod img;
 pub mod render;
 pub mod sensors;
+pub mod shm;
 
 pub use format_value::*;
