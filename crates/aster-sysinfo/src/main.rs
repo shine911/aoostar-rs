@@ -23,6 +23,23 @@ use std::time::{Duration, Instant};
 use sysinfo::{Components, DiskKind, Disks, Networks, System};
 use tempfile::Builder;
 
+/// Allowed `--refresh` intervals, in seconds.
+const REFRESH_OPTIONS: [u16; 4] = [2, 5, 10, 30];
+
+/// Parses a `--refresh` value, accepting only [`REFRESH_OPTIONS`].
+fn parse_refresh(value: &str) -> Result<u16, String> {
+    let secs: u16 = value.parse().map_err(|_| {
+        format!("invalid refresh interval '{value}': must be one of {REFRESH_OPTIONS:?}")
+    })?;
+    if REFRESH_OPTIONS.contains(&secs) {
+        Ok(secs)
+    } else {
+        Err(format!(
+            "invalid refresh interval '{value}': must be one of {REFRESH_OPTIONS:?}"
+        ))
+    }
+}
+
 /// Proof of concept sensor value collection for the asterctl screen control tool.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -42,8 +59,8 @@ struct Args {
     #[arg(long)]
     console: bool,
 
-    /// System sensor refresh interval in seconds
-    #[arg(short, long)]
+    /// System sensor refresh interval in seconds (one of 2, 5, 10, 30)
+    #[arg(short, long, value_parser = parse_refresh)]
     refresh: Option<u16>,
 
     /// Enable individual disk refresh logic as used in AOOSTAR-X. Refresh interval in seconds.
@@ -420,9 +437,11 @@ impl SysinfoSource {
             // "Wi-Fi"), so "Wi-Fi" never matched any prefix and was silently dropped --
             // added "wi-fi"/"wifi"/"wireless" to also cover Windows Wi-Fi adapters.
             let if_name = interface_name.to_lowercase();
-            if !["eth", "en", "em", "wlan", "wlp", "wlo", "wi-fi", "wifi", "wireless"]
-                .iter()
-                .any(|i| if_name.starts_with(*i))
+            if ![
+                "eth", "en", "em", "wlan", "wlp", "wlo", "wi-fi", "wifi", "wireless",
+            ]
+            .iter()
+            .any(|i| if_name.starts_with(*i))
             {
                 continue;
             }
@@ -838,5 +857,17 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1048576), "1.00 MB");
         assert_eq!(format_bytes(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_parse_refresh_allows_only_configured_intervals() {
+        assert_eq!(parse_refresh("2"), Ok(2));
+        assert_eq!(parse_refresh("5"), Ok(5));
+        assert_eq!(parse_refresh("10"), Ok(10));
+        assert_eq!(parse_refresh("30"), Ok(30));
+        assert!(parse_refresh("3").is_err());
+        assert!(parse_refresh("0").is_err());
+        assert!(parse_refresh("abc").is_err());
+        assert!(parse_refresh("").is_err());
     }
 }

@@ -60,10 +60,15 @@ namespace HwBridge
 
     internal class Program
     {
+        // Allowed refresh intervals, in seconds, matching the launcher's
+        // refresh_time option and aster-sysinfo's --refresh.
+        private static readonly int[] AllowedRefresh = new int[] { 2, 5, 10, 30 };
+        private const int DefaultRefreshSeconds = 5;
+
         private static int Main(string[] args)
         {
             string outPath = "cfg\\sensors\\hwbridge.txt";
-            int refreshSeconds = 5;
+            int refreshSeconds = DefaultRefreshSeconds;
 
             if (args.Length > 0)
             {
@@ -71,7 +76,7 @@ namespace HwBridge
             }
             if (args.Length > 1)
             {
-                refreshSeconds = int.Parse(args[1], CultureInfo.InvariantCulture);
+                refreshSeconds = ParseRefresh(args[1]);
             }
 
             string outDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
@@ -169,6 +174,25 @@ namespace HwBridge
 
                 Thread.Sleep(refreshSeconds * 1000);
             }
+        }
+
+        // Parses a refresh interval argument, falling back to the default
+        // (with a warning) when it is not one of the allowed values.
+        private static int ParseRefresh(string value)
+        {
+            int parsed;
+            if (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out parsed))
+            {
+                for (int i = 0; i < AllowedRefresh.Length; i++)
+                {
+                    if (AllowedRefresh[i] == parsed)
+                    {
+                        return parsed;
+                    }
+                }
+            }
+            Console.Error.WriteLine("HwBridge: invalid refresh interval '" + value + "', must be one of 2/5/10/30 seconds; using default " + DefaultRefreshSeconds + "s.");
+            return DefaultRefreshSeconds;
         }
 
         private static void CollectSensors(IList<IHardware> hardwareList, List<SensorEntry> into)

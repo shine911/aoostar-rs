@@ -4,11 +4,14 @@
 # AOOSTAR-X panel config file passed to asterctl's --config option.
 monitor_config = "Monitor3.json"
 
-# aster-sysinfo refresh interval, in seconds.
-sysinfo_refresh = 2
+# Shared sensor refresh interval, in seconds, applied to BOTH aster-sysinfo
+# and hwbridge. Allowed values: 2, 5, 10, 30.
+refresh_time = 5
 
-# hwbridge refresh interval, in seconds.
-hwbridge_refresh = 5
+# Legacy per-process overrides (optional, backward compatible). Only used
+# when refresh_time is not set; each must also be one of 2, 5, 10, 30.
+# sysinfo_refresh = 2
+# hwbridge_refresh = 5
 
 # On wake from sleep: disable + re-enable the AOOSTAR USB UART before
 # restarting the children (automates the old Device Manager fix). Set to

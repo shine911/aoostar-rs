@@ -3,6 +3,7 @@
 use crate::config::LauncherConfig;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct ChildSpec {
     pub name: &'static str,
     pub base_dir: PathBuf,
@@ -27,7 +28,7 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
                 "--temp-dir".to_string(),
                 "cfg\\sensors".to_string(),
                 "--refresh".to_string(),
-                cfg.sysinfo_refresh.to_string(),
+                cfg.sysinfo_refresh_effective().to_string(),
             ],
             log_path: logs_dir.join("aster-sysinfo.log"),
         },
@@ -44,7 +45,7 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
             exe_path: base_dir.join("hwbridge").join("HwBridge.exe"),
             args: vec![
                 "cfg\\sensors\\hwbridge.txt".to_string(),
-                cfg.hwbridge_refresh.to_string(),
+                cfg.hwbridge_refresh_effective().to_string(),
             ],
             log_path: logs_dir.join("hwbridge.log"),
         },
@@ -65,6 +66,22 @@ pub struct ChildHandle {
 pub(crate) fn kill_all(handles: &[ChildHandle]) {
     for handle in handles {
         if let Ok(mut guard) = handle.current_child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// Force-kills only the children whose names match `names` (used by the
+/// tray's refresh menu to restart exactly the refresh-driven processes;
+/// their watchers respawn them with the updated specs). Safe to call with
+/// children already dead.
+#[cfg(windows)]
+pub(crate) fn kill_named(handles: &[ChildHandle], names: &[&str]) {
+    for handle in handles {
+        if names.contains(&handle.name)
+            && let Ok(mut guard) = handle.current_child.lock()
             && let Some(child) = guard.as_mut()
         {
             let _ = child.kill();
@@ -140,27 +157,35 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
         .spawn()
 }
 
-/// Spawns `spec` in a background thread that keeps it running: on
-/// unexpected exit it logs a restart marker and relaunches, until `quit`
-/// is set. Returns immediately with a handle to observe health / reach the
-/// current child for a forced kill, plus the watcher thread's `JoinHandle`
-/// so shutdown can wait for the thread to actually observe `quit` (a
-/// watcher still running while the process is torn down could orphan a
-/// hidden elevated child).
+/// Spawns the child at `index` of the shared `specs` in a background thread
+/// that keeps it running: on unexpected exit it logs a restart marker and
+/// relaunches, until `quit` is set. The specs are read fresh on every spawn
+/// (not captured once), so updating `specs` and killing the current child —
+/// as the tray's refresh menu does — restarts it with the new arguments.
+/// Returns immediately with a handle to observe health / reach the current
+/// child for a forced kill, plus the watcher thread's `JoinHandle` so
+/// shutdown can wait for the thread to actually observe `quit` (a watcher
+/// still running while the process is torn down could orphan a hidden
+/// elevated child).
 #[cfg(windows)]
 pub fn spawn_and_watch(
-    spec: ChildSpec,
+    index: usize,
+    specs: std::sync::Arc<std::sync::Mutex<[ChildSpec; 3]>>,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     suspended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (ChildHandle, std::thread::JoinHandle<()>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    let spec = specs.lock().unwrap()[index].clone();
+    let name = spec.name;
+    let log_path = spec.log_path.clone();
+
     let healthy = Arc::new(AtomicBool::new(false));
     let current_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
 
     let handle = ChildHandle {
-        name: spec.name,
+        name,
         healthy: healthy.clone(),
         current_child: current_child.clone(),
     };
@@ -171,10 +196,10 @@ pub fn spawn_and_watch(
         // every run ever. `spawn_child`'s append-mode opens (and the
         // restart markers written below) then accumulate within the
         // session, including across restarts.
-        if let Some(parent) = spec.log_path.parent() {
+        if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::File::create(&spec.log_path);
+        let _ = std::fs::File::create(&log_path);
 
         let mut consecutive_failures: u32 = 0;
 
@@ -190,6 +215,10 @@ pub fn spawn_and_watch(
                 sleep_until_quit(&quit, std::time::Duration::from_millis(250));
                 continue;
             }
+
+            // Read the spec fresh each spawn so a tray refresh change is
+            // picked up on the next restart.
+            let spec = specs.lock().unwrap()[index].clone();
 
             match spawn_child(&spec) {
                 Ok(child) => {
@@ -275,8 +304,9 @@ mod tests {
         let base_dir = Path::new("C:\\dist");
         let cfg = LauncherConfig {
             monitor_config: "Custom.json".to_string(),
-            sysinfo_refresh: 7,
-            hwbridge_refresh: 11,
+            refresh_time: Some(10),
+            sysinfo_refresh: Some(7),
+            hwbridge_refresh: Some(11),
             restart_uart_on_resume: true,
         };
 
@@ -287,7 +317,8 @@ mod tests {
             specs[0].exe_path,
             base_dir.join("bin").join("aster-sysinfo.exe")
         );
-        assert_eq!(specs[0].args.last().unwrap(), "7");
+        // the shared refresh_time wins over the legacy per-process keys
+        assert_eq!(specs[0].args.last().unwrap(), "10");
         assert_eq!(
             specs[0].log_path,
             base_dir.join("logs").join("aster-sysinfo.log")
@@ -307,11 +338,31 @@ mod tests {
         );
         assert_eq!(
             specs[2].args,
-            vec!["cfg\\sensors\\hwbridge.txt".to_string(), "11".to_string()]
+            vec!["cfg\\sensors\\hwbridge.txt".to_string(), "10".to_string()]
         );
 
         for spec in &specs {
             assert_eq!(spec.base_dir, base_dir);
         }
+    }
+
+    #[test]
+    fn legacy_refresh_values_flow_through_when_no_shared_refresh_time() {
+        let base_dir = Path::new("C:\\dist");
+        let cfg = LauncherConfig {
+            monitor_config: "Custom.json".to_string(),
+            refresh_time: None,
+            sysinfo_refresh: Some(2),
+            hwbridge_refresh: Some(30),
+            restart_uart_on_resume: true,
+        };
+
+        let specs = child_specs(base_dir, &cfg);
+
+        assert_eq!(specs[0].args.last().unwrap(), "2");
+        assert_eq!(
+            specs[2].args,
+            vec!["cfg\\sensors\\hwbridge.txt".to_string(), "30".to_string()]
+        );
     }
 }

@@ -1,6 +1,14 @@
 [workspace]
 members = ["crates/*"]
+# vendor/tray-item is a path dependency via [patch], not a workspace member.
+exclude = ["vendor/tray-item"]
 resolver = "3"
+
+# Vendored tray-item with Windows submenu support added (the crates.io
+# release has no submenu API and its WM_MENUCOMMAND handler cannot deliver
+# submenu clicks). See vendor/tray-item.
+[patch.crates-io]
+tray-item = { path = "vendor/tray-item" }
 
 [workspace.package]
 rust-version = "1.88"
