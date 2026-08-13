@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Changes in the next release_
 
+### Added
+- `aster-launcher` suspends all children while Windows sleeps and respawns them after wake (power-event monitor).
+- On wake, the launcher optionally disables + re-enables the AOOSTAR USB UART before respawning children
+  (`restart_uart_on_resume`, default `true`) — automates the old manual Device Manager fix.
+
+### Fixed
+- `asterctl` no longer exits when the LCD serial port fails (e.g. after resume); it reopens the port with
+  backoff and re-initializes the display in-process.
+
 ## v0.2.0 - 2025-08-31
 ### Fixed
 - Misplaced text sensors in custom panels ([#11](https://github.com/zehnm/aoostar-rs/issues/11)).

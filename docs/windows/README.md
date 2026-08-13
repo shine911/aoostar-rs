@@ -103,3 +103,23 @@ tray icon) go to `dist\logs\launcher.log` — it has no console window to print 
 Only one launcher can run at a time: it holds `dist\.launcher.lock` while running, and a second
 instance (an accidental double-click, say) notes that in `launcher.log` and exits without starting
 a duplicate set of children.
+
+## Sleep / resume behavior
+
+When Windows goes to sleep, `aster-launcher` detects the power event and
+suspends all three child processes (they are force-stopped; the watchers do
+not restart them while the machine is asleep). On wake it waits ~4s for the
+USB stack, then restarts the children with fresh serial handles, so the
+AOOSTAR display re-initializes automatically.
+
+By default the launcher also disables + re-enables the AOOSTAR USB UART on
+every wake (the automated version of the old manual "Device Manager → COM3 →
+Disable → Enable → restart" fix). If your unit recovers without that, set
+`restart_uart_on_resume = false` in `launcher.toml`.
+
+Recommended power settings (reduces the chance of a wedged USB port):
+- untick "Allow the computer to turn off this device to save power" for the
+  AOOSTAR USB device / hub in Device Manager,
+- disable USB selective suspend for the current power plan
+  (`powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0`
+  then `powercfg /setactive scheme_current`).
