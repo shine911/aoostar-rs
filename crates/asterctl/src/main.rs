@@ -80,6 +80,11 @@ struct Args {
     #[arg(long)]
     shm: bool,
 
+    /// Theme index 0-3 (Default, Cyberpunk, Interstellar, Cartoon).
+    /// Overrides the `theme` value in the config file's `setup` section.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=3))]
+    theme: Option<u32>,
+
     /// Sensor identifier mapping file. Ignored if the file does not exist.
     ///
     /// The configuration file will be loaded from the `config_dir` directory if no full path is
@@ -148,7 +153,7 @@ fn main() -> anyhow::Result<()> {
         let font_dir = PathBuf::from(args.font_dir);
         let sensor_path = PathBuf::from(args.sensor_path);
         let mapping_cfg = PathBuf::from(args.sensor_mapping);
-        let cfg = load_configuration(&config, &cfg_dir, args.panels, &mapping_cfg)?;
+        let cfg = load_configuration(&config, &cfg_dir, args.panels, &mapping_cfg, args.theme)?;
         run_sensor_panel(
             &mut screen,
             cfg,
@@ -180,11 +185,12 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_configuration<P: AsRef<Path>>(
+fn load_configuration<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     config: P,
-    config_dir: P,
+    config_dir: Q,
     panels: Option<Vec<PathBuf>>,
-    sensor_mapping: P,
+    sensor_mapping: R,
+    theme: Option<u32>,
 ) -> anyhow::Result<MonitorConfig> {
     let config = config.as_ref();
     let config_dir = config_dir.as_ref();
@@ -194,6 +200,13 @@ fn load_configuration<P: AsRef<Path>>(
     } else {
         cfg::load_cfg(config_dir.join(config))?
     };
+
+    // Theme selection (official AOOSTAR-X parity): the CLI flag wins over
+    // the JSON's `setup.theme`; when neither is present, the config's own
+    // `mianban` is left untouched (backward compatible for custom configs).
+    if let Some(theme) = theme.map(|t| t as i32).or(cfg.setup.theme) {
+        cfg.apply_theme(theme);
+    }
 
     if let Some(panels) = panels {
         for panel in panels {
@@ -352,4 +365,76 @@ fn update_panel(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_config(dir: &std::path::Path, theme: Option<i32>, mianban: &[u32]) {
+        let panels: Vec<String> = (1..=8)
+            .map(|i| {
+                format!(
+                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": -1, "pic": "", "x": 10, "y": 10}}]}}"#
+                )
+            })
+            .collect();
+        let theme_json = theme
+            .map(|t| format!(r#", "theme": {t}"#))
+            .unwrap_or_default();
+        let mianban_json: Vec<String> = mianban.iter().map(|p| p.to_string()).collect();
+        let json = format!(
+            r#"{{"setup": {{"refresh": 1, "controlParams": true, "controlDiskTemp": true{theme_json}}}, "mianban": [{}], "diy": [{}]}}"#,
+            mianban_json.join(","),
+            panels.join(",")
+        );
+        fs::write(dir.join("Monitor3.json"), json).unwrap();
+    }
+
+    #[test]
+    fn cli_theme_overrides_json_theme() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), Some(2), &[1]);
+        let cfg = load_configuration(
+            "Monitor3.json",
+            dir.path(),
+            None,
+            dir.path().join("no-such-mapping.cfg"),
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(cfg.active_panels, vec![7, 8]);
+    }
+
+    #[test]
+    fn json_theme_applies_when_no_cli_flag() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), Some(1), &[1]);
+        let cfg = load_configuration(
+            "Monitor3.json",
+            dir.path(),
+            None,
+            dir.path().join("no-such-mapping.cfg"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.active_panels, vec![3, 4]);
+    }
+
+    #[test]
+    fn mianban_untouched_without_theme() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), None, &[1]);
+        let cfg = load_configuration(
+            "Monitor3.json",
+            dir.path(),
+            None,
+            dir.path().join("no-such-mapping.cfg"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
 }
