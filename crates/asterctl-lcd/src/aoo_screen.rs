@@ -73,6 +73,21 @@ impl AooScreenBuilder {
             enable_cache: self.enable_cache.unwrap_or(true),
             prev_frame: None,
             no_init_check: self.no_init_check.unwrap_or(false),
+            timeout: Duration::from_millis(1000),
+            reopen: Reopen::Simulated,
+        })
+    }
+
+    /// Like `simulate`, but the fake port fails its first `fail_writes`
+    /// writes — for tests of the reconnect logic.
+    pub fn simulate_with_failures(self, fail_writes: u32) -> anyhow::Result<AooScreen> {
+        Ok(AooScreen {
+            port: Some(Box::new(FakeSerialPort::new().with_failures(fail_writes))),
+            enable_cache: self.enable_cache.unwrap_or(true),
+            prev_frame: None,
+            no_init_check: self.no_init_check.unwrap_or(false),
+            timeout: Duration::from_millis(1000),
+            reopen: Reopen::Simulated,
         })
     }
 
@@ -87,31 +102,41 @@ impl AooScreenBuilder {
     /// Open the specified USB UART
     pub fn open_usb(self, vid: u16, pid: u16) -> anyhow::Result<AooScreen> {
         let serial_dev = find_usb_serial_port(vid, pid)?;
-        self.open_device(&serial_dev)
-    }
-
-    /// Open the specified serial device
-    pub fn open_device(self, device: &str) -> anyhow::Result<AooScreen> {
-        let port = serialport::new(device, UART_BAUDRATE)
-            .timeout(self.timeout.unwrap_or(Duration::from_millis(1000)))
-            .open()
-            .with_context(|| format!("Error opening serial port: {device}"))?;
-
-        info!(
-            "Opened serial port {device}: baud={}, {}:{}:{}",
-            port.baud_rate()?,
-            port.data_bits()?,
-            port.parity()?,
-            port.stop_bits()?
-        );
-
+        let timeout = self.timeout.unwrap_or(Duration::from_millis(1000));
+        let port = open_serial_port(&serial_dev, timeout)?;
         Ok(AooScreen {
             port: Some(port),
             enable_cache: self.enable_cache.unwrap_or(true),
             prev_frame: None,
             no_init_check: self.no_init_check.unwrap_or(false),
+            timeout,
+            reopen: Reopen::Usb { vid, pid },
         })
     }
+
+    /// Open the specified serial device
+    pub fn open_device(self, device: &str) -> anyhow::Result<AooScreen> {
+        let timeout = self.timeout.unwrap_or(Duration::from_millis(1000));
+        let port = open_serial_port(device, timeout)?;
+        Ok(AooScreen {
+            port: Some(port),
+            enable_cache: self.enable_cache.unwrap_or(true),
+            prev_frame: None,
+            no_init_check: self.no_init_check.unwrap_or(false),
+            timeout,
+            reopen: Reopen::Device(device.to_string()),
+        })
+    }
+}
+
+/// How to reopen the LCD port after a serial failure (e.g. after resume).
+enum Reopen {
+    /// Discover by USB VID/PID — robust against the COM number changing.
+    Usb { vid: u16, pid: u16 },
+    /// Reopen an explicit serial device name.
+    Device(String),
+    /// Simulated port: reconnect just creates a fresh fake.
+    Simulated,
 }
 
 pub struct AooScreen {
@@ -119,6 +144,10 @@ pub struct AooScreen {
     enable_cache: bool,
     prev_frame: Option<BytesMut>,
     no_init_check: bool,
+    /// Resolved serial timeout (builder default 1s).
+    timeout: Duration,
+    /// How to reopen the port after a serial failure (e.g. after resume).
+    reopen: Reopen,
 }
 
 #[allow(dead_code)]
@@ -251,6 +280,63 @@ impl AooScreen {
         self.prev_frame = None;
     }
 
+    /// Drops the current serial handle and reopens the LCD port, re-running
+    /// the initialization handshake. The frame cache is cleared so the next
+    /// `send_image` sends a full frame (after a resume the display may be in
+    /// an arbitrary state).
+    pub fn reconnect(&mut self) -> anyhow::Result<()> {
+        warn!("Reconnecting LCD serial port");
+        self.port = None;
+        self.prev_frame = None;
+
+        let port: Box<dyn SerialPort> = match &self.reopen {
+            Reopen::Simulated => Box::new(FakeSerialPort::new()),
+            Reopen::Device(name) => open_serial_port(name, self.timeout)?,
+            Reopen::Usb { vid, pid } => {
+                let device = find_usb_serial_port(*vid, *pid)?;
+                open_serial_port(&device, self.timeout)?
+            }
+        };
+
+        self.port = Some(port);
+        if let Err(e) = self.init() {
+            // Never leave a half-open handle behind: a port whose handshake
+            // failed must not be usable by a caller that ignores the error.
+            self.port = None;
+            return Err(e);
+        }
+        info!("LCD reconnected");
+        Ok(())
+    }
+
+    /// Backoff delay for the n-th reconnect attempt: 1s → 2s → ... → 60s
+    /// cap. Extracted so the growth/cap is unit-testable.
+    fn backoff_delay(attempt: u32) -> Duration {
+        let secs = 1u64 << attempt.min(6);
+        Duration::from_secs(secs.min(60))
+    }
+
+    /// Attempts to reconnect forever, backing off between attempts (1s →
+    /// 2s → ... → 60s cap). Never returns an error: on failure it logs and
+    /// retries. Returns once the port is open and initialized again.
+    pub fn reconnect_with_retry(&mut self) {
+        let mut attempt = 0;
+        loop {
+            match self.reconnect() {
+                Ok(()) => {
+                    info!("LCD reconnected");
+                    return;
+                }
+                Err(e) => {
+                    let delay = Self::backoff_delay(attempt);
+                    warn!("Reconnect failed ({e:?}); retrying in {}s", delay.as_secs());
+                    sleep(delay);
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         // TODO not sure if retry logic is required. Need a real device to test...
         let mut retry = 0;
@@ -282,6 +368,23 @@ impl AooScreen {
     }
 }
 
+fn open_serial_port(device: &str, timeout: Duration) -> anyhow::Result<Box<dyn SerialPort>> {
+    let port = serialport::new(device, UART_BAUDRATE)
+        .timeout(timeout)
+        .open()
+        .with_context(|| format!("Error opening serial port: {device}"))?;
+
+    info!(
+        "Opened serial port {device}: baud={}, {}:{}:{}",
+        port.baud_rate()?,
+        port.data_bits()?,
+        port.parity()?,
+        port.stop_bits()?
+    );
+
+    Ok(port)
+}
+
 pub fn find_usb_serial_port(vid: u16, pid: u16) -> serialport::Result<String> {
     info!("Looking for USB serial port {vid:x}:{pid:x}");
     let ports = serialport::available_ports()?;
@@ -299,4 +402,73 @@ pub fn find_usb_serial_port(vid: u16, pid: u16) -> serialport::Result<String> {
         serialport::ErrorKind::NoDevice,
         format!("USB serial port {vid:x}:{pid:x} not found"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::RgbImage;
+
+    fn blank_image() -> RgbImage {
+        RgbImage::new(DISPLAY_SIZE.0, DISPLAY_SIZE.1)
+    }
+
+    #[test]
+    fn fake_port_fails_then_recovers() {
+        let mut port = FakeSerialPort::new().with_failures(4);
+        let buf = [0u8; 8];
+        assert!(port.write(&buf).is_err());
+        assert!(port.write(&buf).is_err());
+        assert!(port.write(&buf).is_err());
+        assert!(port.write(&buf).is_err());
+        assert!(port.write(&buf).is_ok());
+    }
+
+    #[test]
+    fn reconnect_recovers_from_wedged_port() {
+        // 4 injected failures = one `send()` call's worth of attempts
+        // (initial write + SERIAL_RETRY = 3 retries), so the first
+        // send_image fails as if the port were wedged after resume.
+        let mut screen = AooScreenBuilder::new().simulate_with_failures(4).unwrap();
+        assert!(screen.send_image(&blank_image()).is_err());
+
+        // reconnect() drops the stale handle, opens a fresh (healthy) port,
+        // re-runs init and clears the frame cache.
+        screen.reconnect().unwrap();
+        assert!(screen.send_image(&blank_image()).is_ok());
+    }
+
+    #[test]
+    fn reconnect_clears_frame_cache() {
+        let mut screen = AooScreenBuilder::new().simulate().unwrap();
+        screen.send_image(&blank_image()).unwrap();
+        assert!(screen.prev_frame.is_some());
+        screen.reconnect().unwrap();
+        assert!(screen.prev_frame.is_none());
+    }
+
+    #[test]
+    fn reconnect_with_retry_recovers() {
+        let mut screen = AooScreenBuilder::new().simulate_with_failures(4).unwrap();
+        assert!(screen.send_image(&blank_image()).is_err());
+        // Smoke test of the happy path: the simulated reopen always
+        // succeeds, so this must return (not loop forever).
+        screen.reconnect_with_retry();
+        assert!(screen.send_image(&blank_image()).is_ok());
+    }
+
+    #[test]
+    fn backoff_delay_grows_then_caps_at_60s() {
+        // The retry loop itself is not exercisable with the fake (reopen
+        // always succeeds on a simulated port), so the backoff schedule is
+        // tested directly: 1s → 2s → ... → 32s → 60s cap.
+        assert_eq!(AooScreen::backoff_delay(0), Duration::from_secs(1));
+        assert_eq!(AooScreen::backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(AooScreen::backoff_delay(2), Duration::from_secs(4));
+        assert_eq!(AooScreen::backoff_delay(3), Duration::from_secs(8));
+        assert_eq!(AooScreen::backoff_delay(4), Duration::from_secs(16));
+        assert_eq!(AooScreen::backoff_delay(5), Duration::from_secs(32));
+        assert_eq!(AooScreen::backoff_delay(6), Duration::from_secs(60));
+        assert_eq!(AooScreen::backoff_delay(99), Duration::from_secs(60));
+    }
 }

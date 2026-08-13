@@ -52,10 +52,24 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
 }
 
 #[cfg(windows)]
+#[derive(Clone)]
 pub struct ChildHandle {
     pub name: &'static str,
     pub healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub current_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+}
+
+/// Force-kills every currently running child (used on power suspend and on
+/// launcher shutdown). Safe to call with children already dead.
+#[cfg(windows)]
+pub(crate) fn kill_all(handles: &[ChildHandle]) {
+    for handle in handles {
+        if let Ok(mut guard) = handle.current_child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -137,6 +151,7 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
 pub fn spawn_and_watch(
     spec: ChildSpec,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    suspended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (ChildHandle, std::thread::JoinHandle<()>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -168,23 +183,36 @@ pub fn spawn_and_watch(
                 break;
             }
 
+            // While the machine is asleep, don't spawn or respawn anything:
+            // the power monitor killed the children on suspend and will
+            // clear this flag after wake, at which point we start fresh.
+            if suspended.load(Ordering::SeqCst) {
+                sleep_until_quit(&quit, std::time::Duration::from_millis(250));
+                continue;
+            }
+
             match spawn_child(&spec) {
                 Ok(child) => {
                     consecutive_failures = 0;
                     healthy.store(true, Ordering::SeqCst);
                     *current_child.lock().unwrap() = Some(child);
 
-                    // Re-check quit immediately after storing the child: if a
-                    // shutdown's kill attempt ran while spawn_child() was
-                    // doing I/O (before the child existed to be killed), it
-                    // would have no-op'd on a still-None current_child. This
-                    // re-check guarantees we self-kill instead of leaking an
-                    // orphaned hidden process.
-                    if quit.load(Ordering::SeqCst) {
+                    // Re-check quit (and the suspend flag) immediately after
+                    // storing the child: a shutdown's or the power monitor's
+                    // kill attempt that ran while spawn_child() was doing I/O
+                    // (before the child existed to be killed) would have
+                    // no-op'd on a still-None current_child. This re-check
+                    // guarantees we self-kill instead of leaking an orphaned
+                    // hidden process — or one that would hold the serial port
+                    // through a sleep. On quit we stop the watcher; on suspend
+                    // we loop back and wait for the flag to clear.
+                    if quit.load(Ordering::SeqCst) || suspended.load(Ordering::SeqCst) {
                         if let Some(child) = current_child.lock().unwrap().as_mut() {
                             let _ = child.kill();
                         }
-                        break;
+                        if quit.load(Ordering::SeqCst) {
+                            break;
+                        }
                     }
 
                     // Block until the child exits, without holding the lock
@@ -249,6 +277,7 @@ mod tests {
             monitor_config: "Custom.json".to_string(),
             sysinfo_refresh: 7,
             hwbridge_refresh: 11,
+            restart_uart_on_resume: true,
         };
 
         let specs = child_specs(base_dir, &cfg);

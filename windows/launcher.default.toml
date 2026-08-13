@@ -9,3 +9,8 @@ sysinfo_refresh = 2
 
 # hwbridge refresh interval, in seconds.
 hwbridge_refresh = 5
+
+# On wake from sleep: disable + re-enable the AOOSTAR USB UART before
+# restarting the children (automates the old Device Manager fix). Set to
+# false if the screen already recovers without it.
+restart_uart_on_resume = true

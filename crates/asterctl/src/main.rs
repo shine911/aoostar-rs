@@ -290,7 +290,15 @@ fn run_sensor_panel<B: Into<PathBuf>>(
 
             // Keeping the read lock during panel rendering should be ok, otherwise we could always clone the HashMap
             let values = sensor_values.read().expect("RwLock is poisoned");
-            update_panel(screen, &mut renderer, panel, &values)?;
+            if let Err(e) = update_panel(screen, &mut renderer, panel, &values) {
+                // Serial communication failed (e.g. after resume). Don't
+                // exit — drop the stale handle, reopen + re-init the port
+                // with backoff, and continue the panel loop. The frame cache
+                // was cleared by `reconnect`, so the next send is a full
+                // frame that repairs whatever the display was left showing.
+                error!("Display communication failed: {e:?} — reconnecting with backoff");
+                screen.reconnect_with_retry();
+            }
             drop(values);
 
             let elapsed = upd_start_time.elapsed();
