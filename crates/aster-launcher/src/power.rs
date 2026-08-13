@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Windows power-event monitoring.
+//! Windows power-event monitoring (suspend/resume).
 //!
 //! The launcher suspends all child processes while the machine sleeps and
 //! respawns them after wake. Two goals:
@@ -8,22 +8,37 @@
 //!   cycle (a stale handle is the classic cause of "COM3 dead after wake");
 //! - the periodic sensor/refresh loops stop running during sleep (saves
 //!   battery on Modern Standby machines).
+//!
+//! Transport: `RegisterSuspendResumeNotification` — a windowless API that
+//! works on Modern Standby (S0 low-power idle). The earlier hidden-window +
+//! `WM_POWERBROADCAST` approach never delivered events on the AOOSTAR WTR
+//! MAX (launcher.log stayed empty across real sleep/wake cycles), so it was
+//! replaced. The system invokes our callback on a private thread; the
+//! callback only records the event type and signals a Win32 event, and a
+//! dedicated daemon thread does the actual work (kill children / wait /
+//! UART restart).
 
 // `main.rs` denies `unsafe_code` crate-wide; this module is the narrow,
 // deliberate exception — it is pure Win32 FFI glue. Scoped here so the
 // crate-wide deny still guards every other module.
 #![allow(unsafe_code)]
 
+// Only used by the `#[cfg(windows)]` code below; gated so the module stays
+// warning-free on non-Windows targets (Linux CI).
+#[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// Classification of a `WM_POWERBROADCAST` wParam.
+/// Classification of a suspend/resume notification type.
 ///
 /// Platform-free so the logic is unit-testable everywhere; the raw values
-/// match the Win32 constants `PBT_APMSUSPEND` (4), `PBT_APMRESUMEAUTOMATIC`
-/// (18) and `PBT_APMRESUMESUSPEND` (7) from
-/// `windows-sys::Win32::UI::WindowsAndMessaging`.
+/// match the Win32 constants from `windows-sys`:
+/// suspend: `PBT_APMSUSPEND` (4), `PBT_APMSTANDBY` (5);
+/// resume: `PBT_APMRESUMECRITICAL` (6), `PBT_APMRESUMESUSPEND` (7),
+/// `PBT_APMRESUMESTANDBY` (8), `PBT_APMRESUMEAUTOMATIC` (18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PowerEvent {
     Suspend,
@@ -46,35 +61,8 @@ pub(crate) fn classify_power_event(wparam: usize) -> PowerEvent {
 /// stack needs a moment to re-enumerate the LCD UART.
 const RESUME_SETTLE_SECS: u64 = 4;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classifies_suspend_and_resume_wparams() {
-        assert_eq!(classify_power_event(4), PowerEvent::Suspend); // PBT_APMSUSPEND
-        assert_eq!(classify_power_event(5), PowerEvent::Suspend); // PBT_APMSTANDBY
-        assert_eq!(classify_power_event(6), PowerEvent::Resume); // PBT_APMRESUMECRITICAL
-        assert_eq!(classify_power_event(7), PowerEvent::Resume); // PBT_APMRESUMESUSPEND
-        assert_eq!(classify_power_event(8), PowerEvent::Resume); // PBT_APMRESUMESTANDBY
-        assert_eq!(classify_power_event(18), PowerEvent::Resume); // PBT_APMRESUMEAUTOMATIC
-    }
-
-    #[test]
-    fn classifies_unrelated_messages_as_other() {
-        assert_eq!(classify_power_event(0), PowerEvent::Other);
-        assert_eq!(classify_power_event(12345), PowerEvent::Other);
-    }
-}
-
 #[cfg(windows)]
 use crate::process::ChildHandle;
-
-// `HWND`, `WPARAM`, `LPARAM` and `LRESULT` are used by `wnd_proc`'s
-// signature at module scope, so they are imported here (cfg-gated like the
-// rest of the Windows code) rather than inside `start`'s closure.
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 
 #[cfg(windows)]
 struct PowerState {
@@ -84,16 +72,35 @@ struct PowerState {
     log_path: PathBuf,
 }
 
-// `WndProc` is a plain function pointer, so the state it needs lives in a
-// thread-local set once at thread start. The message loop runs on this same
-// thread, so there is no cross-thread access.
-//
-// Edition 2024 requires explicit `unsafe` blocks for unsafe operations even
-// inside an `unsafe fn`; this module's scoped `#![allow(unsafe_code)]`
-// covers the block.
+/// State shared between the power callback (invoked by the system on a
+/// private thread) and the daemon thread. The callback only touches
+/// `pending_event` and `wake`; `power` is owned by the daemon thread.
 #[cfg(windows)]
-thread_local! {
-    static STATE: std::cell::RefCell<Option<PowerState>> = const { std::cell::RefCell::new(None) };
+#[repr(C)]
+struct Shared {
+    pending_event: AtomicU32,
+    wake: windows_sys::Win32::Foundation::HANDLE,
+    power: PowerState,
+}
+
+/// Callback invoked by `RegisterSuspendResumeNotification` on a system
+/// thread. Must not block: it only records the event type and signals the
+/// daemon thread, which does the actual work.
+#[cfg(windows)]
+unsafe extern "system" fn on_power_event(
+    context: *const core::ffi::c_void,
+    r#type: u32,
+    _setting: *const core::ffi::c_void,
+) -> u32 {
+    use windows_sys::Win32::System::Threading::SetEvent;
+
+    if let Some(shared) = unsafe { (context as *const Shared).as_ref() } {
+        shared.pending_event.store(r#type, Ordering::SeqCst);
+        // SAFETY: `wake` is a valid event handle created in `start`; the
+        // module carries the scoped `#![allow(unsafe_code)]`.
+        unsafe { SetEvent(shared.wake) };
+    }
+    0 // NO_ERROR
 }
 
 /// Starts the power-monitor thread. The thread is a daemon: it runs for the
@@ -107,100 +114,82 @@ pub(crate) fn start(
     log_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        // `use` locally so power.rs still compiles on non-Windows targets
-        // (windows-sys is a Windows-only dependency).
-        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, TranslateMessage,
-            WNDCLASSW,
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Power::{
+            DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, RegisterSuspendResumeNotification,
         };
-
-        let log_path_for_errors = log_path.clone();
-        STATE.with(|slot| {
-            *slot.borrow_mut() = Some(PowerState {
-                suspended,
-                handles,
-                restart_uart_on_resume,
-                log_path,
-            });
-        });
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, INFINITE, ResetEvent, WaitForSingleObject,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_CALLBACK;
 
         unsafe {
-            let hinstance = GetModuleHandleW(std::ptr::null());
-            let class_name: Vec<u16> = "AsterLauncherPowerWindow\0".encode_utf16().collect();
-            let wc = WNDCLASSW {
-                style: 0,
-                lpfnWndProc: Some(wnd_proc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinstance,
-                hIcon: std::ptr::null_mut(),
-                hCursor: std::ptr::null_mut(),
-                hbrBackground: std::ptr::null_mut(),
-                lpszMenuName: std::ptr::null(),
-                lpszClassName: class_name.as_ptr(),
-            };
-            if RegisterClassW(&wc) == 0 {
-                crate::logging::append_line(
-                    &log_path_for_errors,
-                    "power: RegisterClassW failed; power handling disabled",
-                );
-                return;
-            }
-            let hwnd = CreateWindowExW(
-                0,
-                class_name.as_ptr(),
+            let wake = CreateEventW(
                 std::ptr::null(),
+                1, /* manual reset */
                 0,
-                0,
-                0,
-                0,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                hinstance,
                 std::ptr::null(),
             );
-            if hwnd.is_null() {
+            if wake.is_null() {
                 crate::logging::append_line(
-                    &log_path_for_errors,
-                    "power: CreateWindowExW failed; power handling disabled",
+                    &log_path,
+                    "power: CreateEventW failed; power handling disabled",
                 );
                 return;
             }
 
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            let shared = Shared {
+                pending_event: AtomicU32::new(0),
+                wake,
+                power: PowerState {
+                    suspended,
+                    handles,
+                    restart_uart_on_resume,
+                    log_path,
+                },
+            };
+
+            let params = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+                Callback: Some(on_power_event),
+                Context: &shared as *const Shared as *mut core::ffi::c_void,
+            };
+            let registration = RegisterSuspendResumeNotification(
+                &params as *const DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as *mut core::ffi::c_void,
+                DEVICE_NOTIFY_CALLBACK,
+            );
+            if registration == 0 {
+                crate::logging::append_line(
+                    &shared.power.log_path,
+                    "power: RegisterSuspendResumeNotification failed; power handling disabled",
+                );
+                return;
+            }
+
+            // Daemon loop: block until the callback signals a power event.
+            loop {
+                let ret = WaitForSingleObject(shared.wake, INFINITE);
+                if ret == WAIT_FAILED {
+                    crate::logging::append_line(
+                        &shared.power.log_path,
+                        "power: WaitForSingleObject failed; power handling disabled",
+                    );
+                    return;
+                }
+                if ret == WAIT_OBJECT_0 {
+                    ResetEvent(shared.wake);
+                }
+                let event_type = shared.pending_event.swap(0, Ordering::SeqCst);
+                if event_type != 0 {
+                    handle_power_event(&shared.power, event_type as usize);
+                }
             }
         }
     })
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_POWERBROADCAST};
-    if msg == WM_POWERBROADCAST {
-        STATE.with(|slot| {
-            if let Some(state) = slot.borrow().as_ref() {
-                handle_power_event(state, wparam);
-            }
-        });
-    }
-    // Forward to the default handler. `DefWindowProcW` is unsafe; edition 2024
-    // requires an explicit block even inside this `unsafe fn`.
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-}
-
-#[cfg(windows)]
-fn handle_power_event(state: &PowerState, wparam: usize) {
-    match classify_power_event(wparam) {
+fn handle_power_event(state: &PowerState, event_type: usize) {
+    match classify_power_event(event_type) {
         PowerEvent::Suspend => {
             crate::logging::append_line(
                 &state.log_path,
@@ -211,8 +200,8 @@ fn handle_power_event(state: &PowerState, wparam: usize) {
         }
         PowerEvent::Resume => {
             // Only the first Resume after a Suspend may act: Windows can
-            // send several Resume wParams for one wake (e.g. 7 then 18),
-            // and a second pass would disable the UART while asterctl
+            // send several Resume notifications for one wake (e.g. 7 then
+            // 18), and a second pass would disable the UART while asterctl
             // already has the COM port open again. The swap also records
             // the Suspend→Resume transition.
             if !state.suspended.swap(false, Ordering::SeqCst) {
@@ -248,5 +237,26 @@ fn handle_power_event(state: &PowerState, wparam: usize) {
             crate::logging::append_line(&state.log_path, "power: resuming children");
         }
         PowerEvent::Other => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_suspend_and_resume_wparams() {
+        assert_eq!(classify_power_event(4), PowerEvent::Suspend); // PBT_APMSUSPEND
+        assert_eq!(classify_power_event(5), PowerEvent::Suspend); // PBT_APMSTANDBY
+        assert_eq!(classify_power_event(6), PowerEvent::Resume); // PBT_APMRESUMECRITICAL
+        assert_eq!(classify_power_event(7), PowerEvent::Resume); // PBT_APMRESUMESUSPEND
+        assert_eq!(classify_power_event(8), PowerEvent::Resume); // PBT_APMRESUMESTANDBY
+        assert_eq!(classify_power_event(18), PowerEvent::Resume); // PBT_APMRESUMEAUTOMATIC
+    }
+
+    #[test]
+    fn classifies_unrelated_messages_as_other() {
+        assert_eq!(classify_power_event(0), PowerEvent::Other);
+        assert_eq!(classify_power_event(12345), PowerEvent::Other);
     }
 }
