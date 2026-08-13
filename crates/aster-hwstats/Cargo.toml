@@ -1,0 +1,16 @@
+[package]
+name = "aster-hwstats"
+version = "0.1.0"
+description = "Shared-memory hardware stats protocol (HwBridge <-> asterctl)"
+readme = "../../README.md"
+
+rust-version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# POSIX shm backend, used for unit tests on Linux. Windows uses raw
+# CreateFileMappingW/MapViewOfFile FFI (no external dependency).
+libc = "0.2"

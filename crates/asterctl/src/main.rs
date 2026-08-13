@@ -7,6 +7,7 @@
 use asterctl::cfg::{MonitorConfig, Panel, load_custom_panel};
 use asterctl::render::PanelRenderer;
 use asterctl::sensors::{read_filter_file, read_key_value_file, start_file_slurper};
+use asterctl::shm::SharedMemoryProvider;
 use asterctl::{cfg, img};
 use asterctl_lcd::{AooScreen, AooScreenBuilder, DISPLAY_SIZE};
 
@@ -72,6 +73,12 @@ struct Args {
     /// Single sensor value input file or directory for multiple sensor input files.
     #[arg(long, default_value_t = String::from("cfg/sensors"))]
     sensor_path: String,
+
+    /// Also read hardware sensor values from the "AOOSTAR_HW_STATS" shared
+    /// memory region (written by `HwBridge.exe --shm`). Sensor files are
+    /// still read as before; shared-memory values win on key conflicts.
+    #[arg(long)]
+    shm: bool,
 
     /// Sensor identifier mapping file. Ignored if the file does not exist.
     ///
@@ -148,6 +155,7 @@ fn main() -> anyhow::Result<()> {
             cfg_dir,
             font_dir,
             sensor_path,
+            args.shm,
             img_save_path,
         )?;
         return Ok(());
@@ -238,6 +246,7 @@ fn run_sensor_panel<B: Into<PathBuf>>(
     config_dir: B,
     font_dir: B,
     sensor_path: B,
+    use_shm: bool,
     img_save_path: Option<B>,
 ) -> anyhow::Result<()> {
     let font_dir = font_dir.into();
@@ -259,6 +268,15 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         sensor_values.clone(),
         cfg.sensor_filter.clone(),
     )?;
+
+    // Shared-memory sensor source (HwBridge): polled on every render
+    // iteration; values are merged into the same map as the file slurper.
+    let mut shm_provider = if use_shm {
+        info!("Shared memory sensor source enabled (AOOSTAR_HW_STATS)");
+        Some(SharedMemoryProvider::new())
+    } else {
+        None
+    };
 
     let refresh = Duration::from_millis((cfg.setup.refresh * 1000f32) as u64);
 
@@ -288,7 +306,12 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                 renderer.set_img_suffix(format!("-{refresh_count:02}"));
             }
 
-            // Keeping the read lock during panel rendering should be ok, otherwise we could always clone the HashMap
+            // Poll shared memory first so the render below sees the freshest
+            // values. The write lock is released before rendering.
+            if let Some(provider) = shm_provider.as_mut() {
+                let mut values = sensor_values.write().expect("RwLock is poisoned");
+                provider.update(&mut *values);
+            }
             let values = sensor_values.read().expect("RwLock is poisoned");
             if let Err(e) = update_panel(screen, &mut renderer, panel, &values) {
                 // Serial communication failed (e.g. after resume). Don't

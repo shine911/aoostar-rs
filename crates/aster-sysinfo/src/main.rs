@@ -55,6 +55,12 @@ struct Args {
     #[arg(short, long)]
     temp_dir: Option<PathBuf>,
 
+    /// Write sensor values into the "AOOSTAR_HW_STATS" shared memory region
+    /// (SysInfo slot) instead of the `--out` file. Used by the launcher on
+    /// Windows; `asterctl --shm` reads the values directly, with no file I/O.
+    #[arg(long)]
+    shm: bool,
+
     /// Print values in console
     #[arg(long)]
     console: bool,
@@ -92,6 +98,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sensors = HashMap::with_capacity(64);
     let mut sysinfo_source = SysinfoSource::new();
 
+    // Shared-memory writer (SysInfo slot), used instead of the output file
+    // when --shm is passed (the launcher's default on Windows).
+    let mut shm_writer = if args.shm {
+        info!(
+            "Writing sensors to shared memory region '{}'",
+            aster_hwstats::REGION_NAME
+        );
+        Some(SharedMemoryWriter::new()?)
+    } else {
+        None
+    };
+
     let refresh = Duration::from_secs(args.refresh.unwrap_or_default() as u64);
 
     let disk_refresh = Duration::from_secs(args.disk_refresh.unwrap_or_default() as u64);
@@ -119,7 +137,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             disk_refresh_time = Instant::now();
         }
 
-        if let Some(out_file) = &args.out {
+        if let Some(writer) = shm_writer.as_mut() {
+            writer.write(&sensors)?;
+        } else if let Some(out_file) = &args.out {
             write_sensor_file(out_file, args.temp_dir.as_deref(), &sensors)?;
         }
 
@@ -185,6 +205,61 @@ fn write_sensor_file(
     tmp_file.persist(out_file)?;
 
     Ok(())
+}
+
+/// Serializes the sensor map into the `label: value\n` payload bytes used by
+/// both the shared-memory slots and the legacy text file.
+fn serialize_payload(sensors: &HashMap<String, String>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(sensors.len() * 24);
+    for (label, value) in sensors {
+        payload.extend_from_slice(label.as_bytes());
+        payload.extend_from_slice(b": ");
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(b'\n');
+    }
+    payload
+}
+
+/// Publishes the sensor map into the SysInfo slot of the `AOOSTAR_HW_STATS`
+/// shared memory region, mirroring `HwBridge.exe --shm` (same protocol, same
+/// odd/even sequence pattern).
+struct SharedMemoryWriter {
+    region: aster_hwstats::SharedStatsRegion,
+    sequence: u64,
+}
+
+impl SharedMemoryWriter {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            region: aster_hwstats::SharedStatsRegion::open()?,
+            sequence: 0,
+        })
+    }
+
+    fn write(
+        &mut self,
+        sensors: &HashMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.sequence += 2;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let payload = serialize_payload(sensors);
+        let n = self.region.write_payload(
+            aster_hwstats::Producer::SysInfo,
+            &payload,
+            self.sequence,
+            timestamp_ms,
+        )?;
+        debug!(
+            "Wrote {} sensor values ({} bytes) to SysInfo slot, sequence {}",
+            sensors.len(),
+            n,
+            self.sequence
+        );
+        Ok(())
+    }
 }
 
 pub struct SysinfoSource {
@@ -869,5 +944,24 @@ mod tests {
         assert!(parse_refresh("0").is_err());
         assert!(parse_refresh("abc").is_err());
         assert!(parse_refresh("").is_err());
+    }
+
+    #[test]
+    fn test_serialize_payload_roundtrips_through_parser() {
+        let mut sensors = HashMap::new();
+        sensors.insert("cpu_usage_percent".to_string(), "12.3".to_string());
+        sensors.insert("mem_usage_percent".to_string(), "45.6".to_string());
+        sensors.insert(
+            "network_Wi-Fi_download_speed".to_string(),
+            "1048576".to_string(),
+        );
+
+        let payload = serialize_payload(&sensors);
+        let parsed = aster_hwstats::parse_key_value(&payload);
+
+        assert_eq!(parsed.len(), sensors.len());
+        for (label, value) in &sensors {
+            assert_eq!(parsed.get(label).unwrap(), value);
+        }
     }
 }

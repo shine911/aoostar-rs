@@ -10,6 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aster-hwstats = { path = "../aster-hwstats", version = "0.1.0" }
 clap = { version = "4.5.42", features = ["derive"] }
 sysinfo = "0.37.0"
 itertools = "0.14"
