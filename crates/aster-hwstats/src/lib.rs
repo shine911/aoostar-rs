@@ -74,11 +74,17 @@ pub const MAGIC: u32 = 0x4857_5331;
 pub const VERSION: u32 = 1;
 
 // Header field offsets (see module docs).
+/// Offset of the slot `magic` field (u32).
 pub const MAGIC_OFFSET: usize = 0;
+/// Offset of the slot `version` field (u32).
 pub const VERSION_OFFSET: usize = 4;
+/// Offset of the slot `sequence` field (u64, atomic, odd/even seqlock).
 pub const SEQUENCE_OFFSET: usize = 8;
+/// Offset of the slot `timestamp_ms` field (u64).
 pub const TIMESTAMP_OFFSET: usize = 16;
+/// Offset of the slot `payload_len` field (u32).
 pub const PAYLOAD_LEN_OFFSET: usize = 24;
+/// Offset of the slot payload bytes.
 pub const PAYLOAD_OFFSET: usize = 32;
 
 /// Identifies one producer; each owns a fixed slot in the region.
