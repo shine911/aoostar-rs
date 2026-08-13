@@ -142,7 +142,10 @@ pub fn active_panels_for_theme(
     control_params: bool,
     control_disk_temp: bool,
 ) -> Vec<u32> {
-    debug_assert!((0..=3).contains(&theme), "theme index out of range: {theme}");
+    debug_assert!(
+        (0..=3).contains(&theme),
+        "theme index out of range: {theme}"
+    );
     let first = (1 + 2 * theme) as u32;
     let second = first + 1;
     match (control_params, control_disk_temp) {
