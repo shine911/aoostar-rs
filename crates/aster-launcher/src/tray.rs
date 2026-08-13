@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::process::ChildHandle;
+use crate::config::LauncherConfig;
+use crate::process::{ChildHandle, ChildSpec};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tray_item::{IconSource, TrayItem};
+
+/// Allowed refresh intervals shown in the tray "Refresh time" submenu, in seconds.
+const REFRESH_OPTIONS: [u16; 4] = [2, 5, 10, 30];
 
 /// Builds the tray status line summarizing child health: "all running" or a
 /// "degraded (...)" list of the children currently reporting unhealthy.
@@ -23,11 +27,62 @@ fn status_label(handles: &[ChildHandle]) -> String {
     }
 }
 
-/// Shows the tray icon (status label + "Quit All" item) and blocks,
-/// refreshing the status label and the hover tooltip every 2 seconds, until
-/// `quit` becomes `true` — either because "Quit All" was clicked (this
-/// function wires that up itself) or because the caller set it for another
-/// reason.
+/// Tray "Refresh: Ns" click handler: persists `secs` to `launcher.toml`,
+/// rebuilds the child specs with the new interval, and restarts
+/// aster-sysinfo + hwbridge so it applies immediately (their watchers read
+/// the specs fresh on every spawn). `current` is updated so the tray menu
+/// can move the check mark.
+#[cfg(windows)]
+fn apply_refresh(
+    secs: u16,
+    config_path: &Path,
+    base_dir: &Path,
+    cfg: &LauncherConfig,
+    specs: &Mutex<[ChildSpec; 3]>,
+    handles: &[ChildHandle],
+    log_path: &Path,
+    current: &AtomicU16,
+) {
+    // 1. persist the choice so it survives a launcher restart
+    if let Err(err) = crate::config::set_refresh_time(config_path, secs) {
+        crate::logging::append_line(
+            log_path,
+            &format!(
+                "failed to write refresh_time={secs}s to {}: {err}",
+                config_path.display()
+            ),
+        );
+        return;
+    }
+    crate::logging::append_line(
+        log_path,
+        &format!("tray: refresh_time set to {secs}s; restarting aster-sysinfo and hwbridge"),
+    );
+
+    // 2. rebuild the specs with the new shared interval
+    let mut new_cfg = cfg.clone();
+    new_cfg.refresh_time = Some(secs);
+    if let Ok(mut guard) = specs.lock() {
+        *guard = crate::process::child_specs(base_dir, &new_cfg);
+    }
+
+    // 3. kill the two refresh-driven children; their watchers respawn them
+    //    with the updated arguments within ~2s
+    crate::process::kill_named(handles, &["aster-sysinfo", "hwbridge"]);
+
+    current.store(secs, Ordering::SeqCst);
+}
+
+/// Shows the tray icon (status label, "Refresh time" sub-menu, "Quit All"
+/// item) and blocks, refreshing the status label and the hover tooltip every
+/// 2 seconds, until `quit` becomes `true` — either because "Quit All" was
+/// clicked (this function wires that up itself) or because the caller set it
+/// for another reason.
+///
+/// The "Refresh time" sub-menu entries write the chosen interval to
+/// `config_path` and restart `aster-sysinfo` + `hwbridge` via
+/// `specs`/`handles` (see [`apply_refresh`]); `current_refresh` tracks the
+/// active interval so the sub-menu shows a check mark on it.
 ///
 /// Never panics: any failure to create or update the tray icon is logged to
 /// `log_path` (this exe is built with `windows_subsystem = "windows"`, so it
@@ -37,7 +92,16 @@ fn status_label(handles: &[ChildHandle]) -> String {
 /// path then kills the children instead of leaving hidden elevated processes
 /// running with no way to stop them.
 #[cfg(windows)]
-pub fn run(handles: &[ChildHandle], quit: Arc<AtomicBool>, log_path: &Path) {
+pub fn run(
+    handles: &[ChildHandle],
+    specs: Arc<Mutex<[ChildSpec; 3]>>,
+    current_refresh: Arc<AtomicU16>,
+    quit: Arc<AtomicBool>,
+    log_path: &Path,
+    config_path: &Path,
+    base_dir: &Path,
+    cfg: &LauncherConfig,
+) {
     let initial_label = status_label(handles);
 
     // `build.rs` embeds `aster-launcher.ico` into this exe as a named icon
@@ -95,9 +159,90 @@ pub fn run(handles: &[ChildHandle], quit: Arc<AtomicBool>, log_path: &Path) {
         }
     }
 
+    // "Refresh time" sub-menu: picking an interval persists it to
+    // launcher.toml and restarts aster-sysinfo + hwbridge so it applies
+    // immediately. The active interval carries a native check mark.
+    let active_refresh = current_refresh.load(Ordering::SeqCst);
+    let mut refresh_submenu: Option<u32> = None;
+    let mut refresh_ids = [0u32; REFRESH_OPTIONS.len()];
+    match tray.inner_mut().add_submenu("Refresh time") {
+        Ok(sub) => {
+            refresh_submenu = Some(sub);
+            for (i, secs) in REFRESH_OPTIONS.iter().enumerate() {
+                let secs = *secs;
+                let config_path = config_path.to_path_buf();
+                let base_dir = base_dir.to_path_buf();
+                let cfg = cfg.clone();
+                let specs = specs.clone();
+                let handles = handles.to_vec();
+                let log_path = log_path.to_path_buf();
+                // separate clone for the error arm below (the original is
+                // moved into the menu closure)
+                let log_path_err = log_path.clone();
+                let current = current_refresh.clone();
+                let label = format!("{secs}s");
+                match tray
+                    .inner_mut()
+                    .add_submenu_item_with_id(sub, &label, move || {
+                        apply_refresh(
+                            secs,
+                            &config_path,
+                            &base_dir,
+                            &cfg,
+                            &specs,
+                            &handles,
+                            &log_path,
+                            &current,
+                        );
+                    }) {
+                    Ok(id) => refresh_ids[i] = id,
+                    Err(err) => crate::logging::append_line(
+                        &log_path_err,
+                        &format!("failed to add tray refresh menu item ({secs}s): {err}"),
+                    ),
+                }
+            }
+            // Check the currently active interval.
+            if let Some(pos) = REFRESH_OPTIONS.iter().position(|&v| v == active_refresh) {
+                let _ = tray
+                    .inner_mut()
+                    .set_submenu_item_checked(sub, refresh_ids[pos], true);
+            }
+        }
+        Err(err) => crate::logging::append_line(
+            log_path,
+            &format!("failed to add tray Refresh time submenu: {err}"),
+        ),
+    }
+
     let mut last_label = initial_label;
+    let mut last_refresh = active_refresh;
     while !quit.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(2));
+
+        // Move the check mark when the interval changed (e.g. the user
+        // picked a different one from the "Refresh time" submenu).
+        let refresh = current_refresh.load(Ordering::SeqCst);
+        if refresh != last_refresh {
+            if let Some(sub) = refresh_submenu {
+                for (i, id) in refresh_ids.iter().enumerate() {
+                    if *id != 0
+                        && let Err(err) = tray.inner_mut().set_submenu_item_checked(
+                            sub,
+                            *id,
+                            REFRESH_OPTIONS[i] == refresh,
+                        )
+                    {
+                        crate::logging::append_line(
+                            log_path,
+                            &format!("failed to update refresh menu check mark: {err}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            last_refresh = refresh;
+        }
 
         let label = status_label(handles);
         if label != last_label {

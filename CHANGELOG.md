@@ -13,6 +13,15 @@ _Changes in the next release_
 - `aster-launcher` suspends all children while Windows sleeps and respawns them after wake (power-event monitor).
 - On wake, the launcher optionally disables + re-enables the AOOSTAR USB UART before respawning children
   (`restart_uart_on_resume`, default `true`) — automates the old manual Device Manager fix.
+- Shared `refresh_time` option in `launcher.toml` sets the sensor refresh interval for both
+  `aster-sysinfo` and `hwbridge`; allowed values are 2, 5, 10, or 30 seconds. The legacy per-process
+  keys `sysinfo_refresh` / `hwbridge_refresh` still work when `refresh_time` is not set, and out-of-range
+  values are rejected instead of causing a respawn loop.
+- The refresh interval can be changed live from the tray icon (`Refresh time` sub-menu with
+  2s / 5s / 10s / 30s): the choice is written back to `launcher.toml` and `aster-sysinfo` + `hwbridge`
+  are restarted automatically to apply it; the active value is marked with a check mark.
+- Vendored `tray-item` (see `vendor/tray-item`) with Windows sub-menu support added — the crates.io
+  release has no sub-menu API and cannot deliver sub-menu item clicks.
 
 ### Fixed
 - `asterctl` no longer exits when the LCD serial port fails (e.g. after resume); it reopens the port with

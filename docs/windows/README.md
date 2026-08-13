@@ -91,8 +91,15 @@ and the other 2 inherit the same elevated process so nothing else needs its own 
 icon appears once running; right-click it to see status (running / degraded) or choose
 "Quit All" to stop everything.
 
-Edit `dist\launcher.toml` to change the monitor config file name or the refresh intervals, then
-restart `aster-launcher.exe` to apply changes.
+Edit `dist\launcher.toml` to change the monitor config file name or the sensor refresh interval, then
+restart `aster-launcher.exe` to apply changes. `refresh_time` sets the refresh interval in seconds for
+*both* `aster-sysinfo` and `hwbridge`; allowed values are 2, 5, 10, or 30 (default 5). The legacy
+per-process keys `sysinfo_refresh` / `hwbridge_refresh` still work when `refresh_time` is not set.
+
+You can also change the refresh interval live from the tray icon: right-click the tray icon and open
+the `Refresh time` sub-menu to pick `2s / 5s / 10s / 30s`. The chosen value is written back to
+`dist\launcher.toml` (survives restarts) and `aster-sysinfo` + `hwbridge` are restarted automatically
+to apply it; the active choice is marked with a check mark.
 
 Each process's own output goes to `dist\logs\aster-sysinfo.log`, `dist\logs\asterctl.log`, and
 `dist\logs\hwbridge.log`; these are truncated at every launcher start, so a log always covers just

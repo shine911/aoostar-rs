@@ -59,7 +59,8 @@ fn acquire_instance_lock(path: &std::path::Path) -> std::io::Result<std::fs::Fil
 #[cfg(windows)]
 fn windows_main() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
     let base_dir = std::env::current_exe()
         .expect("cannot resolve current exe path")
@@ -99,14 +100,20 @@ fn windows_main() {
     };
 
     let cfg = config::LauncherConfig::load(&base_dir.join("launcher.toml"));
-    let specs = process::child_specs(&base_dir, &cfg);
+    let config_path = base_dir.join("launcher.toml");
+    // Shared, mutable child specs: the tray's refresh menu rewrites them and
+    // restarts the children, whose watchers re-read the specs on every spawn.
+    let specs: Arc<Mutex<[process::ChildSpec; 3]>> =
+        Arc::new(Mutex::new(process::child_specs(&base_dir, &cfg)));
+    let current_refresh = Arc::new(AtomicU16::new(cfg.sysinfo_refresh_effective()));
 
     let quit = Arc::new(AtomicBool::new(false));
     let suspended = Arc::new(AtomicBool::new(false));
-    let mut handles: Vec<process::ChildHandle> = Vec::with_capacity(specs.len());
-    let mut watchers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let (handle, watcher) = process::spawn_and_watch(spec, quit.clone(), suspended.clone());
+    let mut handles: Vec<process::ChildHandle> = Vec::with_capacity(3);
+    let mut watchers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(3);
+    for index in 0..3 {
+        let (handle, watcher) =
+            process::spawn_and_watch(index, specs.clone(), quit.clone(), suspended.clone());
         handles.push(handle);
         watchers.push(watcher);
     }
@@ -120,7 +127,16 @@ fn windows_main() {
         launcher_log.clone(),
     );
 
-    tray::run(&handles, quit.clone(), &launcher_log);
+    tray::run(
+        &handles,
+        specs,
+        current_refresh,
+        quit.clone(),
+        &launcher_log,
+        &config_path,
+        &base_dir,
+        &cfg,
+    );
 
     // tray::run returned because quit was set (Quit All clicked) or because
     // the tray icon could not be created at all — make sure every watcher
