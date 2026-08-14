@@ -45,7 +45,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install build deps
-        run: sudo apt install pkg-config libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
 
       - uses: auguwu/clippy-action@1.4.0
         with:
@@ -56,6 +56,39 @@ jobs:
 
       - name: Unit tests
         run: cargo test
+
+  windows-check:
+    name: Windows-target check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache dependencies
+        id: cache-dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install build deps (llvm for llvm-rc used by winresource)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev llvm
+
+      - name: Add llvm tools to PATH
+        run: |
+          LLVM_DIR=$(ls -d /usr/lib/llvm-*/bin | head -n 1)
+          echo "$LLVM_DIR" >> "$GITHUB_PATH"
+
+      - name: Check Windows target
+        run: cargo check -p aster-launcher --target x86_64-pc-windows-msvc
 
   build:
     name: Linux-x64 build
@@ -76,7 +109,7 @@ jobs:
           echo "ARTIFACT_NAME=${{ env.APP_NAME }}-$APP_VERSION-${{ env.LINUX_ARTIFACT_SUFFIX }}" >> $GITHUB_ENV
 
       - name: Install build deps
-        run: sudo apt install pkg-config libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
 
       - name: Cache dependencies
         id: cache-dependencies
