@@ -42,6 +42,12 @@ _Changes in the next release_
 - LCD frames are now flushed to the serial port once per frame instead of once per 59-byte chunk, removing
   ~15,380 blocking `tcdrain` calls per full frame and letting the kernel pipeline chunks at full UART
   throughput (cherry-picked from upstream [#26](https://github.com/zehnm/aoostar-rs/pull/26)).
+- `asterctl` now retries the startup display init with backoff (1s → 2s → … → 32s, ~6 attempts) before
+  giving up, so a screen that is still waking up after USB re-enumeration comes back in-process instead of
+  crash-looping on the first write timeout.
+- `aster-launcher` now backs off when a child repeatedly exits with a failure shortly after spawn (e.g.
+  `asterctl` failing the display init after resume) instead of restarting it every few seconds forever,
+  hammering the serial port.
 
 ## v0.2.0 - 2025-08-31
 ### Fixed

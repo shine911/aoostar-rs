@@ -116,6 +116,28 @@ const FAILURE_BACKOFF_THRESHOLD: u32 = 3;
 #[cfg(windows)]
 const MAX_BACKOFF_SECS: u64 = 60;
 
+/// How long a child may run and still count as a "quick" exit for backoff
+/// purposes. An asterctl that crashes on the LCD display init after resume
+/// exits within ~3s; a healthy child runs for minutes. Kept cross-platform
+/// so the decision logic is unit-testable on any host.
+const QUICK_EXIT_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// True if a child that just exited should count as a backoff-worthy
+/// failure: it exited with a non-success status shortly after spawn
+/// (e.g. asterctl failing the LCD display init after resume). Such
+/// crash-exit loops would otherwise be restarted at the base delay forever,
+/// hammering the serial port every few seconds.
+///
+/// Kept cross-platform (and `#[allow(dead_code)]` on non-Windows builds)
+/// so the logic is covered by the cross-platform unit tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_quick_failure(status: Option<std::process::ExitStatus>, uptime: std::time::Duration) -> bool {
+    match status {
+        Some(status) if !status.success() => uptime < QUICK_EXIT_THRESHOLD,
+        _ => false,
+    }
+}
+
 /// Retry delay for the given number of consecutive spawn failures: the base
 /// delay up to the threshold, then doubling, capped at [`MAX_BACKOFF_SECS`].
 #[cfg(windows)]
@@ -230,7 +252,7 @@ pub fn spawn_and_watch(
 
             match spawn_child(&spec) {
                 Ok(child) => {
-                    consecutive_failures = 0;
+                    let spawn_time = std::time::Instant::now();
                     healthy.store(true, Ordering::SeqCst);
                     *current_child.lock().unwrap() = Some(child);
 
@@ -276,6 +298,20 @@ pub fn spawn_and_watch(
                         break;
                     }
 
+                    // Grow the backoff when the child keeps exiting quickly
+                    // with a failure (e.g. asterctl failing the LCD display
+                    // init after resume): a crash-exit loop must not be
+                    // restarted at the base delay forever, hammering the
+                    // serial port every few seconds. A child that ran past
+                    // QUICK_EXIT_THRESHOLD (or exited cleanly / was killed
+                    // deliberately, e.g. by the tray menus) resets the
+                    // counter so a normal restart stays immediate.
+                    if is_quick_failure(status, spawn_time.elapsed()) {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                    } else {
+                        consecutive_failures = 0;
+                    }
+
                     crate::logging::append_line(
                         &spec.log_path,
                         &format!("--- {} exited ({status:?}), restarting ---", spec.name),
@@ -306,6 +342,7 @@ pub fn spawn_and_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn builds_specs_relative_to_base_dir_using_config_values() {
@@ -432,5 +469,53 @@ mod tests {
                 "2".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn quick_exit_with_failure_counts_as_backoff_failure() {
+        // asterctl crashing on the LCD display init after resume: exits
+        // non-zero within ~3s of spawn.
+        assert!(is_quick_failure(
+            Some(exit_status_non_success()),
+            Duration::from_secs(2)
+        ));
+        // A child that ran for a while before failing (or was killed by the
+        // tray) must NOT grow the backoff.
+        assert!(!is_quick_failure(
+            Some(exit_status_non_success()),
+            Duration::from_secs(30)
+        ));
+        // A clean exit never counts, however quick.
+        assert!(!is_quick_failure(
+            Some(exit_status_success()),
+            Duration::from_secs(1)
+        ));
+        // No status (spawn-level error path) never counts either.
+        assert!(!is_quick_failure(None, Duration::from_secs(1)));
+    }
+
+    #[cfg(unix)]
+    fn exit_status_non_success() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1)
+    }
+
+    #[cfg(windows)]
+    fn exit_status_non_success() -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(1)
+    }
+
+    #[cfg(unix)]
+    fn exit_status_success() -> std::process::ExitStatus {
+        std::process::Command::new("true").status().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn exit_status_success() -> std::process::ExitStatus {
+        std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .status()
+            .unwrap()
     }
 }
