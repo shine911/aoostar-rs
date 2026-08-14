@@ -51,7 +51,14 @@ _Changes in the next release_
 - `aster-launcher` now re-enumerates the AOOSTAR USB UART on wake with the function-level reset
   `CM_Reset_Device` (an in-place USB port reset) instead of Device Manager-style disable/enable, which
   could leave the device in the "restart required" pending state; disable/enable is only used as a
-  fallback on pre-1809 Windows where `CM_Reset_Device` does not exist.
+  fallback where `CM_Reset_Device` is not exported (documented as Windows 10 1809+, but verified
+  absent from `CfgMgr32.dll` even on Windows 10 25H2 build 26200, so the fallback is what runs on the
+  WTR MAX).
+- `aster-launcher` now waits for the UART restart to finish before respawning the children after wake.
+  Previously the `suspended` flag was cleared immediately on resume, so `asterctl` could reopen COM3
+  while the UART was being disabled, making `CM_Disable_DevNode` fail (`CR_INSUFFICIENT_RESOURCES`,
+  launcher.log "USB UART restart failed: DisableFailed(23)") and leaving the port wedged — the LCD then
+  never recovered and `asterctl.log` filled with "semaphore timeout (os error 121)" init retries.
 
 ## v0.2.0 - 2025-08-31
 ### Fixed

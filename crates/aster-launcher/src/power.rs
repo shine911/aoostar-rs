@@ -70,6 +70,13 @@ struct PowerState {
     handles: Arc<Vec<ChildHandle>>,
     restart_uart_on_resume: bool,
     log_path: PathBuf,
+    /// True once a Resume has been acted on for the current sleep cycle.
+    /// Daemon-thread-only (a plain bool): Windows can send several Resume
+    /// notifications for one wake (e.g. 7 then 18) and only the first may
+    /// act. Reset by the next Suspend; starts true so a Resume with no
+    /// preceding Suspend is ignored (same as the previous `swap(false)`
+    /// guard on `suspended`).
+    resume_handled: bool,
 }
 
 /// State shared between the power callback (invoked by the system on a
@@ -138,7 +145,7 @@ pub(crate) fn start(
                 return;
             }
 
-            let shared = Shared {
+            let mut shared = Shared {
                 pending_event: AtomicU32::new(0),
                 wake,
                 power: PowerState {
@@ -146,6 +153,7 @@ pub(crate) fn start(
                     handles,
                     restart_uart_on_resume,
                     log_path,
+                    resume_handled: true,
                 },
             };
 
@@ -180,7 +188,7 @@ pub(crate) fn start(
                 }
                 let event_type = shared.pending_event.swap(0, Ordering::SeqCst);
                 if event_type != 0 {
-                    handle_power_event(&shared.power, event_type as usize);
+                    handle_power_event(&mut shared.power, event_type as usize);
                 }
             }
         }
@@ -188,29 +196,31 @@ pub(crate) fn start(
 }
 
 #[cfg(windows)]
-fn handle_power_event(state: &PowerState, event_type: usize) {
+fn handle_power_event(state: &mut PowerState, event_type: usize) {
     match classify_power_event(event_type) {
         PowerEvent::Suspend => {
             crate::logging::append_line(
                 &state.log_path,
                 "power: sleep detected, suspending children",
             );
+            // Arm the Resume handler for the next wake.
+            state.resume_handled = false;
             state.suspended.store(true, Ordering::SeqCst);
             crate::process::kill_all(&state.handles);
         }
         PowerEvent::Resume => {
             // Only the first Resume after a Suspend may act: Windows can
             // send several Resume notifications for one wake (e.g. 7 then
-            // 18), and a second pass would disable the UART while asterctl
-            // already has the COM port open again. The swap also records
-            // the Suspend→Resume transition.
-            if !state.suspended.swap(false, Ordering::SeqCst) {
+            // 18), and a second pass would re-restart the UART while a
+            // child already has the COM port open again.
+            if state.resume_handled {
                 crate::logging::append_line(
                     &state.log_path,
                     "power: resume already handled, ignoring",
                 );
                 return;
             }
+            state.resume_handled = true;
             crate::logging::append_line(
                 &state.log_path,
                 "power: wake detected, waiting for USB stack",
@@ -236,7 +246,15 @@ fn handle_power_event(state: &PowerState, event_type: usize) {
                     ),
                 }
             }
+            // The children must NOT respawn before the UART restart:
+            // asterctl reopening COM3 while the device is being disabled is
+            // what makes CM_Disable_DevNode fail (CR_INSUFFICIENT_RESOURCES),
+            // leaving the port wedged for the rest of the session. Keep
+            // `suspended` set (watchers keep sleeping) until the UART has
+            // been re-enumerated, then clear it so the children start with
+            // fresh serial handles.
             crate::logging::append_line(&state.log_path, "power: resuming children");
+            state.suspended.store(false, Ordering::SeqCst);
         }
         PowerEvent::Other => {}
     }

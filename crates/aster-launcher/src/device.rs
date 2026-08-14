@@ -60,9 +60,12 @@ const CM_RESET_DEVICE_SCOPE_DEVICE: u32 = 0;
 
 /// `CM_Reset_Device` — function-level reset of a device instance (for USB,
 /// a port reset that re-enumerates the device at the same port). Not
-/// exposed by windows-sys 0.60 and only present on Windows 10 1809+, so it
-/// is resolved dynamically via `GetProcAddress`; `Err(None)` means the
-/// export is unavailable (caller falls back to disable/enable),
+/// exposed by windows-sys 0.60, so it is resolved dynamically via
+/// `GetProcAddress`. Although documented as available since Windows 10
+/// 1809, the export is empirically ABSENT from `CfgMgr32.dll` on some
+/// builds (verified missing on Windows 10 25H2 build 26200), so the
+/// dynamic lookup is the only reliable way to use it: `Err(None)` means
+/// the export is unavailable (caller falls back to disable/enable),
 /// `Err(Some(code))` means the reset was attempted and failed with
 /// `code` (caller must NOT fall back to disable/enable).
 #[cfg(windows)]
@@ -95,10 +98,12 @@ fn cm_reset_device(dev_inst: u32) -> Result<(), Option<u32>> {
 
 /// Re-enumerates the device with instance ID `instance`. Preferred path is
 /// the function-level reset [`cm_reset_device`] (in-place USB port reset —
-/// no pending "restart required" state). On pre-1809 Windows, where that
-/// API does not exist, it falls back to the CfgMgr32 equivalents of Device
-/// Manager's "Disable device" / "Enable device" (the old behavior).
-/// Requires Administrator (the launcher runs elevated).
+/// no pending "restart required" state) when the export exists. When it
+/// does not (pre-1809 Windows, and — verified — Windows 10 25H2 build
+/// 26200), it falls back to the CfgMgr32 equivalents of Device Manager's
+/// "Disable device" / "Enable device" (the old behavior, which is what
+/// actually runs on the WTR MAX). Requires Administrator (the launcher
+/// runs elevated).
 #[cfg(windows)]
 pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFailure> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
