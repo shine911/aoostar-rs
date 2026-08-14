@@ -33,11 +33,18 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
             name: "asterctl",
             base_dir: base_dir.to_path_buf(),
             exe_path: base_dir.join("bin").join("asterctl.exe"),
-            args: vec![
-                "--config".to_string(),
-                cfg.monitor_config.clone(),
-                "--shm".to_string(),
-            ],
+            args: {
+                let mut args = vec![
+                    "--config".to_string(),
+                    cfg.monitor_config.clone(),
+                    "--shm".to_string(),
+                ];
+                if let Some(theme) = cfg.theme {
+                    args.push("--theme".to_string());
+                    args.push(theme.to_string());
+                }
+                args
+            },
             log_path: logs_dir.join("asterctl.log"),
         },
         ChildSpec {
@@ -309,6 +316,7 @@ mod tests {
             sysinfo_refresh: Some(7),
             hwbridge_refresh: Some(11),
             restart_uart_on_resume: true,
+            theme: None,
         };
 
         let specs = child_specs(base_dir, &cfg);
@@ -364,11 +372,65 @@ mod tests {
             sysinfo_refresh: Some(2),
             hwbridge_refresh: Some(30),
             restart_uart_on_resume: true,
+            theme: None,
         };
 
         let specs = child_specs(base_dir, &cfg);
 
         assert_eq!(specs[0].args.last().unwrap(), "2");
         assert_eq!(specs[2].args, vec!["--shm".to_string(), "30".to_string()]);
+    }
+
+    #[test]
+    fn theme_flag_flows_through_to_asterctl_args() {
+        let base_dir = Path::new("C:\\dist");
+        let cfg = LauncherConfig {
+            monitor_config: "Monitor3.json".to_string(),
+            refresh_time: None,
+            sysinfo_refresh: None,
+            hwbridge_refresh: None,
+            restart_uart_on_resume: true,
+            theme: Some(2),
+        };
+
+        let specs = child_specs(base_dir, &cfg);
+
+        assert_eq!(
+            specs[1].args,
+            vec![
+                "--config".to_string(),
+                "Monitor3.json".to_string(),
+                "--shm".to_string(),
+                "--theme".to_string(),
+                "2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_and_theme_flow_through_together() {
+        let base_dir = Path::new("C:\\dist");
+        let cfg = LauncherConfig {
+            monitor_config: "Monitor3.json".to_string(),
+            refresh_time: Some(10),
+            sysinfo_refresh: None,
+            hwbridge_refresh: None,
+            restart_uart_on_resume: true,
+            theme: Some(2),
+        };
+
+        let specs = child_specs(base_dir, &cfg);
+
+        assert_eq!(specs[0].args.last().unwrap(), "10");
+        assert_eq!(
+            specs[1].args,
+            vec![
+                "--config".to_string(),
+                "Monitor3.json".to_string(),
+                "--shm".to_string(),
+                "--theme".to_string(),
+                "2".to_string()
+            ]
+        );
     }
 }

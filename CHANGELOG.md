@@ -29,6 +29,12 @@ _Changes in the next release_
   are restarted automatically to apply it; the active value is marked with a check mark.
 - Vendored `tray-item` (see `vendor/tray-item`) with Windows sub-menu support added — the crates.io
   release has no sub-menu API and cannot deliver sub-menu item clicks.
+- `aster-launcher` tray "Themes" sub-menu with the official AOOSTAR-X theme options (Default, Cyberpunk,
+  Interstellar, Cartoon): picking one persists `theme` in `launcher.toml` and restarts `asterctl`, which
+  activates the matching built-in panel pair. `asterctl --theme <0-3>` selects the theme from the command
+  line (the CLI flag wins over `setup.theme` in the monitor config; without either, the config's own
+  `mianban` is used unchanged). Theme handling mirrors the official AOOSTAR-X behavior: theme N activates
+  panels `(1+2N, 2+2N)` filtered by the `controlParams` / `controlDiskTemp` flags.
 
 ### Fixed
 - `asterctl` no longer exits when the LCD serial port fails (e.g. after resume); it reopens the port with

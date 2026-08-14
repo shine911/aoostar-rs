@@ -128,6 +128,34 @@ pub struct MonitorConfig {
     pub sensor_filter: Option<Vec<Regex>>,
 }
 
+/// Maps a theme index (0-3) plus the two panel-type flags to the 1-based
+/// active panel indices, mirroring the official AOOSTAR-X save-config logic:
+///
+/// | theme | both flags     | controlParams only | controlDiskTemp only | neither |
+/// |-------|----------------|--------------------|----------------------|---------|
+/// | 0     | [1, 2]         | [1]                | [2]                  | []      |
+/// | 1     | [3, 4]         | [3]                | [4]                  | []      |
+/// | 2     | [5, 6]         | [5]                | [6]                  | []      |
+/// | 3     | [7, 8]         | [7]                | [8]                  | []      |
+pub fn active_panels_for_theme(
+    theme: i32,
+    control_params: bool,
+    control_disk_temp: bool,
+) -> Vec<u32> {
+    debug_assert!(
+        (0..=3).contains(&theme),
+        "theme index out of range: {theme}"
+    );
+    let first = (1 + 2 * theme) as u32;
+    let second = first + 1;
+    match (control_params, control_disk_temp) {
+        (true, true) => vec![first, second],
+        (true, false) => vec![first],
+        (false, true) => vec![second],
+        (false, false) => vec![],
+    }
+}
+
 impl MonitorConfig {
     pub fn get_next_active_panel(&mut self) -> Option<&Panel> {
         // Wraparound must be based on how many panels are actually marked active
@@ -168,6 +196,40 @@ impl MonitorConfig {
         }
 
         None
+    }
+
+    /// Applies a theme index: replaces `active_panels` with the panel pair
+    /// the official AOOSTAR-X software would activate for this theme,
+    /// honoring the `controlParams` / `controlDiskTemp` flags.
+    ///
+    /// Keeps the config's own `mianban` unchanged (with a logged warning)
+    /// when the theme is out of range or the config does not define all
+    /// referenced panels, or when the theme would select no panels (both
+    /// flags off).
+    pub fn apply_theme(&mut self, theme: i32) {
+        if !(0..=3).contains(&theme) {
+            warn!("Invalid theme {theme}, expected 0-3; keeping the configured active panels");
+            return;
+        }
+        let panels = active_panels_for_theme(
+            theme,
+            self.setup.control_params.unwrap_or(false),
+            self.setup.control_disk_temp.unwrap_or(false),
+        );
+        if panels.is_empty() {
+            warn!(
+                "Theme {theme} selects no panels (controlParams and controlDiskTemp both off); keeping the configured active panels"
+            );
+            return;
+        }
+        if panels.iter().all(|&p| (p as usize) <= self.panels.len()) {
+            self.active_panels = panels;
+        } else {
+            warn!(
+                "Theme {theme} selects panels {panels:?}, but the config defines only {} panels; keeping the configured active panels",
+                self.panels.len()
+            );
+        }
     }
 
     /// Adds a custom panel to the application and maps sensor labels if applicable.
@@ -218,16 +280,16 @@ pub struct Setup {
     pub switch_time: Option<String>, // existed as "30" string
     /// Panel redraw interval in seconds. Default: 1
     pub refresh: f32,
+    /// Theme index 0-3 (Default, Cyberpunk, Interstellar, Cartoon): selects
+    /// which built-in panels are active, exactly like the official
+    /// AOOSTAR-X software. Absent in custom configs.
+    pub theme: Option<i32>,
+    /// Show the "index" (system overview) panel of the theme's panel pair.
+    pub control_params: Option<bool>,
+    /// Show the "hdd" (disk temperature) panel of the theme's panel pair.
+    pub control_disk_temp: Option<bool>,
     /*
     // The following fields of the AOOSTAR-X json configuration file are NOT used in `asterctl`
-    /// Default: true
-    pub off_display: bool,
-    /// Selection of default panels based on theme / control_params / control_disk_temp ?
-    pub theme: i32,
-    /// ? Default: true
-    pub control_params: bool,
-    /// ? Default: true
-    pub control_disk_temp: bool,
     /// Default: false
     pub custom_panel: bool,
     /// Language index. Default: 0
@@ -636,4 +698,115 @@ where
 {
     let rounded = f32::deserialize(deserializer).map(f32::round)?;
     Ok(rounded as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_maps_panels_exactly_like_official_software() {
+        // (theme, controlParams, controlDiskTemp) -> expected active panels
+        let cases: &[(i32, bool, bool, &[u32])] = &[
+            (0, true, true, &[1, 2]),
+            (0, true, false, &[1]),
+            (0, false, true, &[2]),
+            (0, false, false, &[]),
+            (1, true, true, &[3, 4]),
+            (1, true, false, &[3]),
+            (1, false, true, &[4]),
+            (1, false, false, &[]),
+            (2, true, true, &[5, 6]),
+            (2, true, false, &[5]),
+            (2, false, true, &[6]),
+            (2, false, false, &[]),
+            (3, true, true, &[7, 8]),
+            (3, true, false, &[7]),
+            (3, false, true, &[8]),
+            (3, false, false, &[]),
+        ];
+        for (theme, params, disk, expected) in cases {
+            assert_eq!(
+                active_panels_for_theme(*theme, *params, *disk),
+                *expected,
+                "theme={theme} controlParams={params} controlDiskTemp={disk}"
+            );
+        }
+    }
+
+    /// Builds a config with `n` minimal panels. `theme` is only written into
+    /// `setup` when `Some`. The panel-type flags are always present.
+    fn config_with_panels(n: usize, theme: Option<i32>, params: bool, disk: bool) -> MonitorConfig {
+        let panels: Vec<String> = (1..=n)
+            .map(|i| {
+                format!(
+                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": -1, "pic": "", "x": 10, "y": 10}}]}}"#
+                )
+            })
+            .collect();
+        let theme_json = theme
+            .map(|t| format!(r#", "theme": {t}"#))
+            .unwrap_or_default();
+        let json = format!(
+            r#"{{"setup": {{"refresh": 1, "controlParams": {params}, "controlDiskTemp": {disk}{theme_json}}}, "mianban": [1], "diy": [{}]}}"#,
+            panels.join(",")
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn apply_theme_replaces_active_panels() {
+        let mut cfg = config_with_panels(8, Some(2), true, true);
+        assert_eq!(cfg.active_panels, vec![1]);
+        cfg.apply_theme(2);
+        assert_eq!(cfg.active_panels, vec![5, 6]);
+    }
+
+    #[test]
+    fn apply_theme_honors_panel_type_flags() {
+        let mut cfg = config_with_panels(8, Some(1), true, false);
+        cfg.apply_theme(1);
+        assert_eq!(cfg.active_panels, vec![3]);
+    }
+
+    #[test]
+    fn apply_theme_keeps_mianban_when_panels_are_missing() {
+        let mut cfg = config_with_panels(4, Some(3), true, true); // theme 3 wants [7, 8]
+        cfg.apply_theme(3);
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
+
+    #[test]
+    fn apply_theme_keeps_mianban_for_out_of_range_theme() {
+        let mut cfg = config_with_panels(8, None, true, true);
+        cfg.apply_theme(7);
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
+
+    #[test]
+    fn apply_theme_keeps_mianban_when_no_panel_flags() {
+        let mut cfg = config_with_panels(8, Some(1), false, false);
+        cfg.apply_theme(1);
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
+
+    #[test]
+    fn apply_theme_defaults_missing_flags_to_off() {
+        // no controlParams/controlDiskTemp keys in the JSON at all
+        let panels: Vec<String> = (1..=8)
+            .map(|i| {
+                format!(
+                    r#"{{"img": "default_{i}_index.jpg", "sensor": [{{"mode": 1, "label": "cpu", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": -1, "pic": "", "x": 10, "y": 10}}]}}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"setup": {{"refresh": 1, "theme": 2}}, "mianban": [1], "diy": [{}]}}"#,
+            panels.join(",")
+        );
+        let mut cfg: MonitorConfig = serde_json::from_str(&json).unwrap();
+        cfg.apply_theme(2);
+        // both flags default to false -> empty set -> keep mianban
+        assert_eq!(cfg.active_panels, vec![1]);
+    }
 }
