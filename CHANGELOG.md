@@ -39,6 +39,9 @@ _Changes in the next release_
 ### Fixed
 - `asterctl` no longer exits when the LCD serial port fails (e.g. after resume); it reopens the port with
   backoff and re-initializes the display in-process.
+- LCD frames are now flushed to the serial port once per frame instead of once per 59-byte chunk, removing
+  ~15,380 blocking `tcdrain` calls per full frame and letting the kernel pipeline chunks at full UART
+  throughput (cherry-picked from upstream [#26](https://github.com/zehnm/aoostar-rs/pull/26)).
 
 ## v0.2.0 - 2025-08-31
 ### Fixed
