@@ -22,6 +22,16 @@ Check out the **[User Guide](https://shine911.github.io/aoostar-rs)** for a list
       `AOOSTAR_HW_STATS` shared memory region, which `asterctl --shm` reads directly — no file I/O in the hot path.
 - USB device/serial port selection.
 
+## Requirements
+
+- **Linux**: no extra requirements beyond the runtime binaries themselves.
+- **Windows**: the hardware temperature / GPU sensors in the sensor panels are read by
+  [`hwbridge`](hwbridge/HwBridge.cs), which loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X
+  itself uses — an AOOSTAR-X build backed by the **PawnIO** driver stack. Install the official
+  AOOSTAR-X prerequisite **`PawnIO.exe`** (download and install it first, per the AOOSTAR-X software
+  requirements) before first run; otherwise those hardware sensors will not be available. The LCD
+  display, serial protocol, and basic system sensors (CPU/memory/disk/network) work without it.
+
 ## Disclaimer
 
 > I take no responsibility for the use of this software.  
