@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // switch on screen for remaining commands
-    screen.init()?;
+    init_display_with_retry(&mut screen)?;
 
     if let Some(config) = args.config {
         info!("Starting sensor panel mode");
@@ -183,6 +183,44 @@ fn main() -> anyhow::Result<()> {
     info!("Bye bye!");
 
     Ok(())
+}
+
+/// Display-init retry budget. 1s+2s+4s+8s+16s of backoff plus the init
+/// timeouts themselves cover the observed post-resume window in which the
+/// LCD takes a while to accept writes after USB re-enumeration (~10s in the
+/// common case); when the budget is exhausted the error is returned and the
+/// launcher watcher restarts us (with its own backoff for crash-exit loops).
+const INIT_RETRY_ATTEMPTS: u32 = 6;
+
+/// Backoff in seconds before the n-th display-init retry: 1, 2, 4, ..., 32.
+/// Mirrors the reconnect backoff used by `asterctl-lcd`'s
+/// `reconnect_with_retry`. Extracted so the sequence is unit-testable.
+fn init_backoff_secs(attempt: u32) -> u64 {
+    1u64 << attempt.min(5)
+}
+
+/// Tries `screen.init()`, backing off between attempts ([`init_backoff_secs`])
+/// so a display that is still waking up after USB re-enumeration gets a
+/// chance to respond instead of the process exiting on the first timeout.
+/// Returns the last error once [`INIT_RETRY_ATTEMPTS`] are exhausted.
+fn init_display_with_retry(screen: &mut AooScreen) -> anyhow::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match screen.init() {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt + 1 < INIT_RETRY_ATTEMPTS => {
+                let delay = Duration::from_secs(init_backoff_secs(attempt));
+                error!(
+                    "Display init failed: {e:?}; retrying in {}s (attempt {})",
+                    delay.as_secs(),
+                    attempt + 1
+                );
+                sleep(delay);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn load_configuration<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
@@ -436,5 +474,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.active_panels, vec![1]);
+    }
+
+    #[test]
+    fn init_backoff_grows_and_caps() {
+        assert_eq!(init_backoff_secs(0), 1);
+        assert_eq!(init_backoff_secs(1), 2);
+        assert_eq!(init_backoff_secs(2), 4);
+        assert_eq!(init_backoff_secs(3), 8);
+        assert_eq!(init_backoff_secs(4), 16);
+        assert_eq!(init_backoff_secs(5), 32);
+        // cap at 32s for any further attempt
+        assert_eq!(init_backoff_secs(6), 32);
+        assert_eq!(init_backoff_secs(100), 32);
     }
 }

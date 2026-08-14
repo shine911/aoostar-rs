@@ -42,6 +42,23 @@ _Changes in the next release_
 - LCD frames are now flushed to the serial port once per frame instead of once per 59-byte chunk, removing
   ~15,380 blocking `tcdrain` calls per full frame and letting the kernel pipeline chunks at full UART
   throughput (cherry-picked from upstream [#26](https://github.com/zehnm/aoostar-rs/pull/26)).
+- `asterctl` now retries the startup display init with backoff (1s → 2s → … → 32s, ~6 attempts) before
+  giving up, so a screen that is still waking up after USB re-enumeration comes back in-process instead of
+  crash-looping on the first write timeout.
+- `aster-launcher` now backs off when a child repeatedly exits with a failure shortly after spawn (e.g.
+  `asterctl` failing the display init after resume) instead of restarting it every few seconds forever,
+  hammering the serial port.
+- `aster-launcher` now re-enumerates the AOOSTAR USB UART on wake with the function-level reset
+  `CM_Reset_Device` (an in-place USB port reset) instead of Device Manager-style disable/enable, which
+  could leave the device in the "restart required" pending state; disable/enable is only used as a
+  fallback where `CM_Reset_Device` is not exported (documented as Windows 10 1809+, but verified
+  absent from `CfgMgr32.dll` even on Windows 10 25H2 build 26200, so the fallback is what runs on the
+  WTR MAX).
+- `aster-launcher` now waits for the UART restart to finish before respawning the children after wake.
+  Previously the `suspended` flag was cleared immediately on resume, so `asterctl` could reopen COM3
+  while the UART was being disabled, making `CM_Disable_DevNode` fail (`CR_INSUFFICIENT_RESOURCES`,
+  launcher.log "USB UART restart failed: DisableFailed(23)") and leaving the port wedged — the LCD then
+  never recovered and `asterctl.log` filled with "semaphore timeout (os error 121)" init retries.
 
 ## v0.2.0 - 2025-08-31
 ### Fixed
