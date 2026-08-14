@@ -1,0 +1,67 @@
+name: Windows dist release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-dist:
+    name: Build dist and upload zip
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Build HwBridge.exe
+        shell: pwsh
+        working-directory: hwbridge
+        run: |
+          $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs
+
+      - name: Assemble dist folder
+        shell: pwsh
+        run: .\windows\package-dist.ps1
+
+      - name: Create zip and checksum
+        shell: pwsh
+        run: |
+          $zip = "aoostar-rs-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
+          $hash = Get-FileHash -Algorithm SHA256 $zip
+          Set-Content -Path "$($zip).sha256" -Value "$($hash.Hash)  $zip"
+
+      - name: Upload zip as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-windows-x64
+          path: |
+            aoostar-rs-*.zip
+            aoostar-rs-*.sha256
+          if-no-files-found: error
+
+      - name: Upload to GitHub release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            aoostar-rs-*.zip
+            aoostar-rs-*.sha256

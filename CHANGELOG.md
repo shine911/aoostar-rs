@@ -35,6 +35,10 @@ _Changes in the next release_
   line (the CLI flag wins over `setup.theme` in the monitor config; without either, the config's own
   `mianban` is used unchanged). Theme handling mirrors the official AOOSTAR-X behavior: theme N activates
   panels `(1+2N, 2+2N)` filtered by the `controlParams` / `controlDiskTemp` flags.
+- GitHub Actions: the CI workflow additionally type-checks the Windows-only launcher code (`cargo check`
+  for the `x86_64-pc-windows-msvc` target), and a new release workflow builds the full Windows `dist\`
+  package (release binaries + `HwBridge.exe` + cfg/fonts, via `windows/package-dist.ps1`) and uploads
+  `aoostar-rs-<tag>-windows-x64.zip` (with SHA-256 checksum) to the GitHub release.
 
 ### Fixed
 - `asterctl` no longer exits when the LCD serial port fails (e.g. after resume); it reopens the port with
