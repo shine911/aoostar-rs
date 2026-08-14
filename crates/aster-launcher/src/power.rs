@@ -217,17 +217,19 @@ fn handle_power_event(state: &PowerState, event_type: usize) {
             );
             std::thread::sleep(std::time::Duration::from_secs(RESUME_SETTLE_SECS));
             if state.restart_uart_on_resume {
-                crate::logging::append_line(
-                    &state.log_path,
-                    "power: restarting AOOSTAR USB UART (disable/enable)",
-                );
+                crate::logging::append_line(&state.log_path, "power: resetting AOOSTAR USB UART");
                 match crate::device::restart_uart(
                     crate::device::AOOSTAR_UART_VID,
                     crate::device::AOOSTAR_UART_PID,
                 ) {
-                    Ok(()) => {
-                        crate::logging::append_line(&state.log_path, "power: USB UART restarted")
-                    }
+                    Ok(crate::device::RestartMethod::Reset) => crate::logging::append_line(
+                        &state.log_path,
+                        "power: USB UART restarted (CM_Reset_Device)",
+                    ),
+                    Ok(crate::device::RestartMethod::DisableEnable) => crate::logging::append_line(
+                        &state.log_path,
+                        "power: USB UART restarted (disable/enable fallback)",
+                    ),
                     Err(e) => crate::logging::append_line(
                         &state.log_path,
                         &format!("power: USB UART restart failed: {e:?}"),

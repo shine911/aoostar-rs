@@ -25,24 +25,82 @@ pub(crate) fn is_our_instance(instance: &str, vid: u16, pid: u16) -> bool {
     upper.starts_with(&prefix) && upper.as_bytes().get(prefix.len()) == Some(&b'\\')
 }
 
-/// Why a device restart failed. `CONFIGRET` values are `u32`.
+/// Why a device reset failed. `CONFIGRET` values are `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartFailure {
     /// Device not present / could not be located.
     NotPresent,
+    /// `CM_Reset_Device` failed with this CONFIGRET. Deliberately NOT
+    /// followed by a disable/enable fallback: a failing function-level
+    /// reset is a worse device state than no restart, and disable/enable is
+    /// what can leave the device in the "restart required" pending state.
+    ResetFailed(u32),
     /// `CM_Disable_DevNode` failed with this CONFIGRET.
     DisableFailed(u32),
     /// `CM_Enable_DevNode` failed with this CONFIGRET (after one retry).
     EnableFailed(u32),
 }
 
-/// Disables and re-enables the device with instance ID `instance` (CfgMgr32
-/// equivalents of Device Manager's "Disable device" / "Enable device"),
-/// forcing the USB stack to re-enumerate it. Requires Administrator (the
-/// launcher runs elevated). A short delay between disable and enable lets
-/// PnP finish processing the disable before the enable is attempted.
+/// Which mechanism successfully re-enumerated the device (logged by
+/// `power.rs` so the wake path is diagnosable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartMethod {
+    /// `CM_Reset_Device` function-level reset (USB port reset): the device
+    /// re-enumerates in place, without the disable→enable state machine, so
+    /// Windows never asks for a reboot.
+    Reset,
+    /// `CM_Reset_Device` is not available (pre-1809 Windows); the old
+    /// disable/enable sequence was used instead.
+    DisableEnable,
+}
+
+/// `CM_Reset_Device` scope: reset the device instance itself.
 #[cfg(windows)]
-pub(crate) fn restart_device(instance: &str) -> Result<(), RestartFailure> {
+const CM_RESET_DEVICE_SCOPE_DEVICE: u32 = 0;
+
+/// `CM_Reset_Device` — function-level reset of a device instance (for USB,
+/// a port reset that re-enumerates the device at the same port). Not
+/// exposed by windows-sys 0.60 and only present on Windows 10 1809+, so it
+/// is resolved dynamically via `GetProcAddress`; `Err(None)` means the
+/// export is unavailable (caller falls back to disable/enable),
+/// `Err(Some(code))` means the reset was attempted and failed with
+/// `code` (caller must NOT fall back to disable/enable).
+#[cfg(windows)]
+fn cm_reset_device(dev_inst: u32) -> Result<(), Option<u32>> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+    unsafe {
+        let lib_name: Vec<u16> = "CfgMgr32.dll\0".encode_utf16().collect();
+        let lib = LoadLibraryW(lib_name.as_ptr());
+        if lib.is_null() {
+            return Err(None);
+        }
+
+        let fn_name = b"CM_Reset_Device\0";
+        let proc = GetProcAddress(lib, fn_name.as_ptr());
+        let Some(proc) = proc else {
+            return Err(None);
+        };
+
+        type ResetFn = unsafe extern "system" fn(dev_inst: u32, scope: u32) -> u32;
+        let reset: ResetFn = std::mem::transmute(proc);
+        let ret = reset(dev_inst, CM_RESET_DEVICE_SCOPE_DEVICE);
+        if ret == windows_sys::Win32::Devices::DeviceAndDriverInstallation::CR_SUCCESS {
+            Ok(())
+        } else {
+            Err(Some(ret))
+        }
+    }
+}
+
+/// Re-enumerates the device with instance ID `instance`. Preferred path is
+/// the function-level reset [`cm_reset_device`] (in-place USB port reset —
+/// no pending "restart required" state). On pre-1809 Windows, where that
+/// API does not exist, it falls back to the CfgMgr32 equivalents of Device
+/// Manager's "Disable device" / "Enable device" (the old behavior).
+/// Requires Administrator (the launcher runs elevated).
+#[cfg(windows)]
+pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFailure> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         CM_Disable_DevNode, CM_Enable_DevNode, CM_Locate_DevNodeW, CR_SUCCESS,
     };
@@ -53,6 +111,18 @@ pub(crate) fn restart_device(instance: &str) -> Result<(), RestartFailure> {
         if CM_Locate_DevNodeW(&mut dev_inst, id.as_ptr(), 0) != CR_SUCCESS {
             return Err(RestartFailure::NotPresent);
         }
+
+        // Preferred path: function-level reset.
+        match cm_reset_device(dev_inst) {
+            Ok(()) => return Ok(RestartMethod::Reset),
+            // Reset API exists but failed: do NOT fall back to
+            // disable/enable, which can leave the device in the
+            // "restart required" state that Windows wants a reboot for.
+            Err(Some(code)) => return Err(RestartFailure::ResetFailed(code)),
+            // Pre-1809 Windows: no CM_Reset_Device export — disable/enable.
+            Err(None) => {}
+        }
+
         let ret = CM_Disable_DevNode(dev_inst, 0);
         if ret != CR_SUCCESS {
             return Err(RestartFailure::DisableFailed(ret));
@@ -67,7 +137,7 @@ pub(crate) fn restart_device(instance: &str) -> Result<(), RestartFailure> {
                 return Err(RestartFailure::EnableFailed(retry));
             }
         }
-        Ok(())
+        Ok(RestartMethod::DisableEnable)
     }
 }
 
@@ -120,7 +190,7 @@ pub(crate) fn find_uart_instance(vid: u16, pid: u16) -> Option<String> {
 
 /// Convenience: restart the AOOSTAR LCD UART by VID/PID, if present.
 #[cfg(windows)]
-pub(crate) fn restart_uart(vid: u16, pid: u16) -> Result<(), RestartFailure> {
+pub(crate) fn restart_uart(vid: u16, pid: u16) -> Result<RestartMethod, RestartFailure> {
     match find_uart_instance(vid, pid) {
         Some(instance) => restart_device(&instance),
         None => Err(RestartFailure::NotPresent),

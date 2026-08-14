@@ -48,6 +48,10 @@ _Changes in the next release_
 - `aster-launcher` now backs off when a child repeatedly exits with a failure shortly after spawn (e.g.
   `asterctl` failing the display init after resume) instead of restarting it every few seconds forever,
   hammering the serial port.
+- `aster-launcher` now re-enumerates the AOOSTAR USB UART on wake with the function-level reset
+  `CM_Reset_Device` (an in-place USB port reset) instead of Device Manager-style disable/enable, which
+  could leave the device in the "restart required" pending state; disable/enable is only used as a
+  fallback on pre-1809 Windows where `CM_Reset_Device` does not exist.
 
 ## v0.2.0 - 2025-08-31
 ### Fixed
