@@ -74,15 +74,25 @@ pub struct ChildHandle {
     pub current_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
 }
 
-/// Force-kills every currently running child (used on power suspend and on
-/// launcher shutdown). Safe to call with children already dead.
+/// Best-effort force-kill of every currently running child (used on power
+/// suspend and on launcher shutdown to stop the children immediately). This
+/// is NOT the guarantee that children die: it can miss a child that is
+/// being respawned at that moment (`current_child` still `None`), and a
+/// failed `TerminateProcess` used to be swallowed silently — both are why
+/// the watcher threads force-kill their own children on quit/suspend too
+/// (see `spawn_and_watch`). Safe to call with children already dead.
 #[cfg(windows)]
-pub(crate) fn kill_all(handles: &[ChildHandle]) {
+pub(crate) fn kill_all(handles: &[ChildHandle], log_path: &Path) {
     for handle in handles {
         if let Ok(mut guard) = handle.current_child.lock()
             && let Some(child) = guard.as_mut()
         {
-            let _ = child.kill();
+            if let Err(err) = child.kill() {
+                crate::logging::append_line(
+                    log_path,
+                    &format!("kill_all: failed to kill {}: {err}", handle.name),
+                );
+            }
         }
     }
 }
@@ -110,6 +120,15 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// spawn attempt.
 #[cfg(windows)]
 const RETRY_DELAY_SECS: u64 = 2;
+
+/// Grace period the watchers wait (after the launcher signals its shutdown
+/// sequence has started, see `shutting_down` in `spawn_and_watch`) before
+/// force-killing their children on a clean quit. It lets asterctl poll the
+/// "off" display-state once (it re-polls every ~1s, see `STATE_POLL_STEP`
+/// in asterctl) so the LCD is blanked before the processes die. main.rs
+/// uses the same value for its own pre-kill sleep.
+#[cfg(windows)]
+pub(crate) const QUIT_KILL_GRACE_SECS: u64 = 2;
 
 /// Number of consecutive *spawn failures* tolerated at the base delay before
 /// the delay starts widening. A child that can never start (missing exe,
@@ -203,12 +222,22 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
 /// shutdown can wait for the thread to actually observe `quit` (a watcher
 /// still running while the process is torn down could orphan a hidden
 /// elevated child).
+///
+/// The watcher is also the *guarantee* that a spawned child never outlives
+/// the launcher: on `quit` or `suspended` it force-kills its own child and
+/// retries until the process is actually gone (see the wait loop). `kill_all`
+/// is only a best-effort early kill — it can race a respawn and swallows
+/// TerminateProcess errors — which is exactly how a child used to survive
+/// shutdown (e.g. HwBridge.exe after Quit). `shutting_down` anchors the
+/// clean-quit grace so the force-kill cannot preempt asterctl blanking the
+/// LCD (see [`QUIT_KILL_GRACE_SECS`]).
 #[cfg(windows)]
 pub fn spawn_and_watch(
     index: usize,
     specs: std::sync::Arc<std::sync::Mutex<[ChildSpec; 3]>>,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     suspended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (ChildHandle, std::thread::JoinHandle<()>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -262,35 +291,72 @@ pub fn spawn_and_watch(
                     healthy.store(true, Ordering::SeqCst);
                     *current_child.lock().unwrap() = Some(child);
 
-                    // Re-check quit (and the suspend flag) immediately after
-                    // storing the child: a shutdown's or the power monitor's
-                    // kill attempt that ran while spawn_child() was doing I/O
-                    // (before the child existed to be killed) would have
-                    // no-op'd on a still-None current_child. This re-check
-                    // guarantees we self-kill instead of leaking an orphaned
-                    // hidden process — or one that would hold the serial port
-                    // through a sleep. On quit we stop the watcher; on suspend
-                    // we loop back and wait for the flag to clear.
-                    if quit.load(Ordering::SeqCst) || suspended.load(Ordering::SeqCst) {
-                        if let Some(child) = current_child.lock().unwrap().as_mut() {
-                            let _ = child.kill();
-                        }
-                        if quit.load(Ordering::SeqCst) {
-                            break;
-                        }
-                    }
-
-                    // Block until the child exits, without holding the lock
-                    // (so a quit-triggered kill() from another thread can
-                    // still reach it).
+                    // Block until the child exits — or, on quit/suspend,
+                    // until it has been force-killed (see below). The lock
+                    // is held only briefly per check so a kill from another
+                    // thread can still reach the child.
+                    let mut grace_done = false;
+                    let mut kill_notice_logged = false;
                     let status = loop {
+                        // On a clean quit, first wait for the launcher's
+                        // shutdown sequence to start (display-state write +
+                        // grace for asterctl to blank the LCD), so this
+                        // force-kill can never preempt the display-off.
+                        // Anchored on `shutting_down` rather than `quit`
+                        // because the tray loop may notice `quit` up to ~2s
+                        // late.
+                        if quit.load(Ordering::SeqCst) && !grace_done {
+                            while !shutting_down.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(
+                                QUIT_KILL_GRACE_SECS,
+                            ));
+                            grace_done = true;
+                        }
+
                         let mut guard = current_child.lock().unwrap();
                         match guard.as_mut() {
-                            Some(child) => match child.try_wait() {
-                                Ok(Some(status)) => break Some(status),
-                                Ok(None) => {}
-                                Err(_) => break None,
-                            },
+                            Some(child) => {
+                                if quit.load(Ordering::SeqCst) || suspended.load(Ordering::SeqCst) {
+                                    // Shutdown or sleep: the child must not
+                                    // outlive the launcher. `kill_all` is
+                                    // best-effort (respawn race, swallowed
+                                    // TerminateProcess errors), so the
+                                    // watcher — which owns the Child —
+                                    // force-kills it here and retries until
+                                    // it is actually gone.
+                                    match child.try_wait() {
+                                        Ok(Some(status)) => break Some(status),
+                                        _ => {
+                                            let result = child.kill();
+                                            if !kill_notice_logged {
+                                                match result {
+                                                    Ok(()) => crate::logging::append_line(
+                                                        &log_path,
+                                                        &format!(
+                                                            "{name}: force-killed by watcher (kill_all missed it)"
+                                                        ),
+                                                    ),
+                                                    Err(err) => crate::logging::append_line(
+                                                        &log_path,
+                                                        &format!(
+                                                            "{name}: kill failed during shutdown/suspend: {err}; retrying"
+                                                        ),
+                                                    ),
+                                                }
+                                                kill_notice_logged = true;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    match child.try_wait() {
+                                        Ok(Some(status)) => break Some(status),
+                                        Ok(None) => {}
+                                        Err(_) => break None,
+                                    }
+                                }
+                            }
                             None => break None,
                         }
                         drop(guard);

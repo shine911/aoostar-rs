@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the file go stale (~10s) it switches the display off and exits to free the serial port. Quitting
   the launcher from the tray blanks the display the same way before the child processes are stopped.
 
+### Fixed
+- `aster-launcher` no longer leaves a child process running after shutdown (e.g. `HwBridge.exe`
+  surviving a tray Quit). Killing was a single best-effort `kill_all` from the main thread that
+  swallowed `TerminateProcess` errors and could miss a child being respawned at that moment; each
+  watcher thread now force-kills its own child on quit/suspend and retries until the process is
+  actually gone, logging if `kill_all` missed it. The quit grace is anchored on a `shutting_down`
+  flag set together with the LCD "off" write, so the watchers cannot kill `asterctl` before it
+  blanks the display.
+
 ## v0.3.0 - 2026-08-14
 
 ### Added

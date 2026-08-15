@@ -29,13 +29,6 @@ fn main() {
 #[cfg(windows)]
 const SHARING_VIOLATION_CODES: [i32; 2] = [32, 33];
 
-/// Seconds the launcher waits after writing `display.state = off` on
-/// shutdown before killing asterctl, so asterctl (which re-polls the state
-/// file every ~1s) can blank the LCD. Must comfortably exceed the poll
-/// step; see `STATE_POLL_STEP` in asterctl.
-#[cfg(windows)]
-const LCD_OFF_GRACE_SECS: u64 = 2;
-
 /// Opens `path` as this process's single-instance lock. The returned handle
 /// must be kept alive for as long as the lock should be held.
 ///
@@ -130,11 +123,20 @@ fn windows_main() {
 
     let quit = Arc::new(AtomicBool::new(false));
     let suspended = Arc::new(AtomicBool::new(false));
+    // Set once the shutdown sequence has started (display-state write +
+    // grace): the child watchers wait for it before force-killing on quit,
+    // so asterctl has time to blank the LCD (see process.rs).
+    let shutting_down = Arc::new(AtomicBool::new(false));
     let mut handles: Vec<process::ChildHandle> = Vec::with_capacity(3);
     let mut watchers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(3);
     for index in 0..3 {
-        let (handle, watcher) =
-            process::spawn_and_watch(index, specs.clone(), quit.clone(), suspended.clone());
+        let (handle, watcher) = process::spawn_and_watch(
+            index,
+            specs.clone(),
+            quit.clone(),
+            suspended.clone(),
+            shutting_down.clone(),
+        );
         handles.push(handle);
         watchers.push(watcher);
     }
@@ -161,18 +163,21 @@ fn windows_main() {
     );
 
     // tray::run returned because quit was set (Quit clicked) or because
-    // the tray icon could not be created at all — make sure every watcher
-    // thread stops trying to restart, then force-kill whichever child is
-    // currently running.
+    // the tray icon could not be created at all. Start the shutdown
+    // sequence: first tell the watchers the sequence has begun and blank
+    // the LCD (write "off" to the state file), then wait the grace period
+    // so asterctl — which re-polls the state file every ~1s — applies the
+    // display-off before any child is killed. After the grace, `kill_all`
+    // stops the children immediately; the watchers then force-kill any
+    // child that survived it (respawn race or a failed TerminateProcess),
+    // so none of them can outlive the launcher.
     quit.store(true, Ordering::SeqCst);
-    // Blank the LCD before killing asterctl: write "off" to the state file
-    // and give asterctl a moment to apply it (it re-polls the file every
-    // ~1s), so quitting the launcher never leaves the display stuck on the
-    // last frame. A killed launcher skips this path — asterctl's heartbeat
-    // watchdog handles that instead (see display.rs).
+    shutting_down.store(true, Ordering::SeqCst);
     display.force_off();
-    std::thread::sleep(std::time::Duration::from_secs(LCD_OFF_GRACE_SECS));
-    process::kill_all(&handles);
+    std::thread::sleep(std::time::Duration::from_secs(
+        process::QUIT_KILL_GRACE_SECS,
+    ));
+    process::kill_all(&handles, &launcher_log);
 
     // Then wait for each watcher thread to actually observe `quit` and exit.
     // Without this, `main` could return — tearing the process down — while a
