@@ -131,17 +131,22 @@ fn apply_theme(
     current.store(theme, Ordering::SeqCst);
 }
 
-/// Shows the tray icon (status label, "Refresh time" sub-menu, "Quit"
-/// item; plus a "Themes" sub-menu that switches the LCD theme) and blocks,
-/// refreshing the status label and the hover tooltip every
-/// 2 seconds, until `quit` becomes `true` — either because "Quit" was
-/// clicked (this function wires that up itself) or because the caller set it
-/// for another reason.
+/// Shows the tray icon (status label, "Refresh time" sub-menu, "Themes"
+/// sub-menu, "Display" sub-menu, "Quit" item) and blocks, refreshing the
+/// status label and the hover tooltip every 2 seconds, until `quit`
+/// becomes `true` — either because "Quit" was clicked (this function wires
+/// that up itself) or because the caller set it for another reason.
 ///
 /// The "Refresh time" sub-menu entries write the chosen interval to
 /// `config_path` and restart `aster-sysinfo` + `hwbridge` via
 /// `specs`/`handles` (see [`apply_refresh`]); `current_refresh` tracks the
 /// active interval so the sub-menu shows a check mark on it.
+///
+/// The "Display" sub-menu selects the LCD display mode (On / Off / Follow
+/// screen state) through `display` (see
+/// [`crate::display::DisplayControl`]): the choice is persisted to
+/// `config_path` and applied immediately via `cfg/display.state`, which
+/// the panel-mode asterctl polls.
 ///
 /// Never panics: any failure to create or update the tray icon is logged to
 /// `log_path` (this exe is built with `windows_subsystem = "windows"`, so it
@@ -156,6 +161,7 @@ pub fn run(
     specs: Arc<Mutex<[ChildSpec; 3]>>,
     current_refresh: Arc<AtomicU16>,
     current_theme: Arc<AtomicU16>,
+    display: Arc<crate::display::DisplayControl>,
     quit: Arc<AtomicBool>,
     log_path: &Path,
     config_path: &Path,
@@ -320,6 +326,54 @@ pub fn run(
         ),
     }
 
+    // "Display" sub-menu: On / Off / Follow screen state. Picking one
+    // persists `display_mode` to launcher.toml and applies it immediately
+    // (the mode also writes `cfg/display.state`, which the panel-mode
+    // asterctl polls every refresh — no restart needed). The active mode
+    // carries a native check mark.
+    let active_display = display.mode.load(Ordering::SeqCst);
+    let mut display_submenu: Option<u32> = None;
+    let mut display_ids = [0u32; crate::config::DISPLAY_OPTIONS.len()];
+    match tray.inner_mut().add_submenu("Display") {
+        Ok(sub) => {
+            display_submenu = Some(sub);
+            for (i, (mode, label)) in crate::config::DISPLAY_OPTIONS.iter().enumerate() {
+                let mode = *mode;
+                let config_path = config_path.to_path_buf();
+                let log_path = log_path.to_path_buf();
+                // separate clone for the error arm below (the original is
+                // moved into the menu closure)
+                let log_path_err = log_path.clone();
+                let display = display.clone();
+                let label = label.to_string();
+                match tray
+                    .inner_mut()
+                    .add_submenu_item_with_id(sub, &label, move || {
+                        display.apply(mode, &config_path);
+                    }) {
+                    Ok(id) => display_ids[i] = id,
+                    Err(err) => crate::logging::append_line(
+                        &log_path_err,
+                        &format!("failed to add tray display menu item ({label}): {err}"),
+                    ),
+                }
+            }
+            // Check the currently active mode.
+            if let Some(pos) = crate::config::DISPLAY_OPTIONS
+                .iter()
+                .position(|(mode, _)| mode.index() == active_display)
+            {
+                let _ = tray
+                    .inner_mut()
+                    .set_submenu_item_checked(sub, display_ids[pos], true);
+            }
+        }
+        Err(err) => crate::logging::append_line(
+            log_path,
+            &format!("failed to add tray Display submenu: {err}"),
+        ),
+    }
+
     // "Quit" item at the bottom of the menu: stops all children and exits
     // the launcher (each child watcher observes `quit` and shuts down).
     {
@@ -334,8 +388,16 @@ pub fn run(
     let mut last_label = initial_label;
     let mut last_refresh = active_refresh;
     let mut last_theme = active_theme;
+    let mut last_display = active_display;
     while !quit.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(2));
+
+        // Heartbeat for asterctl's launcher-death watchdog: rewrite
+        // cfg/display.state (idempotent content) so its mtime stays fresh
+        // while the launcher runs. If this loop stops — launcher closed or
+        // killed — asterctl sees the stale file, switches the display off
+        // and exits.
+        display.heartbeat();
 
         // Move the check mark when the interval changed (e.g. the user
         // picked a different one from the "Refresh time" submenu).
@@ -383,6 +445,30 @@ pub fn run(
                 }
             }
             last_theme = theme;
+        }
+
+        // Move the check mark when the display mode changed (e.g. the user
+        // picked a different one from the "Display" submenu).
+        let mode = display.mode.load(Ordering::SeqCst);
+        if mode != last_display {
+            if let Some(sub) = display_submenu {
+                for (i, id) in display_ids.iter().enumerate() {
+                    if *id != 0
+                        && let Err(err) = tray.inner_mut().set_submenu_item_checked(
+                            sub,
+                            *id,
+                            crate::config::DISPLAY_OPTIONS[i].0.index() == mode,
+                        )
+                    {
+                        crate::logging::append_line(
+                            log_path,
+                            &format!("failed to update display menu check mark: {err}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            last_display = mode;
         }
 
         let label = status_label(handles);

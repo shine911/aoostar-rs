@@ -107,6 +107,29 @@ the `Refresh time` sub-menu to pick `2s / 5s / 10s / 30s`. The chosen value is w
 `dist\launcher.toml` (survives restarts) and `aster-sysinfo` + `hwbridge` are restarted automatically
 to apply it; the active choice is marked with a check mark.
 
+### LCD display control (on / off / follow screen state)
+
+The tray icon also has a `Display` sub-menu with three mutually exclusive modes (the active one is
+marked with a check mark):
+
+- **On** — the LCD stays on (default).
+- **Off** — the LCD turns off; `asterctl` keeps the serial port open and simply stops drawing, so
+  picking **On** again wakes it instantly with no restart.
+- **Follow screen state** — the LCD mirrors the Windows display power state: it turns off when the
+  monitor turns off (power button, idle timeout, screensaver, lid close) and back on when the monitor
+  turns on. The display state is detected via the `GUID_CONSOLE_DISPLAY_STATE` power-setting
+  notification, which also covers idle-blank transitions that never enter system sleep.
+
+The choice is persisted as `display_mode = "on" | "off" | "follow"` in `dist\launcher.toml`
+(survives restarts; the key is optional — when absent the LCD stays on). Internally the launcher
+writes the mode to `dist\cfg\display.state`, which `asterctl --display-state` polls on every refresh.
+
+**The LCD always turns off when the launcher stops.** The launcher rewrites `display.state` roughly
+every 2 seconds as a heartbeat; if `asterctl` sees the file go stale (~10s) — the launcher was
+closed, killed in Task Manager, or crashed — it switches the display off and exits to free the
+serial port. Quitting from the tray (or `Quit` in the menu) blanks the display the same way before
+the child processes are stopped.
+
 Each process's own output goes to `dist\logs\aster-sysinfo.log`, `dist\logs\asterctl.log`, and
 `dist\logs\hwbridge.log`; these are truncated at every launcher start, so a log always covers just
 the current run. If a process crashes while the launcher is running, it's automatically restarted

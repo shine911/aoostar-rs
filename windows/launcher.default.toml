@@ -17,3 +17,16 @@ refresh_time = 5
 # restarting the children (automates the old Device Manager fix). Set to
 # false if the screen already recovers without it.
 restart_uart_on_resume = true
+
+# LCD display mode, selectable live from the tray icon's "Display" sub-menu.
+# Allowed values: "on" (default), "off", "follow".
+#   on     - LCD stays on (normal operation).
+#   off    - LCD turns off until you pick "on" again (asterctl keeps the
+#            serial port open, so no restart is needed to wake it).
+#   follow - LCD mirrors the Windows display power state: off while the
+#            monitor is off, on while it is on (or dimmed).
+# Optional; when absent the LCD stays on.
+# The LCD always turns off when the launcher stops (Quit, kill, crash):
+# asterctl watches cfg/display.state as a heartbeat and blanks the screen
+# once the launcher stops refreshing it.
+# display_mode = "on"

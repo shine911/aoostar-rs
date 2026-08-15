@@ -6,6 +6,7 @@
 
 mod config;
 mod device;
+mod display;
 mod logging;
 mod power;
 mod process;
@@ -110,13 +111,32 @@ fn windows_main() {
     // effective fallback when launcher.toml does not configure a theme.
     let current_theme = Arc::new(AtomicU16::new(cfg.theme.unwrap_or(0)));
 
+    // LCD display control (tray "Display" sub-menu): writes
+    // cfg/display.state for asterctl to poll, and starts the follow
+    // screen-state watcher. Created before the children so asterctl reads
+    // the persisted state (e.g. a manual "Off") on its very first poll.
+    let display = display::DisplayControl::new(
+        cfg.display_mode_effective(),
+        base_dir.join("cfg").join("display.state"),
+        launcher_log.clone(),
+    );
+
     let quit = Arc::new(AtomicBool::new(false));
     let suspended = Arc::new(AtomicBool::new(false));
+    // Set once the shutdown sequence has started (display-state write +
+    // grace): the child watchers wait for it before force-killing on quit,
+    // so asterctl has time to blank the LCD (see process.rs).
+    let shutting_down = Arc::new(AtomicBool::new(false));
     let mut handles: Vec<process::ChildHandle> = Vec::with_capacity(3);
     let mut watchers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(3);
     for index in 0..3 {
-        let (handle, watcher) =
-            process::spawn_and_watch(index, specs.clone(), quit.clone(), suspended.clone());
+        let (handle, watcher) = process::spawn_and_watch(
+            index,
+            specs.clone(),
+            quit.clone(),
+            suspended.clone(),
+            shutting_down.clone(),
+        );
         handles.push(handle);
         watchers.push(watcher);
     }
@@ -135,6 +155,7 @@ fn windows_main() {
         specs,
         current_refresh,
         current_theme,
+        display.clone(),
         quit.clone(),
         &launcher_log,
         &config_path,
@@ -142,11 +163,21 @@ fn windows_main() {
     );
 
     // tray::run returned because quit was set (Quit clicked) or because
-    // the tray icon could not be created at all — make sure every watcher
-    // thread stops trying to restart, then force-kill whichever child is
-    // currently running.
+    // the tray icon could not be created at all. Start the shutdown
+    // sequence: first tell the watchers the sequence has begun and blank
+    // the LCD (write "off" to the state file), then wait the grace period
+    // so asterctl — which re-polls the state file every ~1s — applies the
+    // display-off before any child is killed. After the grace, `kill_all`
+    // stops the children immediately; the watchers then force-kill any
+    // child that survived it (respawn race or a failed TerminateProcess),
+    // so none of them can outlive the launcher.
     quit.store(true, Ordering::SeqCst);
-    process::kill_all(&handles);
+    shutting_down.store(true, Ordering::SeqCst);
+    display.force_off();
+    std::thread::sleep(std::time::Duration::from_secs(
+        process::QUIT_KILL_GRACE_SECS,
+    ));
+    process::kill_all(&handles, &launcher_log);
 
     // Then wait for each watcher thread to actually observe `quit` and exit.
     // Without this, `main` could return — tearing the process down — while a

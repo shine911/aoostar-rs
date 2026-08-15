@@ -206,7 +206,7 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             // Arm the Resume handler for the next wake.
             state.resume_handled = false;
             state.suspended.store(true, Ordering::SeqCst);
-            crate::process::kill_all(&state.handles);
+            crate::process::kill_all(&state.handles, &state.log_path);
         }
         PowerEvent::Resume => {
             // Only the first Resume after a Suspend may act: Windows can

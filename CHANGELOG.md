@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- `aster-launcher` tray "Display" sub-menu with three mutually exclusive LCD modes: **On**, **Off**,
+  and **Follow screen state** (the active mode carries a check mark). Picking one persists
+  `display_mode = "on" | "off" | "follow"` in `launcher.toml` and applies it immediately.
+  Manual On/Off need no process restart: the launcher writes `cfg/display.state`, which
+  `asterctl --display-state` (new flag) polls on every refresh — `off` turns the LCD off and skips
+  rendering while the serial port stays open, so picking **On** wakes it instantly.
+- "Follow screen state" mirrors the Windows console display power state (off/on/dimmed, via
+  `PowerSettingRegisterNotification` with `GUID_CONSOLE_DISPLAY_STATE`) into the same state file,
+  so the LCD turns off when the monitor turns off (power button, idle timeout, screensaver, lid
+  close) and back on when it turns on — including idle-blank transitions that never enter system sleep.
+- The LCD turns off automatically when `aster-launcher` is closed or killed (e.g. via Task Manager):
+  the launcher rewrites `cfg/display.state` roughly every 2s as a heartbeat, and if `asterctl` sees
+  the file go stale (~10s) it switches the display off and exits to free the serial port. Quitting
+  the launcher from the tray blanks the display the same way before the child processes are stopped.
+
+### Fixed
+- `aster-launcher` no longer leaves a child process running after shutdown (e.g. `HwBridge.exe`
+  surviving a tray Quit). Killing was a single best-effort `kill_all` from the main thread that
+  swallowed `TerminateProcess` errors and could miss a child being respawned at that moment; each
+  watcher thread now force-kills its own child on quit/suspend and retries until the process is
+  actually gone, logging if `kill_all` missed it. The quit grace is anchored on a `shutting_down`
+  flag set together with the LCD "off" write, so the watchers cannot kill `asterctl` before it
+  blanks the display.
+
 ## v0.3.0 - 2026-08-14
 
 ### Added
