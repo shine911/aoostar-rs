@@ -100,7 +100,10 @@ struct Args {
     /// (plain text `on` or `off`). While set, the panel loop follows the
     /// file: `off` turns the display off and skips rendering until the file
     /// reads `on` again. The serial port stays open either way, so the
-    /// display can be woken without a restart.
+    /// display can be woken without a restart. The file also doubles as the
+    /// launcher's heartbeat: if it is not rewritten for ~10s (the launcher
+    /// closed or was killed), the display is switched off and this process
+    /// exits to free the serial port.
     #[arg(long)]
     display_state: Option<PathBuf>,
 
@@ -369,35 +372,18 @@ fn run_sensor_panel<B: Into<PathBuf>>(
             let upd_start_time = Instant::now();
 
             // Display-state control (aster-launcher): poll `cfg/display.state`
-            // every refresh. `off` switches the display off and skips
-            // rendering until the file reads `on` again; the serial port stays
-            // open so the wake-up needs no restart. Missing/unreadable file
-            // keeps the display on (backward compatible with launchers that
-            // never write one).
+            // every render tick, and every second while waiting for the next
+            // tick. `off` switches the display off and skips rendering until
+            // the file reads `on` again; the serial port stays open so the
+            // wake-up needs no restart. Missing/unreadable file keeps the
+            // display on (backward compatible with launchers that never write
+            // one). If the file goes stale the launcher is gone: display off
+            // and exit (see `poll_display_state`).
             let mut skip_render = false;
             if let Some(state_file) = display_state.as_deref() {
-                let want_on = read_display_state(state_file);
-                if want_on != display_on {
-                    let (action, result) = if want_on {
-                        ("on", screen.on())
-                    } else {
-                        ("off", screen.off())
-                    };
-                    match result {
-                        Ok(()) => {
-                            info!("Display switched {action} by state file");
-                            display_on = want_on;
-                        }
-                        Err(e) => {
-                            // Same recovery as a failed frame send below:
-                            // reopen + re-init the port with backoff so the
-                            // next poll can apply the state file again.
-                            error!(
-                                "Failed to switch display {action}: {e:?} — reconnecting with backoff"
-                            );
-                            screen.reconnect_with_retry();
-                        }
-                    }
+                if !poll_display_state(screen, state_file, &mut display_on) {
+                    info!("aster-launcher no longer running; display switched off, exiting");
+                    return Ok(());
                 }
                 skip_render = !display_on;
             }
@@ -428,7 +414,26 @@ fn run_sensor_panel<B: Into<PathBuf>>(
 
             let elapsed = upd_start_time.elapsed();
             if refresh > elapsed {
-                sleep(refresh - elapsed);
+                let mut remaining = refresh - elapsed;
+                if let Some(state_file) = display_state.as_deref() {
+                    // Re-poll every second while waiting so launcher death
+                    // and manual on/off apply quickly even at long refresh
+                    // intervals (e.g. quitting the launcher blanks the
+                    // display within ~1s, not after the full refresh).
+                    while !remaining.is_zero() {
+                        let step = remaining.min(STATE_POLL_STEP);
+                        sleep(step);
+                        remaining -= step;
+                        if !poll_display_state(screen, state_file, &mut display_on) {
+                            info!(
+                                "aster-launcher no longer running; display switched off, exiting"
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    sleep(remaining);
+                }
             }
 
             if panel_switch_time.elapsed() >= switch_time {
@@ -439,6 +444,17 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         }
     }
 }
+
+/// How long the display-state file may go without being rewritten before
+/// asterctl considers its writer (aster-launcher) dead. The launcher
+/// rewrites the file roughly every 2s while it runs; keep this at a
+/// generous multiple so a busy system can never cause a false positive.
+const LAUNCHER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll cadence while waiting for the next render tick: the display-state
+/// file is re-read every second so launcher death and manual on/off apply
+/// quickly even when the panel refresh interval is long (up to 30s).
+const STATE_POLL_STEP: Duration = Duration::from_secs(1);
 
 /// Reads the display-state file written by aster-launcher. Returns `true`
 /// when the display should be on. A missing or unreadable file means "on":
@@ -455,6 +471,81 @@ fn read_display_state(path: &Path) -> bool {
 /// trimming) turns the display off; anything else keeps it on.
 fn display_state_text_is_on(text: &str) -> bool {
     text.trim() != "off"
+}
+
+/// True when the display-state file's writer (aster-launcher) is gone:
+/// the launcher rewrites the file roughly every 2s while it runs, so a
+/// file that has not been touched for [`LAUNCHER_HEARTBEAT_TIMEOUT`] means
+/// the launcher closed or was killed. A missing file counts as alive
+/// (backward compatible with launchers that never write one).
+fn launcher_is_dead(state_file: &Path) -> bool {
+    launcher_is_dead_with_timeout(state_file, LAUNCHER_HEARTBEAT_TIMEOUT)
+}
+
+/// [`launcher_is_dead`] with an explicit timeout (kept testable).
+fn launcher_is_dead_with_timeout(state_file: &Path, timeout: Duration) -> bool {
+    match std::fs::metadata(state_file) {
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > timeout),
+        // unreadable metadata or clock trouble → assume the launcher lives
+        Err(_) => false,
+    }
+}
+
+/// Polls the display-state file once and syncs the display to it.
+///
+/// Returns `true` while aster-launcher is alive and the process should
+/// keep running; returns `false` when the launcher's heartbeat is lost,
+/// meaning the display has been switched off and the process should exit
+/// (releasing the serial port for a relaunched launcher).
+///
+/// The state file doubles as the launcher heartbeat (see
+/// [`launcher_is_dead`]): with the launcher gone, the display is switched
+/// off no matter what the file content says.
+fn poll_display_state(screen: &mut AooScreen, state_file: &Path, display_on: &mut bool) -> bool {
+    if launcher_is_dead(state_file) {
+        if *display_on {
+            match screen.off() {
+                Ok(()) => {
+                    info!("Display switched off: aster-launcher heartbeat lost");
+                    *display_on = false;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to switch display off after launcher heartbeat loss: {e:?} — reconnecting with backoff"
+                    );
+                    screen.reconnect_with_retry();
+                }
+            }
+        }
+        return false;
+    }
+
+    let want_on = read_display_state(state_file);
+    if want_on != *display_on {
+        let (action, result) = if want_on {
+            ("on", screen.on())
+        } else {
+            ("off", screen.off())
+        };
+        match result {
+            Ok(()) => {
+                info!("Display switched {action} by state file");
+                *display_on = want_on;
+            }
+            Err(e) => {
+                // Same recovery as a failed frame send below: reopen +
+                // re-init the port with backoff so the next poll can apply
+                // the state file again.
+                error!("Failed to switch display {action}: {e:?} — reconnecting with backoff");
+                screen.reconnect_with_retry();
+            }
+        }
+    }
+    true
 }
 
 fn update_panel(
@@ -588,5 +679,36 @@ mod tests {
         assert!(!read_display_state(&path));
         fs::write(&path, "on\n").unwrap();
         assert!(read_display_state(&path));
+    }
+
+    #[test]
+    fn launcher_heartbeat_missing_file_counts_as_alive() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no-such-file");
+        assert!(!launcher_is_dead(&path));
+    }
+
+    #[test]
+    fn launcher_heartbeat_fresh_means_alive() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        fs::write(&path, "on\n").unwrap();
+        assert!(!launcher_is_dead_with_timeout(
+            &path,
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn launcher_heartbeat_stale_means_dead() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        fs::write(&path, "on\n").unwrap();
+        // wait past the (tiny) timeout so the file is definitely stale
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(launcher_is_dead_with_timeout(
+            &path,
+            Duration::from_millis(5)
+        ));
     }
 }

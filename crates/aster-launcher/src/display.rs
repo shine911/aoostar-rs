@@ -16,13 +16,19 @@
 //! 1 = on, 2 = dimmed). This works on both S3 and Modern Standby (S0ix) and
 //! also covers idle-blank / screensaver / lid transitions that never enter
 //! system sleep — a plain display-power poll would miss those.
+//!
+//! The state file doubles as the launcher's heartbeat: the tray loop
+//! rewrites it roughly every 2s ([`DisplayControl::heartbeat`]), and
+//! asterctl switches the display off — and exits — when the file goes
+//! stale, so a closed or killed launcher never leaves the LCD stuck on.
+//! On a clean launcher shutdown [`DisplayControl::force_off`] blanks the
+//! display before asterctl is killed.
 
 // `main.rs` denies `unsafe_code` crate-wide; this module is the narrow,
 // deliberate exception — pure Win32 FFI glue, scoped the same way as
 // `power.rs`.
 #![allow(unsafe_code)]
 
-#[cfg(windows)]
 use crate::config::DisplayMode;
 use std::path::Path;
 #[cfg(windows)]
@@ -89,6 +95,18 @@ pub(crate) fn write_state_file(path: &Path, on: bool) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, if on { "on\n" } else { "off\n" })
+}
+
+/// Effective on/off state for a display mode, given the last Windows
+/// display power state seen (0 = off, 1 = on, 2 = dimmed). Shared by the
+/// startup/menu application and the periodic heartbeat rewrite.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn effective_state_on(mode: DisplayMode, last_seen: u8) -> bool {
+    match mode {
+        DisplayMode::On => true,
+        DisplayMode::Off => false,
+        DisplayMode::Follow => display_state_is_on(last_seen),
+    }
 }
 
 /// State shared between the power-setting callback (invoked by the system
@@ -203,20 +221,34 @@ impl DisplayControl {
     fn write_for_mode(&self, mode: DisplayMode) {
         self.mode.store(mode.index(), Ordering::SeqCst);
         match mode {
-            DisplayMode::On => {
+            DisplayMode::On | DisplayMode::Off => {
                 self.follow_active.store(false, Ordering::SeqCst);
-                self.write_state(true);
-            }
-            DisplayMode::Off => {
-                self.follow_active.store(false, Ordering::SeqCst);
-                self.write_state(false);
             }
             DisplayMode::Follow => {
                 self.follow_active.store(true, Ordering::SeqCst);
-                let on = display_state_is_on(self.last_seen.load(Ordering::SeqCst));
-                self.write_state(on);
             }
         }
+        let on = effective_state_on(mode, self.last_seen.load(Ordering::SeqCst));
+        self.write_state(on);
+    }
+
+    /// Periodic heartbeat, called from the tray loop roughly every 2s:
+    /// rewrites `cfg/display.state` with the current mode's effective
+    /// state. The rewrite keeps the file's mtime fresh, which is what
+    /// asterctl uses to detect a dead launcher — when the file goes stale
+    /// it switches the display off and exits. The content is idempotent,
+    /// so the extra writes are harmless.
+    pub(crate) fn heartbeat(&self) {
+        let mode = DisplayMode::from_index(self.mode.load(Ordering::SeqCst));
+        let on = effective_state_on(mode, self.last_seen.load(Ordering::SeqCst));
+        self.write_state(on);
+    }
+
+    /// Launcher shutdown: writes `cfg/display.state` as "off" regardless
+    /// of the current mode, so asterctl switches the display off before
+    /// the launcher kills it (see the shutdown grace in `main.rs`).
+    pub(crate) fn force_off(&self) {
+        self.write_state(false);
     }
 
     fn write_state(&self, on: bool) {
@@ -355,5 +387,24 @@ mod tests {
 
         write_state_file(&path, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "on\n");
+    }
+
+    #[test]
+    fn effective_state_on_follows_mode_and_display_state() {
+        // On / Off force the state regardless of the display power state
+        assert!(effective_state_on(DisplayMode::On, 0));
+        assert!(!effective_state_on(DisplayMode::Off, 1));
+        // Follow mirrors the display power state (dimmed still counts as on)
+        assert!(!effective_state_on(DisplayMode::Follow, 0));
+        assert!(effective_state_on(DisplayMode::Follow, 1));
+        assert!(effective_state_on(DisplayMode::Follow, 2));
+    }
+
+    #[test]
+    fn display_mode_from_index_roundtrips_and_defaults() {
+        for (mode, _) in crate::config::DISPLAY_OPTIONS {
+            assert_eq!(DisplayMode::from_index(mode.index()), mode);
+        }
+        assert_eq!(DisplayMode::from_index(99), DisplayMode::On);
     }
 }

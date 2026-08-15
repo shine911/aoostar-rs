@@ -124,6 +124,12 @@ The choice is persisted as `display_mode = "on" | "off" | "follow"` in `dist\lau
 (survives restarts; the key is optional — when absent the LCD stays on). Internally the launcher
 writes the mode to `dist\cfg\display.state`, which `asterctl --display-state` polls on every refresh.
 
+**The LCD always turns off when the launcher stops.** The launcher rewrites `display.state` roughly
+every 2 seconds as a heartbeat; if `asterctl` sees the file go stale (~10s) — the launcher was
+closed, killed in Task Manager, or crashed — it switches the display off and exits to free the
+serial port. Quitting from the tray (or `Quit` in the menu) blanks the display the same way before
+the child processes are stopped.
+
 Each process's own output goes to `dist\logs\aster-sysinfo.log`, `dist\logs\asterctl.log`, and
 `dist\logs\hwbridge.log`; these are truncated at every launcher start, so a log always covers just
 the current run. If a process crashes while the launcher is running, it's automatically restarted

@@ -50,6 +50,17 @@ impl DisplayMode {
             DisplayMode::Follow => 2,
         }
     }
+
+    /// Inverse of [`DisplayMode::index`]; unknown indices fall back to
+    /// [`DisplayMode::On`] (a mode index can only come from
+    /// [`DISPLAY_OPTIONS`] in practice).
+    pub fn from_index(index: u16) -> DisplayMode {
+        DISPLAY_OPTIONS
+            .iter()
+            .find(|(mode, _)| mode.index() == index)
+            .map(|(mode, _)| *mode)
+            .unwrap_or(DisplayMode::On)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

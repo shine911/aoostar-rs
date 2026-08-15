@@ -26,4 +26,7 @@ restart_uart_on_resume = true
 #   follow - LCD mirrors the Windows display power state: off while the
 #            monitor is off, on while it is on (or dimmed).
 # Optional; when absent the LCD stays on.
+# The LCD always turns off when the launcher stops (Quit, kill, crash):
+# asterctl watches cfg/display.state as a heartbeat and blanks the screen
+# once the launcher stops refreshing it.
 # display_mode = "on"

@@ -29,6 +29,13 @@ fn main() {
 #[cfg(windows)]
 const SHARING_VIOLATION_CODES: [i32; 2] = [32, 33];
 
+/// Seconds the launcher waits after writing `display.state = off` on
+/// shutdown before killing asterctl, so asterctl (which re-polls the state
+/// file every ~1s) can blank the LCD. Must comfortably exceed the poll
+/// step; see `STATE_POLL_STEP` in asterctl.
+#[cfg(windows)]
+const LCD_OFF_GRACE_SECS: u64 = 2;
+
 /// Opens `path` as this process's single-instance lock. The returned handle
 /// must be kept alive for as long as the lock should be held.
 ///
@@ -146,7 +153,7 @@ fn windows_main() {
         specs,
         current_refresh,
         current_theme,
-        display,
+        display.clone(),
         quit.clone(),
         &launcher_log,
         &config_path,
@@ -158,6 +165,13 @@ fn windows_main() {
     // thread stops trying to restart, then force-kill whichever child is
     // currently running.
     quit.store(true, Ordering::SeqCst);
+    // Blank the LCD before killing asterctl: write "off" to the state file
+    // and give asterctl a moment to apply it (it re-polls the file every
+    // ~1s), so quitting the launcher never leaves the display stuck on the
+    // last frame. A killed launcher skips this path — asterctl's heartbeat
+    // watchdog handles that instead (see display.rs).
+    display.force_off();
+    std::thread::sleep(std::time::Duration::from_secs(LCD_OFF_GRACE_SECS));
     process::kill_all(&handles);
 
     // Then wait for each watcher thread to actually observe `quit` and exit.

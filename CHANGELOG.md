@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PowerSettingRegisterNotification` with `GUID_CONSOLE_DISPLAY_STATE`) into the same state file,
   so the LCD turns off when the monitor turns off (power button, idle timeout, screensaver, lid
   close) and back on when it turns on — including idle-blank transitions that never enter system sleep.
+- The LCD turns off automatically when `aster-launcher` is closed or killed (e.g. via Task Manager):
+  the launcher rewrites `cfg/display.state` roughly every 2s as a heartbeat, and if `asterctl` sees
+  the file go stale (~10s) it switches the display off and exits to free the serial port. Quitting
+  the launcher from the tray blanks the display the same way before the child processes are stopped.
 
 ## v0.3.0 - 2026-08-14
 
