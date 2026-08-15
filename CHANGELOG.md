@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- `aster-launcher` tray "Display" sub-menu with three mutually exclusive LCD modes: **On**, **Off**,
+  and **Follow screen state** (the active mode carries a check mark). Picking one persists
+  `display_mode = "on" | "off" | "follow"` in `launcher.toml` and applies it immediately.
+  Manual On/Off need no process restart: the launcher writes `cfg/display.state`, which
+  `asterctl --display-state` (new flag) polls on every refresh — `off` turns the LCD off and skips
+  rendering while the serial port stays open, so picking **On** wakes it instantly.
+- "Follow screen state" mirrors the Windows console display power state (off/on/dimmed, via
+  `PowerSettingRegisterNotification` with `GUID_CONSOLE_DISPLAY_STATE`) into the same state file,
+  so the LCD turns off when the monitor turns off (power button, idle timeout, screensaver, lid
+  close) and back on when it turns on — including idle-blank transitions that never enter system sleep.
+
 ## v0.3.0 - 2026-08-14
 
 ### Added

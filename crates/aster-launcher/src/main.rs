@@ -6,6 +6,7 @@
 
 mod config;
 mod device;
+mod display;
 mod logging;
 mod power;
 mod process;
@@ -110,6 +111,16 @@ fn windows_main() {
     // effective fallback when launcher.toml does not configure a theme.
     let current_theme = Arc::new(AtomicU16::new(cfg.theme.unwrap_or(0)));
 
+    // LCD display control (tray "Display" sub-menu): writes
+    // cfg/display.state for asterctl to poll, and starts the follow
+    // screen-state watcher. Created before the children so asterctl reads
+    // the persisted state (e.g. a manual "Off") on its very first poll.
+    let display = display::DisplayControl::new(
+        cfg.display_mode_effective(),
+        base_dir.join("cfg").join("display.state"),
+        launcher_log.clone(),
+    );
+
     let quit = Arc::new(AtomicBool::new(false));
     let suspended = Arc::new(AtomicBool::new(false));
     let mut handles: Vec<process::ChildHandle> = Vec::with_capacity(3);
@@ -135,6 +146,7 @@ fn windows_main() {
         specs,
         current_refresh,
         current_theme,
+        display,
         quit.clone(),
         &launcher_log,
         &config_path,

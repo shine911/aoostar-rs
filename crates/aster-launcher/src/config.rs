@@ -19,6 +19,39 @@ pub const THEME_OPTIONS: [(u16, &str); 4] = [
     (3, "Cartoon"),
 ];
 
+/// LCD display modes selectable from the tray "Display" sub-menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    /// LCD forced on (normal operation; also the default when
+    /// `display_mode` is not configured).
+    On,
+    /// LCD forced off.
+    Off,
+    /// LCD mirrors the Windows display power state: off while the monitor
+    /// is off, on (including "dimmed") while it is on.
+    Follow,
+}
+
+/// Display-mode options shown in the tray "Display" sub-menu:
+/// (mode, label). Order defines the check-mark index.
+pub const DISPLAY_OPTIONS: [(DisplayMode, &str); 3] = [
+    (DisplayMode::On, "On"),
+    (DisplayMode::Off, "Off"),
+    (DisplayMode::Follow, "Follow screen state"),
+];
+
+impl DisplayMode {
+    /// Index into [`DISPLAY_OPTIONS`], used as the tray check-mark id.
+    pub fn index(&self) -> u16 {
+        match self {
+            DisplayMode::On => 0,
+            DisplayMode::Off => 1,
+            DisplayMode::Follow => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LauncherConfig {
@@ -31,6 +64,9 @@ pub struct LauncherConfig {
     /// of [`THEME_OPTIONS`]. Default: not configured (asterctl then uses the
     /// `theme` value in its monitor config).
     pub theme: Option<u16>,
+    /// LCD display mode persisted from the tray "Display" sub-menu. Must be
+    /// one of [`DISPLAY_OPTIONS`]. Default: not configured (= [`DisplayMode::On`]).
+    pub display_mode: Option<DisplayMode>,
     /// Legacy per-process override for aster-sysinfo, kept for backward
     /// compatibility. Only used when `refresh_time` is not configured.
     pub sysinfo_refresh: Option<u16>,
@@ -52,6 +88,7 @@ impl Default for LauncherConfig {
             // and legacy per-process keys still win when present.
             refresh_time: None,
             theme: None,
+            display_mode: None,
             sysinfo_refresh: None,
             hwbridge_refresh: None,
             restart_uart_on_resume: true,
@@ -95,6 +132,13 @@ impl LauncherConfig {
         self.refresh_time
             .or(self.hwbridge_refresh)
             .unwrap_or(DEFAULT_REFRESH_SECS)
+    }
+
+    /// Effective LCD display mode: `display_mode` when configured,
+    /// otherwise [`DisplayMode::On`] (normal operation, backward
+    /// compatible with launchers that never wrote the key).
+    pub fn display_mode_effective(&self) -> DisplayMode {
+        self.display_mode.unwrap_or(DisplayMode::On)
     }
 
     /// Drops any refresh or theme value that is not one of the allowed
@@ -153,11 +197,13 @@ impl LauncherConfig {
     }
 }
 
-/// Rewrites a `key = <N>` line in the TOML file at `path`, preserving every
-/// other line and comment (used by the tray's refresh / themes menus).
+/// Rewrites a `key = <value>` line in the TOML file at `path`, preserving
+/// every other line and comment (used by the tray's refresh / themes /
+/// display menus). `value` is written verbatim after `key = `, so pass a
+/// pre-quoted string for TOML strings (e.g. `"follow"`).
 /// Creates the file with just that option if it does not exist yet.
 /// Does not validate `value` — callers pass one of the allowed options.
-fn set_toml_value(path: &Path, key: &str, value: u16) -> std::io::Result<()> {
+fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -193,12 +239,23 @@ fn set_toml_value(path: &Path, key: &str, value: u16) -> std::io::Result<()> {
 }
 
 pub fn set_refresh_time(path: &Path, secs: u16) -> std::io::Result<()> {
-    set_toml_value(path, "refresh_time", secs)
+    set_toml_value(path, "refresh_time", &secs.to_string())
 }
 
 /// Persists the `theme = <N>` line in `launcher.toml` (see [`set_toml_value`]).
 pub fn set_theme(path: &Path, theme: u16) -> std::io::Result<()> {
-    set_toml_value(path, "theme", theme)
+    set_toml_value(path, "theme", &theme.to_string())
+}
+
+/// Persists the `display_mode = "<mode>"` line in `launcher.toml` (see
+/// [`set_toml_value`]).
+pub fn set_display_mode(path: &Path, mode: DisplayMode) -> std::io::Result<()> {
+    let value = match mode {
+        DisplayMode::On => "on",
+        DisplayMode::Off => "off",
+        DisplayMode::Follow => "follow",
+    };
+    set_toml_value(path, "display_mode", &format!("\"{value}\""))
 }
 
 #[cfg(test)]
@@ -391,5 +448,79 @@ mod tests {
         let file = write_temp("theme = 1\n");
         let cfg = LauncherConfig::load(file.path());
         assert_eq!(cfg.theme, Some(1));
+    }
+
+    #[test]
+    fn display_mode_defaults_to_on_when_unset() {
+        let file = write_temp("refresh_time = 5\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert_eq!(cfg.display_mode, None);
+        assert_eq!(cfg.display_mode_effective(), DisplayMode::On);
+    }
+
+    #[test]
+    fn display_mode_parses_lowercase_values() {
+        for (text, expected) in [
+            ("on", DisplayMode::On),
+            ("off", DisplayMode::Off),
+            ("follow", DisplayMode::Follow),
+        ] {
+            let file = write_temp(&format!("display_mode = \"{text}\"\n"));
+            let cfg = LauncherConfig::load(file.path());
+            assert_eq!(cfg.display_mode_effective(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_display_mode_falls_back_to_defaults() {
+        // an unknown variant makes the whole TOML invalid → defaults (the
+        // documented "bad TOML → defaults + log" contract)
+        let file = write_temp("display_mode = \"banana\"\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert_eq!(cfg, LauncherConfig::default());
+        assert_eq!(cfg.display_mode_effective(), DisplayMode::On);
+    }
+
+    #[test]
+    fn set_display_mode_updates_value_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        std::fs::write(
+            &path,
+            "# my config\ndisplay_mode = \"on\"\n\nrefresh_time = 5\n",
+        )
+        .unwrap();
+
+        set_display_mode(&path, DisplayMode::Follow).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my config"));
+        assert!(text.contains("display_mode = \"follow\""));
+        assert!(!text.contains("display_mode = \"on\""));
+        assert!(text.contains("refresh_time = 5"));
+
+        let cfg = LauncherConfig::load(&path);
+        assert_eq!(cfg.display_mode_effective(), DisplayMode::Follow);
+    }
+
+    #[test]
+    fn set_display_mode_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+
+        set_display_mode(&path, DisplayMode::Off).unwrap();
+
+        let cfg = LauncherConfig::load(&path);
+        assert_eq!(cfg.display_mode_effective(), DisplayMode::Off);
+    }
+
+    #[test]
+    fn display_mode_index_matches_menu_order() {
+        assert_eq!(DisplayMode::On.index(), 0);
+        assert_eq!(DisplayMode::Off.index(), 1);
+        assert_eq!(DisplayMode::Follow.index(), 2);
+        for (i, (mode, _)) in DISPLAY_OPTIONS.iter().enumerate() {
+            assert_eq!(mode.index(), i as u16);
+        }
     }
 }

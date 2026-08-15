@@ -38,6 +38,12 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
                     "--config".to_string(),
                     cfg.monitor_config.clone(),
                     "--shm".to_string(),
+                    "--display-state".to_string(),
+                    base_dir
+                        .join("cfg")
+                        .join("display.state")
+                        .to_string_lossy()
+                        .into_owned(),
                 ];
                 if let Some(theme) = cfg.theme {
                     args.push("--theme".to_string());
@@ -354,6 +360,7 @@ mod tests {
             hwbridge_refresh: Some(11),
             restart_uart_on_resume: true,
             theme: None,
+            display_mode: None,
         };
 
         let specs = child_specs(base_dir, &cfg);
@@ -384,7 +391,13 @@ mod tests {
             vec![
                 "--config".to_string(),
                 "Custom.json".to_string(),
-                "--shm".to_string()
+                "--shm".to_string(),
+                "--display-state".to_string(),
+                base_dir
+                    .join("cfg")
+                    .join("display.state")
+                    .to_string_lossy()
+                    .into_owned(),
             ]
         );
 
@@ -410,6 +423,7 @@ mod tests {
             hwbridge_refresh: Some(30),
             restart_uart_on_resume: true,
             theme: None,
+            display_mode: None,
         };
 
         let specs = child_specs(base_dir, &cfg);
@@ -428,6 +442,7 @@ mod tests {
             hwbridge_refresh: None,
             restart_uart_on_resume: true,
             theme: Some(2),
+            display_mode: None,
         };
 
         let specs = child_specs(base_dir, &cfg);
@@ -438,6 +453,12 @@ mod tests {
                 "--config".to_string(),
                 "Monitor3.json".to_string(),
                 "--shm".to_string(),
+                "--display-state".to_string(),
+                base_dir
+                    .join("cfg")
+                    .join("display.state")
+                    .to_string_lossy()
+                    .into_owned(),
                 "--theme".to_string(),
                 "2".to_string()
             ]
@@ -454,6 +475,7 @@ mod tests {
             hwbridge_refresh: None,
             restart_uart_on_resume: true,
             theme: Some(2),
+            display_mode: None,
         };
 
         let specs = child_specs(base_dir, &cfg);
@@ -465,6 +487,12 @@ mod tests {
                 "--config".to_string(),
                 "Monitor3.json".to_string(),
                 "--shm".to_string(),
+                "--display-state".to_string(),
+                base_dir
+                    .join("cfg")
+                    .join("display.state")
+                    .to_string_lossy()
+                    .into_owned(),
                 "--theme".to_string(),
                 "2".to_string()
             ]
