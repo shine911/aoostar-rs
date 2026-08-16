@@ -197,6 +197,7 @@ fn main() -> anyhow::Result<()> {
             sensor_path,
             args.shm,
             args.display_state,
+            args.stuck_file,
             img_save_path,
         )?;
         return Ok(());
@@ -246,11 +247,26 @@ fn report_stuck(path: &std::path::Path) {
     let _ = std::fs::write(path, "stuck\n");
 }
 
+/// [`report_stuck`] for an optional path (the `--stuck-file` flag is not
+/// always set). No-op when unset.
+fn report_stuck_if_set(path: Option<&Path>) {
+    if let Some(path) = path {
+        report_stuck(path);
+    }
+}
+
 /// Removes the stuck marker once the display is initialized, so a stale
 /// file from a previous failed attempt cannot trigger a needless launcher
 /// escalation on the next wake. Best effort, like [`report_stuck`].
 fn clear_stuck(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
+}
+
+/// [`clear_stuck`] for an optional path. No-op when unset.
+fn clear_stuck_if_set(path: Option<&Path>) {
+    if let Some(path) = path {
+        clear_stuck(path);
+    }
 }
 
 /// Tries `screen.init()`, backing off between attempts ([`init_backoff_secs`])
@@ -353,6 +369,7 @@ fn run_sensor_panel<B: Into<PathBuf>>(
     sensor_path: B,
     use_shm: bool,
     display_state: Option<PathBuf>,
+    stuck_file: Option<PathBuf>,
     img_save_path: Option<B>,
 ) -> anyhow::Result<()> {
     let font_dir = font_dir.into();
@@ -423,7 +440,7 @@ fn run_sensor_panel<B: Into<PathBuf>>(
             // and exit (see `poll_display_state`).
             let mut skip_render = false;
             if let Some(state_file) = display_state.as_deref() {
-                if !poll_display_state(screen, state_file, &mut display_on) {
+                if !poll_display_state(screen, state_file, stuck_file.as_deref(), &mut display_on) {
                     info!("aster-launcher no longer running; display switched off, exiting");
                     return Ok(());
                 }
@@ -448,8 +465,13 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                     // with backoff, and continue the panel loop. The frame cache
                     // was cleared by `reconnect`, so the next send is a full
                     // frame that repairs whatever the display was left showing.
+                    // Report the failure so the launcher can escalate (USB
+                    // remove+rescan) instead of letting the backoff loop spin
+                    // against a panel that needs a USB-level reset.
                     error!("Display communication failed: {e:?} — reconnecting with backoff");
+                    report_stuck_if_set(stuck_file.as_deref());
                     screen.reconnect_with_retry();
+                    clear_stuck_if_set(stuck_file.as_deref());
                 }
                 drop(values);
             }
@@ -466,7 +488,12 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                         let step = remaining.min(STATE_POLL_STEP);
                         sleep(step);
                         remaining -= step;
-                        if !poll_display_state(screen, state_file, &mut display_on) {
+                        if !poll_display_state(
+                            screen,
+                            state_file,
+                            stuck_file.as_deref(),
+                            &mut display_on,
+                        ) {
                             info!(
                                 "aster-launcher no longer running; display switched off, exiting"
                             );
@@ -547,7 +574,12 @@ fn launcher_is_dead_with_timeout(state_file: &Path, timeout: Duration) -> bool {
 /// The state file doubles as the launcher heartbeat (see
 /// [`launcher_is_dead`]): with the launcher gone, the display is switched
 /// off no matter what the file content says.
-fn poll_display_state(screen: &mut AooScreen, state_file: &Path, display_on: &mut bool) -> bool {
+fn poll_display_state(
+    screen: &mut AooScreen,
+    state_file: &Path,
+    stuck_file: Option<&Path>,
+    display_on: &mut bool,
+) -> bool {
     if launcher_is_dead(state_file) {
         if *display_on {
             match screen.off() {
@@ -559,7 +591,9 @@ fn poll_display_state(screen: &mut AooScreen, state_file: &Path, display_on: &mu
                     error!(
                         "Failed to switch display off after launcher heartbeat loss: {e:?} — reconnecting with backoff"
                     );
+                    report_stuck_if_set(stuck_file);
                     screen.reconnect_with_retry();
+                    clear_stuck_if_set(stuck_file);
                 }
             }
         }
@@ -581,9 +615,12 @@ fn poll_display_state(screen: &mut AooScreen, state_file: &Path, display_on: &mu
             Err(e) => {
                 // Same recovery as a failed frame send below: reopen +
                 // re-init the port with backoff so the next poll can apply
-                // the state file again.
+                // the state file again. Report the failure so the launcher
+                // can escalate (USB remove+rescan).
                 error!("Failed to switch display {action}: {e:?} — reconnecting with backoff");
+                report_stuck_if_set(stuck_file);
                 screen.reconnect_with_retry();
+                clear_stuck_if_set(stuck_file);
             }
         }
     }

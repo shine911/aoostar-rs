@@ -160,12 +160,14 @@ rescan ladder that tears the stale link down so the panel enumerates fresh.
 It deliberately avoids the old Device Manager "Disable → Enable" workaround
 (leaves a "restart required" pending state that makes Windows demand a
 reboot after repeated cycles) and a plain re-enumerate (looks successful
-but does not clear the stale link). If `asterctl` still cannot initialize
-the panel, it writes `cfg/uart.stuck` and the launcher escalates — another
-re-enumeration, up to 2 rounds — so the recovery is timed by the panel's
-actual readiness. Units whose panel recovers from the soft re-init alone
-(fresh handle + OpenTFT, no USB disturbance) can set
-`restart_uart_on_resume = false` in `launcher.toml`.
+but does not clear the stale link). Recovery does not stop at wake:
+`asterctl` writes `cfg/uart.stuck` on every display-communication failure
+("The semaphore timeout period has expired" included), and a launcher
+daemon re-enumerates the USB UART each time the marker appears (30s
+cooldown) and lets the watcher respawn `asterctl` — so a panel that wedges
+again minutes after wake (deep sleep) still recovers. Units whose panel
+recovers from the soft re-init alone (fresh handle + OpenTFT, no USB
+disturbance) can set `restart_uart_on_resume = false` in `launcher.toml`.
 
 Recommended power settings (reduces the chance of a wedged USB port):
 - untick "Allow the computer to turn off this device to save power" for the

@@ -17,11 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required" pending state (Windows demanded a reboot after repeated sleep/wake
   cycles), and a plain `CM_Reenumerate_DevNode` on the device node looked
   successful but did not clear the stale link.
-- **Escalation on wake**: `asterctl` writes `cfg/uart.stuck` when display init
-  keeps failing; the launcher polls for it after wake and, when present,
-  re-enumerates the USB UART again and lets the watcher respawn `asterctl`
-  (bounded to 2 rounds). The recovery is thus timed by the panel's actual
-  readiness instead of a fixed delay.
+- **Escalation on every failure**: `asterctl` writes `cfg/uart.stuck` on any
+  display-communication failure — init or mid-session ("The semaphore
+  timeout period has expired" included) — and clears it on recovery. A
+  launcher daemon polls the marker for the whole process lifetime and, each
+  time it appears (30s cooldown), re-enumerates the USB UART (remove+rescan)
+  and lets the watcher respawn `asterctl`. A panel that wedges again minutes
+  after wake (deep sleep) still recovers, because every failure gets a fresh
+  hardware-level retry instead of asterctl's soft reconnect loop spinning
+  against a panel that needs a USB reset.
 - `restart_uart_on_resume` stays as a switch (default `true`; set `false` on
   units that recover from the soft re-init alone — fresh serial handle +
   OpenTFT 0x0B).
