@@ -107,6 +107,15 @@ struct Args {
     #[arg(long)]
     display_state: Option<PathBuf>,
 
+    /// Path to a "panel unresponsive" marker file written by aster-launcher
+    /// (`cfg/uart.stuck`). On a failed display init this process writes the
+    /// file (best effort) so the launcher can escalate — re-enumerate the
+    /// USB UART and restart us — instead of letting the init retries burn
+    /// out against a panel that needs a USB-level reset to recover. The
+    /// file is removed again once the display initializes.
+    #[arg(long)]
+    stuck_file: Option<PathBuf>,
+
     /// Test mode: only write to the display without checking response.
     #[arg(short, long)]
     write_only: bool,
@@ -148,7 +157,22 @@ fn main() -> anyhow::Result<()> {
     }
 
     // switch on screen for remaining commands
-    init_display_with_retry(&mut screen)?;
+    if let Err(e) = init_display_with_retry(&mut screen) {
+        // The panel is not accepting commands (e.g. its USB endpoint went
+        // stale after Modern Standby). Tell the launcher so it can escalate
+        // — re-enumerate the USB UART and restart us — instead of letting
+        // the init retry budget burn out against a panel that needs a
+        // USB-level reset to come back.
+        if let Some(path) = args.stuck_file.as_deref() {
+            report_stuck(path);
+        }
+        return Err(e);
+    }
+    // Display is up: clear any stale marker so a previous failed attempt
+    // cannot trigger a needless launcher escalation on the next wake.
+    if let Some(path) = args.stuck_file.as_deref() {
+        clear_stuck(path);
+    }
 
     if let Some(config) = args.config {
         info!("Starting sensor panel mode");
@@ -209,6 +233,24 @@ const INIT_RETRY_ATTEMPTS: u32 = 6;
 /// `reconnect_with_retry`. Extracted so the sequence is unit-testable.
 fn init_backoff_secs(attempt: u32) -> u64 {
     1u64 << attempt.min(5)
+}
+
+/// Writes the "panel unresponsive" marker (`cfg/uart.stuck`) the launcher
+/// polls on wake to decide when to re-enumerate the USB UART. Best effort:
+/// a marker that cannot be written must not crash the process — the
+/// launcher just never escalates.
+fn report_stuck(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, "stuck\n");
+}
+
+/// Removes the stuck marker once the display is initialized, so a stale
+/// file from a previous failed attempt cannot trigger a needless launcher
+/// escalation on the next wake. Best effort, like [`report_stuck`].
+fn clear_stuck(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Tries `screen.init()`, backing off between attempts ([`init_backoff_secs`])
@@ -646,6 +688,21 @@ mod tests {
         // cap at 32s for any further attempt
         assert_eq!(init_backoff_secs(6), 32);
         assert_eq!(init_backoff_secs(100), 32);
+    }
+
+    #[test]
+    fn stuck_marker_roundtrips_through_report_and_clear() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("uart.stuck");
+
+        // Reporting creates the parent directory and writes the marker.
+        report_stuck(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "stuck\n");
+
+        // Clearing removes it; clearing a missing file is a silent no-op.
+        clear_stuck(&path);
+        assert!(!path.exists());
+        clear_stuck(&path);
     }
 
     #[test]

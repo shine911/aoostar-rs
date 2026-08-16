@@ -149,6 +149,7 @@ fn windows_main() {
         Arc::new(handles.clone()),
         display.clone(),
         cfg.restart_uart_on_resume,
+        base_dir.join("cfg").join("uart.stuck"),
         launcher_log.clone(),
     );
 

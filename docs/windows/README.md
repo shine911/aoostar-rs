@@ -152,15 +152,19 @@ re-initializes automatically: `asterctl` re-sends the OpenTFT (0x0B)
 handshake, which is exactly how the panel is (re)initialized on the wire.
 
 The USB re-enumeration is needed because on Modern Standby (S0) — the only
-sleep state these AOOSTAR boards expose — the panel's USB endpoint can stay
-wedged after resume: the device is still enumerated and COM3 opens, but
-writes fail with "The semaphore timeout period has expired". The launcher
-uses a PnP re-enumeration ladder ([`CM_Reenumerate_DevNode`], falling back
-to remove + rescan) that re-negotiates the device with the bus driver. It
-deliberately avoids the old Device Manager "Disable → Enable" workaround,
-which leaves a "restart required" pending state that makes Windows demand a
-reboot after repeated sleep/wake cycles. Units whose panel recovers from
-the soft re-init alone (fresh handle + OpenTFT, no USB disturbance) can set
+sleep state these AOOSTAR boards expose — the panel's MCU power-cycles on
+wake (you see the AOOSTAR boot animation) while the host keeps a stale USB
+link: the device is still enumerated and COM3 opens, but writes fail with
+"The semaphore timeout period has expired". The launcher uses a remove +
+rescan ladder that tears the stale link down so the panel enumerates fresh.
+It deliberately avoids the old Device Manager "Disable → Enable" workaround
+(leaves a "restart required" pending state that makes Windows demand a
+reboot after repeated cycles) and a plain re-enumerate (looks successful
+but does not clear the stale link). If `asterctl` still cannot initialize
+the panel, it writes `cfg/uart.stuck` and the launcher escalates — another
+re-enumeration, up to 2 rounds — so the recovery is timed by the panel's
+actual readiness. Units whose panel recovers from the soft re-init alone
+(fresh handle + OpenTFT, no USB disturbance) can set
 `restart_uart_on_resume = false` in `launcher.toml`.
 
 Recommended power settings (reduces the chance of a wedged USB port):

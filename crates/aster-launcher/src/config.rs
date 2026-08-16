@@ -86,14 +86,17 @@ pub struct LauncherConfig {
     pub hwbridge_refresh: Option<u16>,
     /// On wake from sleep, re-enumerate the AOOSTAR USB UART before
     /// respawning children. Default `true`: on Modern Standby the panel's
-    /// USB endpoint can stay wedged after resume (device enumerated but
-    /// writes time out — "The semaphore timeout period has expired"), and a
-    /// PnP re-enumeration ([`CM_Reenumerate_DevNode`], with a remove+rescan
-    /// fallback) re-negotiates it with the bus driver. Unlike the old
-    /// disable/enable workaround this leaves no "restart required" pending
-    /// state, so Windows never asks for a reboot. Set `false` on units that
-    /// recover from the soft re-init alone (children respawn with fresh
-    /// serial handles and `asterctl` re-sends OpenTFT 0x0B).
+    /// MCU power-cycles on wake (boot animation) while the host keeps a
+    /// stale USB link — device enumerated but writes time out ("The
+    /// semaphore timeout period has expired") — and a re-enumeration ladder
+    /// (reset → remove+rescan, see `device.rs`) re-tears the link down so
+    /// the panel enumerates fresh. If `asterctl` still cannot initialize
+    /// the panel, it writes `cfg/uart.stuck` and the launcher escalates
+    /// (re-enumerate again, up to 2 rounds). Unlike the old disable/enable
+    /// workaround this leaves no "restart required" pending state, so
+    /// Windows never asks for a reboot. Set `false` on units that recover
+    /// from the soft re-init alone (children respawn with fresh serial
+    /// handles and `asterctl` re-sends OpenTFT 0x0B).
     pub restart_uart_on_resume: bool,
 }
 

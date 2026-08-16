@@ -8,15 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Changed
-- Wake now re-enumerates the AOOSTAR USB UART via a **PnP re-enumeration ladder**
-  (`CM_Reenumerate_DevNode`, with a remove + rescan fallback) instead of the old
-  disable/enable workaround. The panel's USB endpoint can stay wedged after Modern
-  Standby resume (device enumerated but writes fail with "The semaphore timeout
-  period has expired"); disable/enable recovered it but left a "restart required"
-  pending state, so Windows demanded a reboot after repeated sleep/wake cycles. The
-  new ladder re-negotiates the device with the bus driver with no reboot ask.
-  `restart_uart_on_resume` stays as a switch (default `true`; set `false` on units
-  that recover from the soft re-init alone — fresh serial handle + OpenTFT 0x0B).
+- Wake now re-enumerates the AOOSTAR USB UART with a **remove + rescan ladder**
+  (`CM_Query_And_Remove_SubTree` → `CM_Reenumerate_DevNode` on the parent hub;
+  `CM_Reset_Device` first when available) instead of the old disable/enable
+  workaround. The panel's MCU power-cycles on Modern Standby wake (boot animation)
+  while the host keeps a stale USB link, so writes fail with "The semaphore
+  timeout period has expired"; disable/enable recovered it but left a "restart
+  required" pending state (Windows demanded a reboot after repeated sleep/wake
+  cycles), and a plain `CM_Reenumerate_DevNode` on the device node looked
+  successful but did not clear the stale link.
+- **Escalation on wake**: `asterctl` writes `cfg/uart.stuck` when display init
+  keeps failing; the launcher polls for it after wake and, when present,
+  re-enumerates the USB UART again and lets the watcher respawn `asterctl`
+  (bounded to 2 rounds). The recovery is thus timed by the panel's actual
+  readiness instead of a fixed delay.
+- `restart_uart_on_resume` stays as a switch (default `true`; set `false` on
+  units that recover from the soft re-init alone — fresh serial handle +
+  OpenTFT 0x0B).
 - Sleep now blanks the LCD before the children are killed: on suspend the launcher writes
   `cfg/display.state` as "off" (asterctl sends CloseTFT 0x0A), waits a short grace for it to
   apply, and keeps the state file "off" for the whole sleep, then re-arms it on wake — so the

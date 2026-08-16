@@ -55,14 +55,9 @@ pub(crate) enum RestartMethod {
     /// `CM_Reset_Device` function-level reset (USB port reset): the device
     /// re-enumerates in place, no PnP state machine, no reboot ask.
     Reset,
-    /// `CM_Reenumerate_DevNode`: PnP re-enumeration of the device node — the
-    /// programmatic "scan for hardware changes" for that device. Re-negotiates
-    /// the wedged USB endpoint with the bus driver and, unlike the old
-    /// disable/enable workaround, leaves no "restart required" pending state.
-    Reenumerate,
     /// Remove the device subtree (unplug simulation) then re-enumerate its
-    /// parent hub (replug simulation). The strongest host-side recovery
-    /// short of a physical replug; still no reboot required.
+    /// parent hub (replug simulation). The real recovery for the
+    /// wake-from-Modern-Standby stale link; no reboot required.
     RemoveRescan,
 }
 
@@ -114,15 +109,17 @@ fn cm_reset_device(dev_inst: u32) -> Result<(), Option<u32>> {
 /// 1. [`cm_reset_device`] — function-level USB port reset, in place, when
 ///    the export exists (dynamically resolved: it is absent from some
 ///    builds, verified on Windows 11 25H2 build 26200).
-/// 2. [`CM_Reenumerate_DevNode`] — PnP re-enumeration of the device node
-///    itself: the programmatic "scan for hardware changes" for this device.
-/// 3. Remove the device subtree (unplug simulation) then re-enumerate its
-///    parent hub (replug simulation) — the strongest host-side recovery.
+/// 2. Remove the device subtree (unplug simulation) then re-enumerate its
+///    parent hub (replug simulation). This is the real recovery when the
+///    panel's MCU power-cycles on wake (boot animation) but the host keeps
+///    the stale link: a plain [`CM_Reenumerate_DevNode`] on the leaf node
+///    does NOT tear the port down, so the stale endpoint survives it.
 ///
-/// Steps 2–3 deliberately replace the old disable/enable workaround, which
+/// Step 2 deliberately replaces the old disable/enable workaround, which
 /// leaves the device in a "restart required" pending state after repeated
-/// cycles (Windows then demands a reboot to apply the change). None of the
-/// ladder steps do. Requires Administrator (the launcher runs elevated).
+/// cycles (Windows then demands a reboot to apply the change) — and a plain
+/// re-enumerate, which looks successful but does not clear the stale link.
+/// Requires Administrator (the launcher runs elevated).
 #[cfg(windows)]
 pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFailure> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -148,19 +145,12 @@ pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFai
             Err(None) => {}
         }
 
-        // 2) PnP re-enumeration of the device node. Re-negotiates the
-        // device with the bus driver (clears the wedged endpoint) without
-        // the disable/enable state machine, so no "restart required"
-        // pending state is left behind.
-        if CM_Reenumerate_DevNode(dev_inst, CM_REENUMERATE_NORMAL) == CR_SUCCESS {
-            // Give the hub a moment to re-negotiate before children reopen
-            // the port.
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            return Ok(RestartMethod::Reenumerate);
-        }
-
-        // 3) Unplug/replug simulation: remove the device subtree, then
-        // re-enumerate its parent (the hub) so the device is rediscovered.
+        // 2) Unplug/replug simulation: remove the device subtree, then
+        // re-enumerate its parent (the hub) so the device is rediscovered
+        // from scratch — a real port teardown that clears the stale link.
+        // A plain CM_Reenumerate_DevNode on the leaf node is NOT enough:
+        // it returns success without tearing the port down, so the stale
+        // endpoint survives it (observed on the GEM12).
         let remove_ret = CM_Query_And_Remove_SubTreeW(
             dev_inst,
             std::ptr::null_mut(),

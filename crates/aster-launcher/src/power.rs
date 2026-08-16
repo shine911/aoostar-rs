@@ -9,17 +9,19 @@
 //! - the periodic sensor/refresh loops stop running during sleep (saves
 //!   battery on Modern Standby machines).
 //!
-//! The wake path re-enumerates the USB UART first (PnP re-enumeration —
-//! [`CM_Reenumerate_DevNode`] with a remove+rescan fallback, see
-//! `device.rs`), because on Modern Standby the panel's USB endpoint can
-//! stay wedged after resume and the old disable/enable workaround left a
-//! "restart required" pending state (Windows then demands a reboot after
-//! repeated cycles). Children respawn after the re-enumeration with fresh
-//! serial handles and `asterctl` re-sends the OpenTFT (0x0B) handshake,
-//! which is exactly how the panel is (re)initialized on the wire (see the
-//! reverse-engineered protocol in the `gem10-miniscreen` docs). When
-//! `restart_uart_on_resume` is `false`, the re-enumeration is skipped and
-//! only the soft re-init runs.
+//! The wake path re-enumerates the USB UART first (reset → remove+rescan,
+//! see `device.rs`), because on Modern Standby the panel's MCU power-cycles
+//! on wake (boot animation) while the host keeps a stale USB link, so
+//! writes fail with "The semaphore timeout period has expired". Children
+//! respawn after the re-enumeration with fresh serial handles and
+//! `asterctl` re-sends the OpenTFT (0x0B) handshake, which is exactly how
+//! the panel is (re)initialized on the wire (see the reverse-engineered
+//! protocol in the `gem10-miniscreen` docs). If asterctl still cannot
+//! initialize the panel, it writes `cfg/uart.stuck` and the resume handler
+//! escalates: re-enumerate again and let the watcher respawn asterctl
+//! (bounded rounds), so the recovery is timed by the panel's actual
+//! readiness instead of a fixed guess. When `restart_uart_on_resume` is
+//! `false`, only the soft re-init runs.
 //!
 //! On suspend the LCD is blanked first (CloseTFT 0x0A, via the
 //! `cfg/display.state` file) and asterctl gets a short grace to apply it
@@ -86,6 +88,19 @@ const RESUME_SETTLE_SECS: u64 = 4;
 #[cfg(windows)]
 const SUSPEND_BLANK_GRACE_SECS: u64 = 2;
 
+/// How long the resume handler waits for asterctl to report the panel
+/// unresponsive (`cfg/uart.stuck`) before escalating to another USB
+/// re-enumeration. asterctl writes the marker on the first failed init
+/// (within ~2s of spawning), so the extra margin covers slow spawns.
+#[cfg(windows)]
+const STUCK_ESCALATION_WINDOW_SECS: u64 = 10;
+
+/// Maximum escalation rounds per wake: each round re-enumerates the USB
+/// UART once and lets the watcher respawn asterctl. Bounded so a panel
+/// that never comes back cannot wedge the daemon thread in a loop.
+#[cfg(windows)]
+const MAX_ESCALATION_ROUNDS: u32 = 2;
+
 #[cfg(windows)]
 use crate::process::ChildHandle;
 
@@ -97,6 +112,10 @@ struct PowerState {
     /// (CloseTFT) before the children are killed and re-arm it on wake.
     display: Arc<crate::display::DisplayControl>,
     restart_uart_on_resume: bool,
+    /// `cfg/uart.stuck`: asterctl writes it when display init keeps
+    /// failing after wake; the resume handler polls it to decide when to
+    /// escalate to another USB re-enumeration.
+    stuck_file: PathBuf,
     log_path: PathBuf,
     /// True once a Resume has been acted on for the current sleep cycle.
     /// Daemon-thread-only (a plain bool): Windows can send several Resume
@@ -147,6 +166,7 @@ pub(crate) fn start(
     handles: Arc<Vec<ChildHandle>>,
     display: Arc<crate::display::DisplayControl>,
     restart_uart_on_resume: bool,
+    stuck_file: PathBuf,
     log_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -182,6 +202,7 @@ pub(crate) fn start(
                     handles,
                     display,
                     restart_uart_on_resume,
+                    stuck_file,
                     log_path,
                     resume_handled: true,
                 },
@@ -264,9 +285,8 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             );
             std::thread::sleep(std::time::Duration::from_secs(RESUME_SETTLE_SECS));
             if state.restart_uart_on_resume {
-                // PnP re-enumeration ladder (reset → re-enumerate →
-                // remove+rescan): re-negotiates the wedged USB endpoint
-                // with the bus driver. Deliberately NOT disable/enable,
+                // Re-enumeration ladder (reset → remove+rescan): re-tears
+                // down the stale USB link. Deliberately NOT disable/enable,
                 // which leaves a "restart required" pending state that
                 // makes Windows demand a reboot after repeated cycles.
                 crate::logging::append_line(&state.log_path, "power: resetting AOOSTAR USB UART");
@@ -277,10 +297,6 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
                     Ok(crate::device::RestartMethod::Reset) => crate::logging::append_line(
                         &state.log_path,
                         "power: USB UART restarted (CM_Reset_Device)",
-                    ),
-                    Ok(crate::device::RestartMethod::Reenumerate) => crate::logging::append_line(
-                        &state.log_path,
-                        "power: USB UART re-enumerated (PnP re-enumerate)",
                     ),
                     Ok(crate::device::RestartMethod::RemoveRescan) => crate::logging::append_line(
                         &state.log_path,
@@ -297,6 +313,10 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             // respawned asterctl sees "on" on its first poll (no waiting
             // for the next ~2s heartbeat).
             state.display.resume();
+            // Drop any stuck marker left over from a previous session: only
+            // a marker written by the asterctl we are about to respawn
+            // counts for this wake's escalation.
+            let _ = std::fs::remove_file(&state.stuck_file);
             // With `restart_uart_on_resume` the children must NOT respawn
             // before the re-enumeration completes: asterctl reopening COM3
             // while the device node is being re-enumerated (or removed for
@@ -308,6 +328,67 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             // and the children's soft OpenTFT re-init.
             crate::logging::append_line(&state.log_path, "power: resuming children");
             state.suspended.store(false, Ordering::SeqCst);
+
+            // Escalation: the panel power-cycles on wake (boot animation),
+            // and while it boots — or when the USB link went stale — the
+            // first init attempts fail. asterctl writes cfg/uart.stuck on
+            // init failure; each time the marker appears within the window,
+            // re-run the re-enumeration and let the watcher respawn
+            // asterctl, so the recovery is timed by the panel's actual
+            // readiness instead of a fixed guess. Bounded rounds; after
+            // that asterctl's own retry/backoff loop keeps trying on its
+            // own.
+            if state.restart_uart_on_resume {
+                for round in 0..MAX_ESCALATION_ROUNDS {
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(STUCK_ESCALATION_WINDOW_SECS);
+                    let mut stuck = false;
+                    while std::time::Instant::now() < deadline {
+                        if state.stuck_file.exists() {
+                            stuck = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                    if !stuck {
+                        break; // asterctl initialized; nothing to escalate
+                    }
+                    crate::logging::append_line(
+                        &state.log_path,
+                        &format!(
+                            "power: LCD unresponsive after wake, re-enumerating USB UART (round {})",
+                            round + 1
+                        ),
+                    );
+                    // Pause the watchers so asterctl is not respawned while
+                    // the device node is being torn down, then re-enumerate
+                    // and let it retry.
+                    state.suspended.store(true, Ordering::SeqCst);
+                    crate::process::kill_all(&state.handles, &state.log_path);
+                    let _ = std::fs::remove_file(&state.stuck_file);
+                    match crate::device::restart_uart(
+                        crate::device::AOOSTAR_UART_VID,
+                        crate::device::AOOSTAR_UART_PID,
+                    ) {
+                        Ok(crate::device::RestartMethod::Reset) => crate::logging::append_line(
+                            &state.log_path,
+                            "power: USB UART restarted (CM_Reset_Device)",
+                        ),
+                        Ok(crate::device::RestartMethod::RemoveRescan) => {
+                            crate::logging::append_line(
+                                &state.log_path,
+                                "power: USB UART re-enumerated (remove + rescan)",
+                            )
+                        }
+                        Err(e) => crate::logging::append_line(
+                            &state.log_path,
+                            &format!("power: USB UART restart failed: {e:?}"),
+                        ),
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    state.suspended.store(false, Ordering::SeqCst);
+                }
+            }
         }
         PowerEvent::Other => {}
     }
