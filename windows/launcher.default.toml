@@ -13,12 +13,12 @@ refresh_time = 5
 # sysinfo_refresh = 2
 # hwbridge_refresh = 5
 
-# Wake from sleep: children respawn with fresh serial handles and asterctl
-# re-initializes the panel at the protocol level (OpenTFT 0x0B) — no USB
-# reset involved. Set to true only if your unit's serial port stays wedged
-# after wake and needs the old hard disable + re-enable (Device Manager
-# workaround).
-restart_uart_on_resume = false
+# Wake from sleep: re-enumerates the AOOSTAR USB UART (PnP re-enumeration,
+# no reboot required) before the children respawn — the panel's USB
+# endpoint can stay wedged after Modern Standby ("The semaphore timeout
+# period has expired" on writes). Set to false only on units whose panel
+# recovers from the soft re-init alone (fresh serial handle + OpenTFT 0x0B).
+restart_uart_on_resume = true
 
 # LCD display mode, selectable live from the tray icon's "Display" sub-menu.
 # Allowed values: "on" (default), "off", "follow".

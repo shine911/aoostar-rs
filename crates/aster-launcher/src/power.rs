@@ -9,13 +9,17 @@
 //! - the periodic sensor/refresh loops stop running during sleep (saves
 //!   battery on Modern Standby machines).
 //!
-//! The default wake path is a soft protocol-level re-init: children respawn
-//! with fresh serial handles and `asterctl` re-sends the OpenTFT (0x0B)
-//! handshake, which is exactly how the panel is (re)initialized on the wire
-//! (see the reverse-engineered protocol in the `gem10-miniscreen` docs) — no
-//! USB reset is involved. Only when `restart_uart_on_resume` is set does the
-//! launcher additionally power-cycle the USB UART (the old Device Manager
-//! workaround, kept as an opt-in escape hatch).
+//! The wake path re-enumerates the USB UART first (PnP re-enumeration —
+//! [`CM_Reenumerate_DevNode`] with a remove+rescan fallback, see
+//! `device.rs`), because on Modern Standby the panel's USB endpoint can
+//! stay wedged after resume and the old disable/enable workaround left a
+//! "restart required" pending state (Windows then demands a reboot after
+//! repeated cycles). Children respawn after the re-enumeration with fresh
+//! serial handles and `asterctl` re-sends the OpenTFT (0x0B) handshake,
+//! which is exactly how the panel is (re)initialized on the wire (see the
+//! reverse-engineered protocol in the `gem10-miniscreen` docs). When
+//! `restart_uart_on_resume` is `false`, the re-enumeration is skipped and
+//! only the soft re-init runs.
 //!
 //! On suspend the LCD is blanked first (CloseTFT 0x0A, via the
 //! `cfg/display.state` file) and asterctl gets a short grace to apply it
@@ -260,10 +264,11 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             );
             std::thread::sleep(std::time::Duration::from_secs(RESUME_SETTLE_SECS));
             if state.restart_uart_on_resume {
-                // Opt-in escape hatch: the default wake path relies on the
-                // children's fresh serial handles + OpenTFT re-init, which
-                // the panel protocol supports directly. Some units need the
-                // hard USB re-enumeration instead.
+                // PnP re-enumeration ladder (reset → re-enumerate →
+                // remove+rescan): re-negotiates the wedged USB endpoint
+                // with the bus driver. Deliberately NOT disable/enable,
+                // which leaves a "restart required" pending state that
+                // makes Windows demand a reboot after repeated cycles.
                 crate::logging::append_line(&state.log_path, "power: resetting AOOSTAR USB UART");
                 match crate::device::restart_uart(
                     crate::device::AOOSTAR_UART_VID,
@@ -273,9 +278,13 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
                         &state.log_path,
                         "power: USB UART restarted (CM_Reset_Device)",
                     ),
-                    Ok(crate::device::RestartMethod::DisableEnable) => crate::logging::append_line(
+                    Ok(crate::device::RestartMethod::Reenumerate) => crate::logging::append_line(
                         &state.log_path,
-                        "power: USB UART restarted (disable/enable fallback)",
+                        "power: USB UART re-enumerated (PnP re-enumerate)",
+                    ),
+                    Ok(crate::device::RestartMethod::RemoveRescan) => crate::logging::append_line(
+                        &state.log_path,
+                        "power: USB UART re-enumerated (remove + rescan)",
                     ),
                     Err(e) => crate::logging::append_line(
                         &state.log_path,
@@ -289,14 +298,14 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             // for the next ~2s heartbeat).
             state.display.resume();
             // With `restart_uart_on_resume` the children must NOT respawn
-            // before the UART restart: asterctl reopening COM3 while the
-            // device is being disabled is what makes CM_Disable_DevNode fail
-            // (CR_INSUFFICIENT_RESOURCES), leaving the port wedged for the
-            // rest of the session. Keep `suspended` set (watchers keep
-            // sleeping) until the UART has been re-enumerated, then clear it
-            // so the children start with fresh serial handles. By default
-            // (no UART reset) the settle wait above is all that stands
-            // between wake and the children's soft OpenTFT re-init.
+            // before the re-enumeration completes: asterctl reopening COM3
+            // while the device node is being re-enumerated (or removed for
+            // the remove+rescan fallback) races the PnP operation and can
+            // leave the port wedged. Keep `suspended` set (watchers keep
+            // sleeping) until the re-enumeration is done, then clear it so
+            // the children start with fresh serial handles. With the switch
+            // off, the settle wait above is all that stands between wake
+            // and the children's soft OpenTFT re-init.
             crate::logging::append_line(&state.log_path, "power: resuming children");
             state.suspended.store(false, Ordering::SeqCst);
         }

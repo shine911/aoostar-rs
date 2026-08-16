@@ -84,14 +84,16 @@ pub struct LauncherConfig {
     /// Legacy per-process override for hwbridge, kept for backward
     /// compatibility. Only used when `refresh_time` is not configured.
     pub hwbridge_refresh: Option<u16>,
-    /// Escape hatch: on wake from sleep, disable + re-enable the AOOSTAR USB
-    /// UART (force re-enumeration) before respawning children — the old
-    /// automated version of the manual Device Manager fix. Default `false`:
-    /// the default wake path is a soft protocol-level re-init (children
-    /// respawn with fresh serial handles and `asterctl` re-sends OpenTFT
-    /// 0x0B), which the reverse-engineered panel protocol supports directly;
-    /// the USB reset is only needed on units whose port stays wedged
-    /// otherwise.
+    /// On wake from sleep, re-enumerate the AOOSTAR USB UART before
+    /// respawning children. Default `true`: on Modern Standby the panel's
+    /// USB endpoint can stay wedged after resume (device enumerated but
+    /// writes time out — "The semaphore timeout period has expired"), and a
+    /// PnP re-enumeration ([`CM_Reenumerate_DevNode`], with a remove+rescan
+    /// fallback) re-negotiates it with the bus driver. Unlike the old
+    /// disable/enable workaround this leaves no "restart required" pending
+    /// state, so Windows never asks for a reboot. Set `false` on units that
+    /// recover from the soft re-init alone (children respawn with fresh
+    /// serial handles and `asterctl` re-sends OpenTFT 0x0B).
     pub restart_uart_on_resume: bool,
 }
 
@@ -106,7 +108,7 @@ impl Default for LauncherConfig {
             display_mode: None,
             sysinfo_refresh: None,
             hwbridge_refresh: None,
-            restart_uart_on_resume: false,
+            restart_uart_on_resume: true,
         }
     }
 }
@@ -316,23 +318,24 @@ mod tests {
     }
 
     #[test]
-    fn partial_file_defaults_restart_uart_off() {
-        // The wake path is a soft protocol-level re-init by default; the USB
-        // reset is an opt-in escape hatch.
+    fn partial_file_defaults_restart_uart_on() {
+        // The panel's USB endpoint can wedge during Modern Standby, so the
+        // default wake path re-enumerates the USB UART (PnP re-enumeration —
+        // no reboot required).
         let file = write_temp("sysinfo_refresh = 9\n");
         let cfg = LauncherConfig::load(file.path());
-        assert!(!cfg.restart_uart_on_resume);
+        assert!(cfg.restart_uart_on_resume);
     }
 
     #[test]
-    fn restart_uart_is_an_opt_in_escape_hatch() {
-        let file = write_temp("restart_uart_on_resume = true\n");
-        let cfg = LauncherConfig::load(file.path());
-        assert!(cfg.restart_uart_on_resume);
-
+    fn restart_uart_can_be_disabled_for_units_that_recover_softly() {
         let file = write_temp("restart_uart_on_resume = false\n");
         let cfg = LauncherConfig::load(file.path());
         assert!(!cfg.restart_uart_on_resume);
+
+        let file = write_temp("restart_uart_on_resume = true\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert!(cfg.restart_uart_on_resume);
     }
 
     #[test]

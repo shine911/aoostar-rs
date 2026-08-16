@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Changed
-- Wake from sleep no longer power-cycles the AOOSTAR USB UART by default: the children respawn
-  with fresh serial handles and `asterctl` re-initializes the panel at the protocol level
-  (OpenTFT 0x0B — the handshake the reverse-engineered panel protocol uses), avoiding the hard
-  disable/enable re-enumeration that can itself leave the port wedged (the reported "The
-  semaphore timeout period has expired" case). `restart_uart_on_resume` now defaults to `false`
-  and stays as an opt-in escape hatch for units that still need the old Device Manager workaround.
+- Wake now re-enumerates the AOOSTAR USB UART via a **PnP re-enumeration ladder**
+  (`CM_Reenumerate_DevNode`, with a remove + rescan fallback) instead of the old
+  disable/enable workaround. The panel's USB endpoint can stay wedged after Modern
+  Standby resume (device enumerated but writes fail with "The semaphore timeout
+  period has expired"); disable/enable recovered it but left a "restart required"
+  pending state, so Windows demanded a reboot after repeated sleep/wake cycles. The
+  new ladder re-negotiates the device with the bus driver with no reboot ask.
+  `restart_uart_on_resume` stays as a switch (default `true`; set `false` on units
+  that recover from the soft re-init alone — fresh serial handle + OpenTFT 0x0B).
 - Sleep now blanks the LCD before the children are killed: on suspend the launcher writes
   `cfg/display.state` as "off" (asterctl sends CloseTFT 0x0A), waits a short grace for it to
   apply, and keeps the state file "off" for the whole sleep, then re-arms it on wake — so the

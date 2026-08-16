@@ -146,17 +146,22 @@ When Windows goes to sleep, `aster-launcher` detects the power event and
 blanks the LCD first (`asterctl` sends CloseTFT 0x0A), waits ~2s for it to
 apply, then suspends all three child processes (they are force-stopped; the
 watchers do not restart them while the machine is asleep). On wake it waits
-~4s for the USB stack, then restarts the children with fresh serial
-handles, so the AOOSTAR display re-initializes automatically: `asterctl`
-re-sends the OpenTFT (0x0B) handshake, which is exactly how the panel is
-(re)initialized on the wire — no USB reset is involved.
+~4s for the USB stack, then re-enumerates the AOOSTAR USB UART and restarts
+the children with fresh serial handles, so the AOOSTAR display
+re-initializes automatically: `asterctl` re-sends the OpenTFT (0x0B)
+handshake, which is exactly how the panel is (re)initialized on the wire.
 
-If your unit's serial port stays wedged after wake anyway (writes keep
-failing with "The semaphore timeout period has expired"), you can fall back
-to the old hard re-enumeration: set `restart_uart_on_resume = true` in
-`launcher.toml`, which disables + re-enables the AOOSTAR USB UART on every
-wake (the automated version of the manual "Device Manager → COM3 → Disable →
-Enable → restart" fix).
+The USB re-enumeration is needed because on Modern Standby (S0) — the only
+sleep state these AOOSTAR boards expose — the panel's USB endpoint can stay
+wedged after resume: the device is still enumerated and COM3 opens, but
+writes fail with "The semaphore timeout period has expired". The launcher
+uses a PnP re-enumeration ladder ([`CM_Reenumerate_DevNode`], falling back
+to remove + rescan) that re-negotiates the device with the bus driver. It
+deliberately avoids the old Device Manager "Disable → Enable" workaround,
+which leaves a "restart required" pending state that makes Windows demand a
+reboot after repeated sleep/wake cycles. Units whose panel recovers from
+the soft re-init alone (fresh handle + OpenTFT, no USB disturbance) can set
+`restart_uart_on_resume = false` in `launcher.toml`.
 
 Recommended power settings (reduces the chance of a wedged USB port):
 - untick "Allow the computer to turn off this device to save power" for the

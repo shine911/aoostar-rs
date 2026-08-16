@@ -424,7 +424,7 @@ mod tests {
             refresh_time: Some(10),
             sysinfo_refresh: Some(7),
             hwbridge_refresh: Some(11),
-            restart_uart_on_resume: false,
+            restart_uart_on_resume: true,
             theme: None,
             display_mode: None,
         };
@@ -487,7 +487,7 @@ mod tests {
             refresh_time: None,
             sysinfo_refresh: Some(2),
             hwbridge_refresh: Some(30),
-            restart_uart_on_resume: false,
+            restart_uart_on_resume: true,
             theme: None,
             display_mode: None,
         };
@@ -506,7 +506,7 @@ mod tests {
             refresh_time: None,
             sysinfo_refresh: None,
             hwbridge_refresh: None,
-            restart_uart_on_resume: false,
+            restart_uart_on_resume: true,
             theme: Some(2),
             display_mode: None,
         };
@@ -539,7 +539,7 @@ mod tests {
             refresh_time: Some(10),
             sysinfo_refresh: None,
             hwbridge_refresh: None,
-            restart_uart_on_resume: false,
+            restart_uart_on_resume: true,
             theme: Some(2),
             display_mode: None,
         };
