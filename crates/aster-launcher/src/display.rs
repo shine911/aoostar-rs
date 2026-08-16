@@ -22,7 +22,10 @@
 //! asterctl switches the display off — and exits — when the file goes
 //! stale, so a closed or killed launcher never leaves the LCD stuck on.
 //! On a clean launcher shutdown [`DisplayControl::force_off`] blanks the
-//! display before asterctl is killed.
+//! display before asterctl is killed; while the machine sleeps
+//! [`DisplayControl::suspend`] does the same (the heartbeat keeps writing
+//! "off" for the whole sleep so asterctl sends CloseTFT before it is
+//! killed and a mid-sleep heartbeat cannot flip the file back to "on").
 
 // `main.rs` denies `unsafe_code` crate-wide; this module is the narrow,
 // deliberate exception — pure Win32 FFI glue, scoped the same way as
@@ -109,6 +112,21 @@ pub(crate) fn effective_state_on(mode: DisplayMode, last_seen: u8) -> bool {
     }
 }
 
+/// Effective state the heartbeat writes: while the machine is asleep
+/// (`suspend_off`) it is always off — the LCD must stay blank during
+/// sleep, and a heartbeat firing mid-grace must not flip the file back to
+/// "on" before asterctl has sent CloseTFT. Otherwise the mode's effective
+/// state. Extracted so the suspend override is unit-testable on every
+/// platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn heartbeat_state_on(mode: DisplayMode, last_seen: u8, suspend_off: bool) -> bool {
+    if suspend_off {
+        false
+    } else {
+        effective_state_on(mode, last_seen)
+    }
+}
+
 /// State shared between the power-setting callback (invoked by the system
 /// on a private thread) and the watcher daemon thread. The callback only
 /// touches `last_seen` and `wake`; `follow_active` and the state file live
@@ -164,6 +182,11 @@ pub(crate) struct DisplayControl {
     pub mode: Arc<AtomicU16>,
     follow_active: Arc<AtomicBool>,
     last_seen: Arc<AtomicU8>,
+    /// Set while the machine is asleep: forces the heartbeat to keep
+    /// writing "off" (see [`heartbeat_state_on`]) so asterctl blanks the
+    /// LCD before the launcher kills it and a mid-sleep heartbeat cannot
+    /// flip the file back to "on".
+    suspend_off: Arc<AtomicBool>,
     state_file: PathBuf,
     log_path: PathBuf,
 }
@@ -186,6 +209,7 @@ impl DisplayControl {
             // worst case the LCD stays on briefly instead of flickering off.
             follow_active: Arc::new(AtomicBool::new(false)),
             last_seen: Arc::new(AtomicU8::new(1)),
+            suspend_off: Arc::new(AtomicBool::new(false)),
             state_file,
             log_path,
         });
@@ -233,14 +257,19 @@ impl DisplayControl {
     }
 
     /// Periodic heartbeat, called from the tray loop roughly every 2s:
-    /// rewrites `cfg/display.state` with the current mode's effective
-    /// state. The rewrite keeps the file's mtime fresh, which is what
-    /// asterctl uses to detect a dead launcher — when the file goes stale
-    /// it switches the display off and exits. The content is idempotent,
-    /// so the extra writes are harmless.
+    /// rewrites `cfg/display.state` with the current state (off while the
+    /// machine is asleep — see [`heartbeat_state_on`]). The rewrite keeps
+    /// the file's mtime fresh, which is what asterctl uses to detect a
+    /// dead launcher — when the file goes stale it switches the display
+    /// off and exits. The content is idempotent, so the extra writes are
+    /// harmless.
     pub(crate) fn heartbeat(&self) {
         let mode = DisplayMode::from_index(self.mode.load(Ordering::SeqCst));
-        let on = effective_state_on(mode, self.last_seen.load(Ordering::SeqCst));
+        let on = heartbeat_state_on(
+            mode,
+            self.last_seen.load(Ordering::SeqCst),
+            self.suspend_off.load(Ordering::SeqCst),
+        );
         self.write_state(on);
     }
 
@@ -249,6 +278,28 @@ impl DisplayControl {
     /// the launcher kills it (see the shutdown grace in `main.rs`).
     pub(crate) fn force_off(&self) {
         self.write_state(false);
+    }
+
+    /// Sleep: blanks the LCD (writes "off") and keeps the heartbeat
+    /// writing "off" while the machine is asleep, so asterctl sends
+    /// CloseTFT before the launcher kills it and a mid-sleep heartbeat
+    /// cannot flip the file back to "on". Called by the power monitor
+    /// before its suspend grace (see `power.rs`).
+    pub(crate) fn suspend(&self) {
+        self.suspend_off.store(true, Ordering::SeqCst);
+        self.write_state(false);
+    }
+
+    /// Wake: clears the suspend override and rewrites the current mode's
+    /// state immediately, so a respawned asterctl sees "on" on its very
+    /// first poll instead of waiting for the next ~2s heartbeat.
+    pub(crate) fn resume(&self) {
+        self.suspend_off.store(false, Ordering::SeqCst);
+        let mode = DisplayMode::from_index(self.mode.load(Ordering::SeqCst));
+        self.write_state(effective_state_on(
+            mode,
+            self.last_seen.load(Ordering::SeqCst),
+        ));
     }
 
     fn write_state(&self, on: bool) {
@@ -398,6 +449,21 @@ mod tests {
         assert!(!effective_state_on(DisplayMode::Follow, 0));
         assert!(effective_state_on(DisplayMode::Follow, 1));
         assert!(effective_state_on(DisplayMode::Follow, 2));
+    }
+
+    #[test]
+    fn heartbeat_state_on_force_off_while_suspended() {
+        // While the machine is asleep the heartbeat must keep writing
+        // "off" no matter the mode or display power state: asterctl has to
+        // send CloseTFT before it is killed, and a mid-sleep heartbeat
+        // must not flip the file back to "on".
+        assert!(!heartbeat_state_on(DisplayMode::On, 1, true));
+        assert!(!heartbeat_state_on(DisplayMode::Follow, 0, true));
+        assert!(!heartbeat_state_on(DisplayMode::Follow, 1, true));
+        // Awake: the mode's effective state applies as before.
+        assert!(heartbeat_state_on(DisplayMode::On, 0, false));
+        assert!(!heartbeat_state_on(DisplayMode::Off, 1, false));
+        assert!(heartbeat_state_on(DisplayMode::Follow, 2, false));
     }
 
     #[test]

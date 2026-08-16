@@ -9,6 +9,20 @@
 //! - the periodic sensor/refresh loops stop running during sleep (saves
 //!   battery on Modern Standby machines).
 //!
+//! The default wake path is a soft protocol-level re-init: children respawn
+//! with fresh serial handles and `asterctl` re-sends the OpenTFT (0x0B)
+//! handshake, which is exactly how the panel is (re)initialized on the wire
+//! (see the reverse-engineered protocol in the `gem10-miniscreen` docs) — no
+//! USB reset is involved. Only when `restart_uart_on_resume` is set does the
+//! launcher additionally power-cycle the USB UART (the old Device Manager
+//! workaround, kept as an opt-in escape hatch).
+//!
+//! On suspend the LCD is blanked first (CloseTFT 0x0A, via the
+//! `cfg/display.state` file) and asterctl gets a short grace to apply it
+//! before the children are killed — the same blank-then-kill sequence the
+//! clean-quit path uses — so the panel enters sleep deterministically off
+//! and wake re-initializes it cleanly with OpenTFT.
+//!
 //! Transport: `RegisterSuspendResumeNotification` — a windowless API that
 //! works on Modern Standby (S0 low-power idle). The earlier hidden-window +
 //! `WM_POWERBROADCAST` approach never delivered events on the AOOSTAR WTR
@@ -61,6 +75,13 @@ pub(crate) fn classify_power_event(wparam: usize) -> PowerEvent {
 /// stack needs a moment to re-enumerate the LCD UART.
 const RESUME_SETTLE_SECS: u64 = 4;
 
+/// Seconds to wait after writing "off" on suspend so asterctl can send
+/// CloseTFT (0x0A) before it is killed. Covers asterctl's ~1s state-file
+/// poll plus a mid-render margin (a full frame upload can take ~1.5s);
+/// same value as the clean-quit grace (`QUIT_KILL_GRACE_SECS`).
+#[cfg(windows)]
+const SUSPEND_BLANK_GRACE_SECS: u64 = 2;
+
 #[cfg(windows)]
 use crate::process::ChildHandle;
 
@@ -68,6 +89,9 @@ use crate::process::ChildHandle;
 struct PowerState {
     suspended: Arc<AtomicBool>,
     handles: Arc<Vec<ChildHandle>>,
+    /// LCD display control: `suspend()`/`resume()` blank the display
+    /// (CloseTFT) before the children are killed and re-arm it on wake.
+    display: Arc<crate::display::DisplayControl>,
     restart_uart_on_resume: bool,
     log_path: PathBuf,
     /// True once a Resume has been acted on for the current sleep cycle.
@@ -117,6 +141,7 @@ unsafe extern "system" fn on_power_event(
 pub(crate) fn start(
     suspended: Arc<AtomicBool>,
     handles: Arc<Vec<ChildHandle>>,
+    display: Arc<crate::display::DisplayControl>,
     restart_uart_on_resume: bool,
     log_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
@@ -151,6 +176,7 @@ pub(crate) fn start(
                 power: PowerState {
                     suspended,
                     handles,
+                    display,
                     restart_uart_on_resume,
                     log_path,
                     resume_handled: true,
@@ -205,6 +231,13 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             );
             // Arm the Resume handler for the next wake.
             state.resume_handled = false;
+            // Blank the LCD before killing asterctl: write "off" (asterctl
+            // sends CloseTFT 0x0A) and give it the grace to apply it —
+            // mirroring the clean-quit sequence. `suspended` must stay
+            // false during the grace, or the watchers would force-kill
+            // asterctl before it can blank the display.
+            state.display.suspend();
+            std::thread::sleep(std::time::Duration::from_secs(SUSPEND_BLANK_GRACE_SECS));
             state.suspended.store(true, Ordering::SeqCst);
             crate::process::kill_all(&state.handles, &state.log_path);
         }
@@ -227,6 +260,10 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             );
             std::thread::sleep(std::time::Duration::from_secs(RESUME_SETTLE_SECS));
             if state.restart_uart_on_resume {
+                // Opt-in escape hatch: the default wake path relies on the
+                // children's fresh serial handles + OpenTFT re-init, which
+                // the panel protocol supports directly. Some units need the
+                // hard USB re-enumeration instead.
                 crate::logging::append_line(&state.log_path, "power: resetting AOOSTAR USB UART");
                 match crate::device::restart_uart(
                     crate::device::AOOSTAR_UART_VID,
@@ -246,13 +283,20 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
                     ),
                 }
             }
-            // The children must NOT respawn before the UART restart:
-            // asterctl reopening COM3 while the device is being disabled is
-            // what makes CM_Disable_DevNode fail (CR_INSUFFICIENT_RESOURCES),
-            // leaving the port wedged for the rest of the session. Keep
-            // `suspended` set (watchers keep sleeping) until the UART has
-            // been re-enumerated, then clear it so the children start with
-            // fresh serial handles.
+            // Re-arm the display control for the new wake: clear the
+            // suspend override and rewrite the current mode's state, so a
+            // respawned asterctl sees "on" on its first poll (no waiting
+            // for the next ~2s heartbeat).
+            state.display.resume();
+            // With `restart_uart_on_resume` the children must NOT respawn
+            // before the UART restart: asterctl reopening COM3 while the
+            // device is being disabled is what makes CM_Disable_DevNode fail
+            // (CR_INSUFFICIENT_RESOURCES), leaving the port wedged for the
+            // rest of the session. Keep `suspended` set (watchers keep
+            // sleeping) until the UART has been re-enumerated, then clear it
+            // so the children start with fresh serial handles. By default
+            // (no UART reset) the settle wait above is all that stands
+            // between wake and the children's soft OpenTFT re-init.
             crate::logging::append_line(&state.log_path, "power: resuming children");
             state.suspended.store(false, Ordering::SeqCst);
         }

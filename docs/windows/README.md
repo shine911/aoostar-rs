@@ -143,15 +143,20 @@ a duplicate set of children.
 ## Sleep / resume behavior
 
 When Windows goes to sleep, `aster-launcher` detects the power event and
-suspends all three child processes (they are force-stopped; the watchers do
-not restart them while the machine is asleep). On wake it waits ~4s for the
-USB stack, then restarts the children with fresh serial handles, so the
-AOOSTAR display re-initializes automatically.
+blanks the LCD first (`asterctl` sends CloseTFT 0x0A), waits ~2s for it to
+apply, then suspends all three child processes (they are force-stopped; the
+watchers do not restart them while the machine is asleep). On wake it waits
+~4s for the USB stack, then restarts the children with fresh serial
+handles, so the AOOSTAR display re-initializes automatically: `asterctl`
+re-sends the OpenTFT (0x0B) handshake, which is exactly how the panel is
+(re)initialized on the wire — no USB reset is involved.
 
-By default the launcher also disables + re-enables the AOOSTAR USB UART on
-every wake (the automated version of the old manual "Device Manager → COM3 →
-Disable → Enable → restart" fix). If your unit recovers without that, set
-`restart_uart_on_resume = false` in `launcher.toml`.
+If your unit's serial port stays wedged after wake anyway (writes keep
+failing with "The semaphore timeout period has expired"), you can fall back
+to the old hard re-enumeration: set `restart_uart_on_resume = true` in
+`launcher.toml`, which disables + re-enables the AOOSTAR USB UART on every
+wake (the automated version of the manual "Device Manager → COM3 → Disable →
+Enable → restart" fix).
 
 Recommended power settings (reduces the chance of a wedged USB port):
 - untick "Allow the computer to turn off this device to save power" for the

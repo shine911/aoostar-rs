@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Wake from sleep no longer power-cycles the AOOSTAR USB UART by default: the children respawn
+  with fresh serial handles and `asterctl` re-initializes the panel at the protocol level
+  (OpenTFT 0x0B — the handshake the reverse-engineered panel protocol uses), avoiding the hard
+  disable/enable re-enumeration that can itself leave the port wedged (the reported "The
+  semaphore timeout period has expired" case). `restart_uart_on_resume` now defaults to `false`
+  and stays as an opt-in escape hatch for units that still need the old Device Manager workaround.
+- Sleep now blanks the LCD before the children are killed: on suspend the launcher writes
+  `cfg/display.state` as "off" (asterctl sends CloseTFT 0x0A), waits a short grace for it to
+  apply, and keeps the state file "off" for the whole sleep, then re-arms it on wake — so the
+  panel enters sleep deterministically off and wake re-initializes it cleanly with OpenTFT.
+
 ### Added
 - `aster-launcher` tray "Display" sub-menu with three mutually exclusive LCD modes: **On**, **Off**,
   and **Follow screen state** (the active mode carries a check mark). Picking one persists

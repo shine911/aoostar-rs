@@ -141,11 +141,13 @@ fn windows_main() {
         watchers.push(watcher);
     }
 
-    // Power monitor: kills children on sleep, respawns them after wake.
-    // The thread is a daemon (see `power::start`) and is never joined.
+    // Power monitor: blanks the LCD (CloseTFT) and kills children on
+    // sleep, respawns them after wake. The thread is a daemon (see
+    // `power::start`) and is never joined.
     let _power_thread = power::start(
         suspended.clone(),
         Arc::new(handles.clone()),
+        display.clone(),
         cfg.restart_uart_on_resume,
         launcher_log.clone(),
     );

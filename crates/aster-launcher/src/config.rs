@@ -84,10 +84,14 @@ pub struct LauncherConfig {
     /// Legacy per-process override for hwbridge, kept for backward
     /// compatibility. Only used when `refresh_time` is not configured.
     pub hwbridge_refresh: Option<u16>,
-    /// On wake from sleep, disable + re-enable the AOOSTAR USB UART (force
-    /// re-enumeration) before respawning children — the automated version of
-    /// the manual Device Manager fix. Set false if Task 1's fresh-open is
-    /// already sufficient on your hardware.
+    /// Escape hatch: on wake from sleep, disable + re-enable the AOOSTAR USB
+    /// UART (force re-enumeration) before respawning children — the old
+    /// automated version of the manual Device Manager fix. Default `false`:
+    /// the default wake path is a soft protocol-level re-init (children
+    /// respawn with fresh serial handles and `asterctl` re-sends OpenTFT
+    /// 0x0B), which the reverse-engineered panel protocol supports directly;
+    /// the USB reset is only needed on units whose port stays wedged
+    /// otherwise.
     pub restart_uart_on_resume: bool,
 }
 
@@ -102,7 +106,7 @@ impl Default for LauncherConfig {
             display_mode: None,
             sysinfo_refresh: None,
             hwbridge_refresh: None,
-            restart_uart_on_resume: true,
+            restart_uart_on_resume: false,
         }
     }
 }
@@ -312,14 +316,20 @@ mod tests {
     }
 
     #[test]
-    fn partial_file_defaults_restart_uart_on_resume() {
+    fn partial_file_defaults_restart_uart_off() {
+        // The wake path is a soft protocol-level re-init by default; the USB
+        // reset is an opt-in escape hatch.
         let file = write_temp("sysinfo_refresh = 9\n");
         let cfg = LauncherConfig::load(file.path());
-        assert!(cfg.restart_uart_on_resume);
+        assert!(!cfg.restart_uart_on_resume);
     }
 
     #[test]
-    fn restart_uart_can_be_disabled_in_config() {
+    fn restart_uart_is_an_opt_in_escape_hatch() {
+        let file = write_temp("restart_uart_on_resume = true\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert!(cfg.restart_uart_on_resume);
+
         let file = write_temp("restart_uart_on_resume = false\n");
         let cfg = LauncherConfig::load(file.path());
         assert!(!cfg.restart_uart_on_resume);

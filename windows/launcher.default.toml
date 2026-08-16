@@ -13,10 +13,12 @@ refresh_time = 5
 # sysinfo_refresh = 2
 # hwbridge_refresh = 5
 
-# On wake from sleep: disable + re-enable the AOOSTAR USB UART before
-# restarting the children (automates the old Device Manager fix). Set to
-# false if the screen already recovers without it.
-restart_uart_on_resume = true
+# Wake from sleep: children respawn with fresh serial handles and asterctl
+# re-initializes the panel at the protocol level (OpenTFT 0x0B) — no USB
+# reset involved. Set to true only if your unit's serial port stays wedged
+# after wake and needs the old hard disable + re-enable (Device Manager
+# workaround).
+restart_uart_on_resume = false
 
 # LCD display mode, selectable live from the tray icon's "Display" sub-menu.
 # Allowed values: "on" (default), "off", "follow".

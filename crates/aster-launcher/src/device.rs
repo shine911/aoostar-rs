@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Windows PnP device helpers: find and power-cycle the AOOSTAR USB UART —
-//! the automated version of the manual "disable in Device Manager,
-//! re-enable" workaround that was previously required after every sleep.
+//! Windows PnP device helpers: find and power-cycle the AOOSTAR USB UART.
+//! Only used when the `restart_uart_on_resume` escape hatch is enabled —
+//! the opt-in version of the manual "disable in Device Manager, re-enable"
+//! workaround for units whose serial port stays wedged after sleep.
 
 // `main.rs` denies `unsafe_code` crate-wide; this module is the narrow,
 // deliberate exception — it is pure CfgMgr32 FFI glue. Scoped here so the
