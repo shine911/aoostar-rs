@@ -252,7 +252,11 @@ impl DisplayControl {
                 self.follow_active.store(true, Ordering::SeqCst);
             }
         }
-        let on = effective_state_on(mode, self.last_seen.load(Ordering::SeqCst));
+        let on = heartbeat_state_on(
+            mode,
+            self.last_seen.load(Ordering::SeqCst),
+            self.suspend_off.load(Ordering::SeqCst),
+        );
         self.write_state(on);
     }
 
@@ -328,6 +332,7 @@ impl DisplayControl {
 
         let follow_active = self.follow_active.clone();
         let last_seen = self.last_seen.clone();
+        let suspend_off = self.suspend_off.clone();
         let state_file = self.state_file.clone();
         let log_path = self.log_path.clone();
 
@@ -393,19 +398,26 @@ impl DisplayControl {
                     // selected, then mirror it into the state file — but
                     // only while "Follow" is the active mode. Manual On/Off
                     // keep working because they clear `follow_active`
-                    // before writing the file themselves.
+                    // before writing the file themselves. Respect the
+                    // suspend override: keep writing "off" while the
+                    // machine is asleep.
                     let state = shared.last_seen.load(Ordering::SeqCst);
                     last_seen.store(state, Ordering::SeqCst);
-                    if follow_active.load(Ordering::SeqCst)
-                        && let Err(err) = write_state_file(&state_file, display_state_is_on(state))
-                    {
-                        crate::logging::append_line(
-                            &log_path,
-                            &format!(
-                                "failed to write display.state ({}): {err}",
-                                state_file.display()
-                            ),
-                        );
+                    if follow_active.load(Ordering::SeqCst) {
+                        let on = if suspend_off.load(Ordering::SeqCst) {
+                            false
+                        } else {
+                            display_state_is_on(state)
+                        };
+                        if let Err(err) = write_state_file(&state_file, on) {
+                            crate::logging::append_line(
+                                &log_path,
+                                &format!(
+                                    "failed to write display.state ({}): {err}",
+                                    state_file.display()
+                                ),
+                            );
+                        }
                     }
                 }
                 PowerSettingUnregisterNotification(registration);

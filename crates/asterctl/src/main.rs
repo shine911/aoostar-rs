@@ -138,14 +138,20 @@ fn main() -> anyhow::Result<()> {
     let mut builder = AooScreenBuilder::new();
     builder.no_init_check(args.write_only);
     let mut screen = if args.simulate {
-        builder.simulate()?
+        builder.simulate()
     } else if let Some(device) = args.device {
-        builder.open_device(&device)?
+        builder.open_device(&device)
     } else if let Some(usb) = args.usb {
-        builder.open_usb_id(&usb)?
+        builder.open_usb_id(&usb)
     } else {
-        builder.open_default()?
-    };
+        builder.open_default()
+    }
+    .map_err(|e| {
+        if let Some(path) = args.stuck_file.as_deref() {
+            report_stuck(path);
+        }
+        e
+    })?;
 
     // process simple commands
     if args.off {
