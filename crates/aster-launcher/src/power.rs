@@ -50,6 +50,8 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::sync::Arc;
 #[cfg(windows)]
+use std::sync::Mutex;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Classification of a suspend/resume notification type.
@@ -114,6 +116,13 @@ struct PowerState {
     /// failure (init or mid-session); the stuck-marker watcher daemon uses
     /// it to decide when to re-enumerate the USB UART and respawn asterctl.
     stuck_file: PathBuf,
+    /// Serializes USB-UART re-enumeration and the `suspended` flag between
+    /// the power daemon (suspend/resume handling, including the CloseTFT
+    /// grace) and the stuck-marker watcher daemon. Without it, the watcher
+    /// could fire mid-grace (killing asterctl before it blanks the LCD) or
+    /// its trailing `store(false)` could clear the daemon's suspend state
+    /// while the machine is asleep, letting children respawn into sleep.
+    uart_lock: Arc<Mutex<()>>,
     log_path: PathBuf,
     /// True once a Resume has been acted on for the current sleep cycle.
     /// Daemon-thread-only (a plain bool): Windows can send several Resume
@@ -155,9 +164,11 @@ unsafe extern "system" fn on_power_event(
     0 // NO_ERROR
 }
 
-/// Starts the power-monitor thread. The thread is a daemon: it runs for the
-/// process lifetime and needs no shutdown coordination (it only writes to
-/// the launcher log and manipulates child handles, never spawns).
+/// Starts the power-monitor thread and the stuck-marker watcher daemon.
+/// Both are daemons: they run for the process lifetime and need no shutdown
+/// coordination (they only write to the launcher log and manipulate child
+/// handles, never spawn). They share [`PowerState::uart_lock`] so the
+/// `suspended` flag and USB re-enumerations are serialized between them.
 #[cfg(windows)]
 pub(crate) fn start(
     suspended: Arc<AtomicBool>,
@@ -165,8 +176,13 @@ pub(crate) fn start(
     display: Arc<crate::display::DisplayControl>,
     restart_uart_on_resume: bool,
     stuck_file: PathBuf,
+    quit: Arc<AtomicBool>,
     log_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
+    // Shared lock: serializes USB-UART re-enumeration and `suspended`
+    // writes between this daemon and the stuck-marker watcher below.
+    let uart_lock = Arc::new(Mutex::new(()));
+
     // Stuck-marker watcher daemon: re-enumerates the USB UART whenever
     // asterctl reports a display-communication failure (any time, not just
     // in the wake window), so every failure gets a fresh remove+rescan
@@ -176,6 +192,8 @@ pub(crate) fn start(
         handles.clone(),
         restart_uart_on_resume,
         stuck_file.clone(),
+        quit.clone(),
+        uart_lock.clone(),
         log_path.clone(),
     );
 
@@ -213,6 +231,7 @@ pub(crate) fn start(
                     display,
                     restart_uart_on_resume,
                     stuck_file,
+                    uart_lock,
                     log_path,
                     resume_handled: true,
                 },
@@ -273,6 +292,8 @@ fn start_stuck_watcher(
     handles: Arc<Vec<ChildHandle>>,
     restart_uart_on_resume: bool,
     stuck_file: PathBuf,
+    quit: Arc<AtomicBool>,
+    uart_lock: Arc<Mutex<()>>,
     log_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -284,17 +305,39 @@ fn start_stuck_watcher(
 
         loop {
             std::thread::sleep(std::time::Duration::from_secs(STUCK_POLL_STEP_SECS));
-            if !restart_uart_on_resume || suspended.load(Ordering::SeqCst) {
-                // Soft-only mode, or the machine is asleep (the wake flow
-                // handles that); do nothing.
+            if quit.load(Ordering::SeqCst)
+                || !stuck_watcher_should_act(
+                    restart_uart_on_resume,
+                    suspended.load(Ordering::SeqCst),
+                    stuck_file.exists(),
+                    last_rescan.elapsed()
+                        >= std::time::Duration::from_secs(STUCK_RESCAN_COOLDOWN_SECS),
+                )
+            {
+                // Quitting, soft-only mode, machine asleep (the wake flow
+                // handles that), no marker, or still on cooldown.
                 continue;
             }
-            if !stuck_file.exists() {
-                continue;
-            }
-            if last_rescan.elapsed() < std::time::Duration::from_secs(STUCK_RESCAN_COOLDOWN_SECS) {
-                // Cooldown: another rescan is not due yet. The marker stays
-                // until asterctl recovers or the cooldown expires.
+
+            // Take the shared lock for the whole escalation round. With the
+            // power daemon holding the same lock through suspend/resume
+            // handling (CloseTFT grace included), `suspended` is stable
+            // here: it cannot flip to true mid-round from a real suspend,
+            // and the trailing store(false) below can never clear a suspend
+            // state the daemon set.
+            let _guard = match uart_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Re-check the conditions under the lock: the daemon may have
+            // started handling a suspend (or respawned children) while we
+            // waited.
+            if !stuck_watcher_should_act(
+                restart_uart_on_resume,
+                suspended.load(Ordering::SeqCst),
+                stuck_file.exists(),
+                last_rescan.elapsed() >= std::time::Duration::from_secs(STUCK_RESCAN_COOLDOWN_SECS),
+            ) {
                 continue;
             }
             last_rescan = std::time::Instant::now();
@@ -331,6 +374,20 @@ fn start_stuck_watcher(
     })
 }
 
+/// Pure decision for the stuck-marker watcher: act only when the
+/// re-enumeration is enabled, the machine is awake, a marker is present,
+/// and the cooldown has elapsed. Extracted so the interplay is
+/// unit-testable on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn stuck_watcher_should_act(
+    restart_uart_on_resume: bool,
+    suspended: bool,
+    marker_present: bool,
+    cooldown_elapsed: bool,
+) -> bool {
+    restart_uart_on_resume && !suspended && marker_present && cooldown_elapsed
+}
+
 #[cfg(windows)]
 fn handle_power_event(state: &mut PowerState, event_type: usize) {
     match classify_power_event(event_type) {
@@ -341,6 +398,14 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
             );
             // Arm the Resume handler for the next wake.
             state.resume_handled = false;
+            // Take the shared lock for the whole suspend sequence (CloseTFT
+            // grace included): the stuck-marker watcher must not fire
+            // mid-grace and kill asterctl before it blanks the LCD, nor run
+            // a USB teardown while we are entering sleep.
+            let _guard = match state.uart_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             // Blank the LCD before killing asterctl: write "off" (asterctl
             // sends CloseTFT 0x0A) and give it the grace to apply it —
             // mirroring the clean-quit sequence. `suspended` must stay
@@ -364,6 +429,13 @@ fn handle_power_event(state: &mut PowerState, event_type: usize) {
                 return;
             }
             state.resume_handled = true;
+            // Serialize with the stuck-marker watcher: no rescan may run
+            // while the wake flow owns the USB UART (settle, ladder,
+            // respawn).
+            let _guard = match state.uart_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             crate::logging::append_line(
                 &state.log_path,
                 "power: wake detected, waiting for USB stack",
@@ -436,5 +508,16 @@ mod tests {
     fn classifies_unrelated_messages_as_other() {
         assert_eq!(classify_power_event(0), PowerEvent::Other);
         assert_eq!(classify_power_event(12345), PowerEvent::Other);
+    }
+
+    #[test]
+    fn stuck_watcher_acts_only_when_armed_awake_marked_and_off_cooldown() {
+        // All conditions met → act.
+        assert!(stuck_watcher_should_act(true, false, true, true));
+        // Each condition alone blocks the escalation.
+        assert!(!stuck_watcher_should_act(false, false, true, true)); // soft-only
+        assert!(!stuck_watcher_should_act(true, true, true, true)); // asleep
+        assert!(!stuck_watcher_should_act(true, false, false, true)); // no marker
+        assert!(!stuck_watcher_should_act(true, false, true, false)); // cooldown
     }
 }

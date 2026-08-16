@@ -90,13 +90,14 @@ pub struct LauncherConfig {
     /// stale USB link — device enumerated but writes time out ("The
     /// semaphore timeout period has expired") — and a re-enumeration ladder
     /// (reset → remove+rescan, see `device.rs`) re-tears the link down so
-    /// the panel enumerates fresh. If `asterctl` still cannot initialize
-    /// the panel, it writes `cfg/uart.stuck` and the launcher escalates
-    /// (re-enumerate again, up to 2 rounds). Unlike the old disable/enable
-    /// workaround this leaves no "restart required" pending state, so
-    /// Windows never asks for a reboot. Set `false` on units that recover
-    /// from the soft re-init alone (children respawn with fresh serial
-    /// handles and `asterctl` re-sends OpenTFT 0x0B).
+    /// the panel enumerates fresh. Recovery does not stop at wake:
+    /// `asterctl` writes `cfg/uart.stuck` on every display-communication
+    /// failure and a launcher daemon re-enumerates the USB UART each time
+    /// the marker appears (30s cooldown) and respawns `asterctl`. Unlike
+    /// the old disable/enable workaround this leaves no "restart required"
+    /// pending state, so Windows never asks for a reboot. Set `false` on
+    /// units that recover from the soft re-init alone (children respawn
+    /// with fresh serial handles and `asterctl` re-sends OpenTFT 0x0B).
     pub restart_uart_on_resume: bool,
 }
 

@@ -150,6 +150,7 @@ fn windows_main() {
         display.clone(),
         cfg.restart_uart_on_resume,
         base_dir.join("cfg").join("uart.stuck"),
+        quit.clone(),
         launcher_log.clone(),
     );
 

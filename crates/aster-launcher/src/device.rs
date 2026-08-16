@@ -151,6 +151,14 @@ pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFai
         // A plain CM_Reenumerate_DevNode on the leaf node is NOT enough:
         // it returns success without tearing the port down, so the stale
         // endpoint survives it (observed on the GEM12).
+        // Capture the parent FIRST: after the subtree is removed the
+        // devnode handle is gone, so CM_Get_Parent must not run afterwards
+        // (a failure then would leave the UART removed with no rescan).
+        let mut parent: u32 = 0;
+        let parent_ret = CM_Get_Parent(&mut parent, dev_inst, 0);
+        if parent_ret != CR_SUCCESS {
+            return Err(RestartFailure::ParentLookupFailed(parent_ret));
+        }
         let remove_ret = CM_Query_And_Remove_SubTreeW(
             dev_inst,
             std::ptr::null_mut(),
@@ -162,11 +170,6 @@ pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFai
             return Err(RestartFailure::RemoveFailed(remove_ret));
         }
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let mut parent: u32 = 0;
-        let parent_ret = CM_Get_Parent(&mut parent, dev_inst, 0);
-        if parent_ret != CR_SUCCESS {
-            return Err(RestartFailure::ParentLookupFailed(parent_ret));
-        }
         let rescan_ret = CM_Reenumerate_DevNode(parent, CM_REENUMERATE_NORMAL);
         if rescan_ret != CR_SUCCESS {
             return Err(RestartFailure::ReenumerateFailed(rescan_ret));
