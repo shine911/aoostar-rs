@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Wake now re-enumerates the AOOSTAR USB UART with a **remove + rescan ladder**
+  (`CM_Query_And_Remove_SubTree` → `CM_Reenumerate_DevNode` on the parent hub;
+  `CM_Reset_Device` first when available) instead of the old disable/enable
+  workaround. The panel's MCU power-cycles on Modern Standby wake (boot animation)
+  while the host keeps a stale USB link, so writes fail with "The semaphore
+  timeout period has expired"; disable/enable recovered it but left a "restart
+  required" pending state (Windows demanded a reboot after repeated sleep/wake
+  cycles), and a plain `CM_Reenumerate_DevNode` on the device node looked
+  successful but did not clear the stale link.
+- **Escalation on every failure**: `asterctl` writes `cfg/uart.stuck` on any
+  display-communication failure — init or mid-session ("The semaphore
+  timeout period has expired" included) — and clears it on recovery. A
+  launcher daemon polls the marker for the whole process lifetime and, each
+  time it appears (30s cooldown), re-enumerates the USB UART (remove+rescan)
+  and lets the watcher respawn `asterctl`. A panel that wedges again minutes
+  after wake (deep sleep) still recovers, because every failure gets a fresh
+  hardware-level retry instead of asterctl's soft reconnect loop spinning
+  against a panel that needs a USB reset.
+- `restart_uart_on_resume` stays as a switch (default `true`; set `false` on
+  units that recover from the soft re-init alone — fresh serial handle +
+  OpenTFT 0x0B).
+- Sleep now blanks the LCD before the children are killed: on suspend the launcher writes
+  `cfg/display.state` as "off" (asterctl sends CloseTFT 0x0A), waits a short grace for it to
+  apply, and keeps the state file "off" for the whole sleep, then re-arms it on wake — so the
+  panel enters sleep deterministically off and wake re-initializes it cleanly with OpenTFT.
+
 ### Added
 - `aster-launcher` tray "Display" sub-menu with three mutually exclusive LCD modes: **On**, **Off**,
   and **Follow screen state** (the active mode carries a check mark). Picking one persists

@@ -143,15 +143,31 @@ a duplicate set of children.
 ## Sleep / resume behavior
 
 When Windows goes to sleep, `aster-launcher` detects the power event and
-suspends all three child processes (they are force-stopped; the watchers do
-not restart them while the machine is asleep). On wake it waits ~4s for the
-USB stack, then restarts the children with fresh serial handles, so the
-AOOSTAR display re-initializes automatically.
+blanks the LCD first (`asterctl` sends CloseTFT 0x0A), waits ~2s for it to
+apply, then suspends all three child processes (they are force-stopped; the
+watchers do not restart them while the machine is asleep). On wake it waits
+~4s for the USB stack, then re-enumerates the AOOSTAR USB UART and restarts
+the children with fresh serial handles, so the AOOSTAR display
+re-initializes automatically: `asterctl` re-sends the OpenTFT (0x0B)
+handshake, which is exactly how the panel is (re)initialized on the wire.
 
-By default the launcher also disables + re-enables the AOOSTAR USB UART on
-every wake (the automated version of the old manual "Device Manager → COM3 →
-Disable → Enable → restart" fix). If your unit recovers without that, set
-`restart_uart_on_resume = false` in `launcher.toml`.
+The USB re-enumeration is needed because on Modern Standby (S0) — the only
+sleep state these AOOSTAR boards expose — the panel's MCU power-cycles on
+wake (you see the AOOSTAR boot animation) while the host keeps a stale USB
+link: the device is still enumerated and COM3 opens, but writes fail with
+"The semaphore timeout period has expired". The launcher uses a remove +
+rescan ladder that tears the stale link down so the panel enumerates fresh.
+It deliberately avoids the old Device Manager "Disable → Enable" workaround
+(leaves a "restart required" pending state that makes Windows demand a
+reboot after repeated cycles) and a plain re-enumerate (looks successful
+but does not clear the stale link). Recovery does not stop at wake:
+`asterctl` writes `cfg/uart.stuck` on every display-communication failure
+("The semaphore timeout period has expired" included), and a launcher
+daemon re-enumerates the USB UART each time the marker appears (30s
+cooldown) and lets the watcher respawn `asterctl` — so a panel that wedges
+again minutes after wake (deep sleep) still recovers. Units whose panel
+recovers from the soft re-init alone (fresh handle + OpenTFT, no USB
+disturbance) can set `restart_uart_on_resume = false` in `launcher.toml`.
 
 Recommended power settings (reduces the chance of a wedged USB port):
 - untick "Allow the computer to turn off this device to save power" for the

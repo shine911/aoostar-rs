@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Windows PnP device helpers: find and power-cycle the AOOSTAR USB UART —
-//! the automated version of the manual "disable in Device Manager,
-//! re-enable" workaround that was previously required after every sleep.
+//! Windows PnP device helpers: find and re-enumerate the AOOSTAR USB UART.
+//! Used on wake when `restart_uart_on_resume` is enabled: the panel's USB
+//! endpoint can wedge during Modern Standby (enumerated but not responding —
+//! "The semaphore timeout period has expired" on writes) and a PnP
+//! re-enumeration re-negotiates the device with the bus driver. The ladder
+//! deliberately avoids the disable/enable Device Manager workaround, which
+//! can leave the device in a "restart required" pending state that makes
+//! Windows ask for a reboot after repeated sleep/wake cycles.
 
 // `main.rs` denies `unsafe_code` crate-wide; this module is the narrow,
 // deliberate exception — it is pure CfgMgr32 FFI glue. Scoped here so the
@@ -25,20 +30,22 @@ pub(crate) fn is_our_instance(instance: &str, vid: u16, pid: u16) -> bool {
     upper.starts_with(&prefix) && upper.as_bytes().get(prefix.len()) == Some(&b'\\')
 }
 
-/// Why a device reset failed. `CONFIGRET` values are `u32`.
+/// Why a device re-enumeration failed. `CONFIGRET` values are `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartFailure {
     /// Device not present / could not be located.
     NotPresent,
     /// `CM_Reset_Device` failed with this CONFIGRET. Deliberately NOT
-    /// followed by a disable/enable fallback: a failing function-level
-    /// reset is a worse device state than no restart, and disable/enable is
-    /// what can leave the device in the "restart required" pending state.
+    /// followed by the other fallbacks: a failing function-level reset is a
+    /// worse device state than no restart.
     ResetFailed(u32),
-    /// `CM_Disable_DevNode` failed with this CONFIGRET.
-    DisableFailed(u32),
-    /// `CM_Enable_DevNode` failed with this CONFIGRET (after one retry).
-    EnableFailed(u32),
+    /// `CM_Reenumerate_DevNode` failed with this CONFIGRET.
+    ReenumerateFailed(u32),
+    /// `CM_Query_And_Remove_SubTree` failed with this CONFIGRET.
+    RemoveFailed(u32),
+    /// `CM_Get_Parent` (locating the hub to rescan after removal) failed
+    /// with this CONFIGRET.
+    ParentLookupFailed(u32),
 }
 
 /// Which mechanism successfully re-enumerated the device (logged by
@@ -46,12 +53,12 @@ pub(crate) enum RestartFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartMethod {
     /// `CM_Reset_Device` function-level reset (USB port reset): the device
-    /// re-enumerates in place, without the disable→enable state machine, so
-    /// Windows never asks for a reboot.
+    /// re-enumerates in place, no PnP state machine, no reboot ask.
     Reset,
-    /// `CM_Reset_Device` is not available (pre-1809 Windows); the old
-    /// disable/enable sequence was used instead.
-    DisableEnable,
+    /// Remove the device subtree (unplug simulation) then re-enumerate its
+    /// parent hub (replug simulation). The real recovery for the
+    /// wake-from-Modern-Standby stale link; no reboot required.
+    RemoveRescan,
 }
 
 /// `CM_Reset_Device` scope: reset the device instance itself.
@@ -96,18 +103,28 @@ fn cm_reset_device(dev_inst: u32) -> Result<(), Option<u32>> {
     }
 }
 
-/// Re-enumerates the device with instance ID `instance`. Preferred path is
-/// the function-level reset [`cm_reset_device`] (in-place USB port reset —
-/// no pending "restart required" state) when the export exists. When it
-/// does not (pre-1809 Windows, and — verified — Windows 10 25H2 build
-/// 26200), it falls back to the CfgMgr32 equivalents of Device Manager's
-/// "Disable device" / "Enable device" (the old behavior, which is what
-/// actually runs on the WTR MAX). Requires Administrator (the launcher
-/// runs elevated).
+/// Re-enumerates the device with instance ID `instance` so a wedged USB
+/// endpoint comes back (the wake-from-Modern-Standby fix). Ladder, in order:
+///
+/// 1. [`cm_reset_device`] — function-level USB port reset, in place, when
+///    the export exists (dynamically resolved: it is absent from some
+///    builds, verified on Windows 11 25H2 build 26200).
+/// 2. Remove the device subtree (unplug simulation) then re-enumerate its
+///    parent hub (replug simulation). This is the real recovery when the
+///    panel's MCU power-cycles on wake (boot animation) but the host keeps
+///    the stale link: a plain [`CM_Reenumerate_DevNode`] on the leaf node
+///    does NOT tear the port down, so the stale endpoint survives it.
+///
+/// Step 2 deliberately replaces the old disable/enable workaround, which
+/// leaves the device in a "restart required" pending state after repeated
+/// cycles (Windows then demands a reboot to apply the change) — and a plain
+/// re-enumerate, which looks successful but does not clear the stale link.
+/// Requires Administrator (the launcher runs elevated).
 #[cfg(windows)]
 pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFailure> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Disable_DevNode, CM_Enable_DevNode, CM_Locate_DevNodeW, CR_SUCCESS,
+        CM_Get_Parent, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW, CM_REENUMERATE_NORMAL,
+        CM_Reenumerate_DevNode, CR_SUCCESS,
     };
 
     unsafe {
@@ -117,32 +134,48 @@ pub(crate) fn restart_device(instance: &str) -> Result<RestartMethod, RestartFai
             return Err(RestartFailure::NotPresent);
         }
 
-        // Preferred path: function-level reset.
+        // 1) Preferred path: function-level reset.
         match cm_reset_device(dev_inst) {
             Ok(()) => return Ok(RestartMethod::Reset),
-            // Reset API exists but failed: do NOT fall back to
-            // disable/enable, which can leave the device in the
-            // "restart required" state that Windows wants a reboot for.
+            // Reset API exists but failed: do NOT chain further
+            // re-enumerations on a device mid-reset — worse state than
+            // no restart.
             Err(Some(code)) => return Err(RestartFailure::ResetFailed(code)),
-            // Pre-1809 Windows: no CM_Reset_Device export — disable/enable.
+            // Export unavailable: fall through to the PnP ladder.
             Err(None) => {}
         }
 
-        let ret = CM_Disable_DevNode(dev_inst, 0);
-        if ret != CR_SUCCESS {
-            return Err(RestartFailure::DisableFailed(ret));
+        // 2) Unplug/replug simulation: remove the device subtree, then
+        // re-enumerate its parent (the hub) so the device is rediscovered
+        // from scratch — a real port teardown that clears the stale link.
+        // A plain CM_Reenumerate_DevNode on the leaf node is NOT enough:
+        // it returns success without tearing the port down, so the stale
+        // endpoint survives it (observed on the GEM12).
+        // Capture the parent FIRST: after the subtree is removed the
+        // devnode handle is gone, so CM_Get_Parent must not run afterwards
+        // (a failure then would leave the UART removed with no rescan).
+        let mut parent: u32 = 0;
+        let parent_ret = CM_Get_Parent(&mut parent, dev_inst, 0);
+        if parent_ret != CR_SUCCESS {
+            return Err(RestartFailure::ParentLookupFailed(parent_ret));
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let ret = CM_Enable_DevNode(dev_inst, 0);
-        if ret != CR_SUCCESS {
-            // PnP contention is transient: retry once before giving up.
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let retry = CM_Enable_DevNode(dev_inst, 0);
-            if retry != CR_SUCCESS {
-                return Err(RestartFailure::EnableFailed(retry));
-            }
+        let remove_ret = CM_Query_And_Remove_SubTreeW(
+            dev_inst,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            0,
+        );
+        if remove_ret != CR_SUCCESS {
+            return Err(RestartFailure::RemoveFailed(remove_ret));
         }
-        Ok(RestartMethod::DisableEnable)
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let rescan_ret = CM_Reenumerate_DevNode(parent, CM_REENUMERATE_NORMAL);
+        if rescan_ret != CR_SUCCESS {
+            return Err(RestartFailure::ReenumerateFailed(rescan_ret));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        Ok(RestartMethod::RemoveRescan)
     }
 }
 

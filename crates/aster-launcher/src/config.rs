@@ -84,10 +84,20 @@ pub struct LauncherConfig {
     /// Legacy per-process override for hwbridge, kept for backward
     /// compatibility. Only used when `refresh_time` is not configured.
     pub hwbridge_refresh: Option<u16>,
-    /// On wake from sleep, disable + re-enable the AOOSTAR USB UART (force
-    /// re-enumeration) before respawning children — the automated version of
-    /// the manual Device Manager fix. Set false if Task 1's fresh-open is
-    /// already sufficient on your hardware.
+    /// On wake from sleep, re-enumerate the AOOSTAR USB UART before
+    /// respawning children. Default `true`: on Modern Standby the panel's
+    /// MCU power-cycles on wake (boot animation) while the host keeps a
+    /// stale USB link — device enumerated but writes time out ("The
+    /// semaphore timeout period has expired") — and a re-enumeration ladder
+    /// (reset → remove+rescan, see `device.rs`) re-tears the link down so
+    /// the panel enumerates fresh. Recovery does not stop at wake:
+    /// `asterctl` writes `cfg/uart.stuck` on every display-communication
+    /// failure and a launcher daemon re-enumerates the USB UART each time
+    /// the marker appears (30s cooldown) and respawns `asterctl`. Unlike
+    /// the old disable/enable workaround this leaves no "restart required"
+    /// pending state, so Windows never asks for a reboot. Set `false` on
+    /// units that recover from the soft re-init alone (children respawn
+    /// with fresh serial handles and `asterctl` re-sends OpenTFT 0x0B).
     pub restart_uart_on_resume: bool,
 }
 
@@ -312,17 +322,24 @@ mod tests {
     }
 
     #[test]
-    fn partial_file_defaults_restart_uart_on_resume() {
+    fn partial_file_defaults_restart_uart_on() {
+        // The panel's USB endpoint can wedge during Modern Standby, so the
+        // default wake path re-enumerates the USB UART (PnP re-enumeration —
+        // no reboot required).
         let file = write_temp("sysinfo_refresh = 9\n");
         let cfg = LauncherConfig::load(file.path());
         assert!(cfg.restart_uart_on_resume);
     }
 
     #[test]
-    fn restart_uart_can_be_disabled_in_config() {
+    fn restart_uart_can_be_disabled_for_units_that_recover_softly() {
         let file = write_temp("restart_uart_on_resume = false\n");
         let cfg = LauncherConfig::load(file.path());
         assert!(!cfg.restart_uart_on_resume);
+
+        let file = write_temp("restart_uart_on_resume = true\n");
+        let cfg = LauncherConfig::load(file.path());
+        assert!(cfg.restart_uart_on_resume);
     }
 
     #[test]

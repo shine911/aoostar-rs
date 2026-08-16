@@ -13,9 +13,11 @@ refresh_time = 5
 # sysinfo_refresh = 2
 # hwbridge_refresh = 5
 
-# On wake from sleep: disable + re-enable the AOOSTAR USB UART before
-# restarting the children (automates the old Device Manager fix). Set to
-# false if the screen already recovers without it.
+# Wake from sleep: re-enumerates the AOOSTAR USB UART (PnP re-enumeration,
+# no reboot required) before the children respawn — the panel's USB
+# endpoint can stay wedged after Modern Standby ("The semaphore timeout
+# period has expired" on writes). Set to false only on units whose panel
+# recovers from the soft re-init alone (fresh serial handle + OpenTFT 0x0B).
 restart_uart_on_resume = true
 
 # LCD display mode, selectable live from the tray icon's "Display" sub-menu.

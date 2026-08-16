@@ -44,6 +44,12 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
                         .join("display.state")
                         .to_string_lossy()
                         .into_owned(),
+                    "--stuck-file".to_string(),
+                    base_dir
+                        .join("cfg")
+                        .join("uart.stuck")
+                        .to_string_lossy()
+                        .into_owned(),
                 ];
                 if let Some(theme) = cfg.theme {
                     args.push("--theme".to_string());
@@ -464,6 +470,12 @@ mod tests {
                     .join("display.state")
                     .to_string_lossy()
                     .into_owned(),
+                "--stuck-file".to_string(),
+                base_dir
+                    .join("cfg")
+                    .join("uart.stuck")
+                    .to_string_lossy()
+                    .into_owned(),
             ]
         );
 
@@ -525,6 +537,12 @@ mod tests {
                     .join("display.state")
                     .to_string_lossy()
                     .into_owned(),
+                "--stuck-file".to_string(),
+                base_dir
+                    .join("cfg")
+                    .join("uart.stuck")
+                    .to_string_lossy()
+                    .into_owned(),
                 "--theme".to_string(),
                 "2".to_string()
             ]
@@ -557,6 +575,12 @@ mod tests {
                 base_dir
                     .join("cfg")
                     .join("display.state")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--stuck-file".to_string(),
+                base_dir
+                    .join("cfg")
+                    .join("uart.stuck")
                     .to_string_lossy()
                     .into_owned(),
                 "--theme".to_string(),
