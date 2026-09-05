@@ -11,7 +11,7 @@ Check out the **[User Guide](https://shine911.github.io/aoostar-rs)** for a list
 - Control the AOOSTAR WTR MAX and GEM12+ PRO second screen from Linux or Windows.
 - Switch the display on or off.
     - Also possible with standard [Linux shell commands](docs/shell_commands.md).
-    - [Linux systemd Service](docs/linux/README.md) to automatically switch off the LCD at boot up.
+    - [Linux KDE tray application](docs/linux/README.md) for Plasma 5/6 (X11 and Wayland).
 - Display images (with automatic scaling and partial update support).
 - Render dynamic sensor panels defined from the AOOSTAR-X software.
     - Update sensor values from simple text files and/or the `AOOSTAR_HW_STATS` shared memory region.
@@ -51,7 +51,7 @@ Note: Multiple attempts to contact the manufacturer for documentation have recei
 With that out of the way, on to the fun stuff!
 
 - Browse the source code or read the [User Guide](https://shine911.github.io/aoostar-rs)
-- See [releases](https://github.com/shine911/aoostar-rs/releases) for binary Linux x64 releases. A Debian package for easy installation is planned for the future!
+- See [releases](https://github.com/shine911/aoostar-rs/releases) for binary Linux x64 releases. Debian and RPM packages can be built with `./linux/package.sh all`; see the [KDE Linux guide](docs/linux/README.md).
 
 ## Contributing
 

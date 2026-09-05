@@ -8,20 +8,22 @@ mod config;
 mod device;
 mod display;
 mod logging;
+#[cfg(target_os = "linux")]
+mod paths;
 mod power;
 mod process;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod tray;
 
 fn main() {
     #[cfg(windows)]
     windows_main();
 
-    #[cfg(not(windows))]
-    {
-        eprintln!("aster-launcher is Windows-only.");
-        std::process::exit(1);
-    }
+    #[cfg(target_os = "linux")]
+    linux_main();
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    std::process::exit(1);
 }
 
 /// `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`: what opening the lock
@@ -104,7 +106,7 @@ fn windows_main() {
     let config_path = base_dir.join("launcher.toml");
     // Shared, mutable child specs: the tray's refresh menu rewrites them and
     // restarts the children, whose watchers re-read the specs on every spawn.
-    let specs: Arc<Mutex<[process::ChildSpec; 3]>> =
+    let specs: Arc<Mutex<Vec<process::ChildSpec>>> =
         Arc::new(Mutex::new(process::child_specs(&base_dir, &cfg)));
     let current_refresh = Arc::new(AtomicU16::new(cfg.sysinfo_refresh_effective()));
     // Active theme for the tray "Themes" check mark; Default (0) is the
@@ -190,5 +192,106 @@ fn windows_main() {
     // restart/backoff delays), so these joins return promptly.
     for watcher in watchers {
         let _ = watcher.join();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_main() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    let paths = paths::LauncherPaths::linux();
+    for dir in [
+        &paths.config,
+        &paths.state,
+        &paths.runtime,
+        &paths.logs,
+        &paths.sensors,
+    ] {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let log = paths.launcher_log();
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&paths.lock)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            logging::append_line(&log, &format!("cannot open instance lock: {e}"));
+            return;
+        }
+    };
+    if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
+        logging::append_line(&log, "another aster-launcher instance is already running");
+        return;
+    }
+    let _instance_lock = lock_file;
+    let config_path = paths.launcher_config();
+    if !config_path.exists() {
+        let default = paths.assets.join("launcher.default.toml");
+        match std::fs::read_to_string(&default) {
+            Ok(text) => {
+                if let Err(err) = std::fs::write(&config_path, text) {
+                    logging::append_line(
+                        &log,
+                        &format!("cannot provision {}: {err}", config_path.display()),
+                    );
+                }
+            }
+            Err(err) => logging::append_line(
+                &log,
+                &format!("cannot read packaged defaults {}: {err}", default.display()),
+            ),
+        }
+    }
+    let cfg = config::LauncherConfig::load_with_log(&config_path, &log);
+    let specs = Arc::new(Mutex::new(process::linux_child_specs(&paths, &cfg)));
+    let quit = Arc::new(AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, quit.clone());
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, quit.clone());
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let suspended = Arc::new(AtomicBool::new(false));
+    let display = display::DisplayControl::new(
+        cfg.display_mode_effective(),
+        paths.display_state.clone(),
+        log.clone(),
+    );
+    let mut handles = Vec::new();
+    let mut watchers = Vec::new();
+    let child_count = specs.lock().map(|s| s.len()).unwrap_or(0);
+    for i in 0..child_count {
+        let (h, w) = process::spawn_and_watch(
+            i,
+            specs.clone(),
+            quit.clone(),
+            suspended.clone(),
+            shutting_down.clone(),
+        );
+        handles.push(h);
+        watchers.push(w);
+    }
+    tray::run_linux(
+        &handles,
+        specs,
+        Arc::new(std::sync::atomic::AtomicU16::new(
+            cfg.sysinfo_refresh_effective(),
+        )),
+        Arc::new(std::sync::atomic::AtomicU16::new(cfg.theme.unwrap_or(0))),
+        display.clone(),
+        quit.clone(),
+        &log,
+        &config_path,
+        &paths,
+    );
+    quit.store(true, Ordering::SeqCst);
+    shutting_down.store(true, Ordering::SeqCst);
+    display.force_off();
+    std::thread::sleep(std::time::Duration::from_secs(
+        process::QUIT_KILL_GRACE_SECS,
+    ));
+    process::kill_all(&handles, &log);
+    for w in watchers {
+        let _ = w.join();
     }
 }

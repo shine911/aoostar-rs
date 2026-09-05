@@ -33,7 +33,7 @@ fn apply_refresh(
     secs: u16,
     config_path: &Path,
     base_dir: &Path,
-    specs: &Mutex<[ChildSpec; 3]>,
+    specs: &Mutex<Vec<ChildSpec>>,
     handles: &[ChildHandle],
     log_path: &Path,
     current: &AtomicU16,
@@ -87,7 +87,7 @@ fn apply_theme(
     theme: u16,
     config_path: &Path,
     base_dir: &Path,
-    specs: &Mutex<[ChildSpec; 3]>,
+    specs: &Mutex<Vec<ChildSpec>>,
     handles: &[ChildHandle],
     log_path: &Path,
     current: &AtomicU16,
@@ -158,7 +158,7 @@ fn apply_theme(
 #[cfg(windows)]
 pub fn run(
     handles: &[ChildHandle],
-    specs: Arc<Mutex<[ChildSpec; 3]>>,
+    specs: Arc<Mutex<Vec<ChildSpec>>>,
     current_refresh: Arc<AtomicU16>,
     current_theme: Arc<AtomicU16>,
     display: Arc<crate::display::DisplayControl>,
@@ -492,5 +492,219 @@ pub fn run(
             }
             last_label = label;
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_linux(
+    handles: &[ChildHandle],
+    specs: Arc<Mutex<Vec<ChildSpec>>>,
+    current_refresh: Arc<AtomicU16>,
+    current_theme: Arc<AtomicU16>,
+    display: Arc<crate::display::DisplayControl>,
+    quit: Arc<AtomicBool>,
+    log_path: &Path,
+    config_path: &Path,
+    paths: &crate::paths::LauncherPaths,
+) {
+    // ksni is session-D-Bus based and works in both Plasma 5 and 6 on X11 or
+    // Wayland.  The vendored tray-item backend has no Linux submenu API, so
+    // choices are exposed as stable, clearly labelled menu entries.
+    let mut tray = match TrayItem::new(
+        "AOOSTAR LCD",
+        IconSource::Resource("io.github.shine911.aoostar"),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::logging::append_line(
+                log_path,
+                &format!("failed to register KDE tray icon: {e}; stopping children"),
+            );
+            return;
+        }
+    };
+    let status_id = match tray.inner_mut().add_label_with_id(&status_label(handles)) {
+        Ok(id) => id,
+        Err(err) => {
+            crate::logging::append_line(log_path, &format!("failed to add tray status: {err}"));
+            return;
+        }
+    };
+    let _ = tray.add_label("Refresh time");
+    let mut refresh_ids = Vec::new();
+    for secs in crate::config::REFRESH_OPTIONS {
+        let specs = specs.clone();
+        let handles = handles.to_vec();
+        let config = config_path.to_path_buf();
+        let log = log_path.to_path_buf();
+        let current = current_refresh.clone();
+        let paths = paths.to_owned();
+        let id =
+            match tray
+                .inner_mut()
+                .add_menu_item_with_id(&format!("Refresh {secs}s"), move || {
+                    if crate::config::set_refresh_time(&config, secs).is_ok() {
+                        let cfg = crate::config::LauncherConfig::load_with_log(&config, &log);
+                        if let Ok(mut s) = specs.lock() {
+                            *s = crate::process::linux_child_specs(&paths, &cfg);
+                        }
+                        crate::process::kill_named(&handles, &["aster-sysinfo"]);
+                        current.store(secs, Ordering::SeqCst);
+                    } else {
+                        crate::logging::append_line(&log, "failed to persist refresh interval");
+                    }
+                }) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    crate::logging::append_line(
+                        log_path,
+                        &format!("failed to add refresh item: {err}"),
+                    );
+                    None
+                }
+            };
+        refresh_ids.push(id);
+    }
+    let _ = tray.add_label("Themes");
+    let mut theme_ids = Vec::new();
+    for (theme, label) in crate::config::THEME_OPTIONS {
+        let specs = specs.clone();
+        let handles = handles.to_vec();
+        let config = config_path.to_path_buf();
+        let current = current_theme.clone();
+        let paths = paths.to_owned();
+        let log = log_path.to_path_buf();
+        let id =
+            match tray
+                .inner_mut()
+                .add_menu_item_with_id(&format!("Theme: {label}"), move || {
+                    if crate::config::set_theme(&config, theme).is_ok() {
+                        let cfg = crate::config::LauncherConfig::load_with_log(&config, &log);
+                        if let Ok(mut s) = specs.lock() {
+                            *s = crate::process::linux_child_specs(&paths, &cfg);
+                        }
+                        crate::process::kill_named(&handles, &["asterctl"]);
+                        current.store(theme, Ordering::SeqCst);
+                    } else {
+                        crate::logging::append_line(&log, "failed to persist theme selection");
+                    }
+                }) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    crate::logging::append_line(
+                        log_path,
+                        &format!("failed to add theme item: {err}"),
+                    );
+                    None
+                }
+            };
+        theme_ids.push(id);
+    }
+    let _ = tray.add_label("Display");
+    let mut display_ids = Vec::new();
+    for (mode, label) in crate::config::DISPLAY_OPTIONS {
+        if mode == crate::config::DisplayMode::Follow {
+            continue;
+        }
+        let display = display.clone();
+        let config = config_path.to_path_buf();
+        let id = match tray
+            .inner_mut()
+            .add_menu_item_with_id(&format!("Display: {label}"), move || {
+                display.apply(mode, &config)
+            }) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                crate::logging::append_line(
+                    log_path,
+                    &format!("failed to add display item: {err}"),
+                );
+                None
+            }
+        };
+        display_ids.push(id);
+    }
+    let quit_cb = quit.clone();
+    let _ = tray
+        .inner_mut()
+        .add_menu_item_with_id("Quit", move || quit_cb.store(true, Ordering::SeqCst));
+    let mut last_status = String::new();
+    let mut last_refresh = u16::MAX;
+    let mut last_theme = u16::MAX;
+    let mut last_display = u16::MAX;
+    while !quit.load(Ordering::SeqCst) {
+        let status = status_label(handles);
+        if status != last_status {
+            if let Err(err) = tray.inner_mut().set_menu_item_label(&status, status_id) {
+                crate::logging::append_line(
+                    log_path,
+                    &format!("failed to update tray status: {err}"),
+                );
+            }
+            last_status = status;
+        }
+        let refresh = current_refresh.load(Ordering::SeqCst);
+        if refresh != last_refresh {
+            for (i, secs) in crate::config::REFRESH_OPTIONS.iter().enumerate() {
+                let label = if refresh == *secs {
+                    format!("✓ Refresh {secs}s")
+                } else {
+                    format!("Refresh {secs}s")
+                };
+                if let Some(Some(id)) = refresh_ids.get(i)
+                    && let Err(err) = tray.inner_mut().set_menu_item_label(&label, *id)
+                {
+                    crate::logging::append_line(
+                        log_path,
+                        &format!("failed to update refresh item: {err}"),
+                    );
+                }
+            }
+            last_refresh = refresh;
+        }
+        let theme = current_theme.load(Ordering::SeqCst);
+        if theme != last_theme {
+            for (i, (idx, label)) in crate::config::THEME_OPTIONS.iter().enumerate() {
+                let text = if theme == *idx {
+                    format!("✓ Theme: {label}")
+                } else {
+                    format!("Theme: {label}")
+                };
+                if let Some(Some(id)) = theme_ids.get(i)
+                    && let Err(err) = tray.inner_mut().set_menu_item_label(&text, *id)
+                {
+                    crate::logging::append_line(
+                        log_path,
+                        &format!("failed to update theme item: {err}"),
+                    );
+                }
+            }
+            last_theme = theme;
+        }
+        let display_mode = display.mode.load(Ordering::SeqCst);
+        if display_mode != last_display {
+            for (i, (mode, label)) in crate::config::DISPLAY_OPTIONS
+                .iter()
+                .filter(|(m, _)| *m != crate::config::DisplayMode::Follow)
+                .enumerate()
+            {
+                let text = if display_mode == mode.index() {
+                    format!("✓ Display: {label}")
+                } else {
+                    format!("Display: {label}")
+                };
+                if let Some(Some(id)) = display_ids.get(i)
+                    && let Err(err) = tray.inner_mut().set_menu_item_label(&text, *id)
+                {
+                    crate::logging::append_line(
+                        log_path,
+                        &format!("failed to update display item: {err}"),
+                    );
+                }
+            }
+            last_display = display_mode;
+        }
+        display.heartbeat();
+        std::thread::sleep(Duration::from_secs(2));
     }
 }

@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 /// Allowed sensor refresh intervals, in seconds. A single `refresh_time`
 /// value is applied to both `aster-sysinfo` and `hwbridge`.
@@ -123,17 +124,24 @@ impl LauncherConfig {
     /// missing or cannot be parsed. Never panics, never returns `Err` —
     /// there is no valid state for the launcher to refuse to start in.
     pub fn load(path: &Path) -> Self {
+        let log_path = path.with_file_name("launcher.log");
+        Self::load_with_log(path, &log_path)
+    }
+
+    /// Variant used by the Linux launcher so diagnostics live under XDG
+    /// state while the TOML remains in the user config directory.
+    pub fn load_with_log(path: &Path, log_path: &Path) -> Self {
         let mut cfg = match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
                 crate::logging::append_line(
-                    &path.with_file_name("launcher.log"),
+                    log_path,
                     &format!("launcher.toml is invalid, using defaults: {err}"),
                 );
                 Self::default()
             }),
             Err(_) => Self::default(),
         };
-        cfg.sanitize_values(path);
+        cfg.sanitize_values(log_path);
         cfg
     }
 
@@ -224,7 +232,54 @@ impl LauncherConfig {
 /// pre-quoted string for TOML strings (e.g. `"follow"`).
 /// Creates the file with just that option if it does not exist yet.
 /// Does not validate `value` — callers pass one of the allowed options.
+static TOML_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn toml_write_lock() -> &'static Mutex<()> {
+    TOML_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Atomically replaces a file on the same filesystem. Unix rename is an
+/// atomic replacement; Windows does not replace an existing path, so remove
+/// it while the process-wide writer lock is held before renaming the complete
+/// temporary file. This keeps concurrent tray callbacks from interleaving
+/// bytes and preserves the never-panic launcher contract.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("launcher.toml");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut temp = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)?;
+    if let Err(err) = temp.write_all(contents.as_bytes()) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    temp.sync_all()?;
+    drop(temp);
+
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    let _guard = toml_write_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -256,7 +311,7 @@ fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
         out.push_str(&line);
         out.push('\n');
     }
-    std::fs::write(path, out)
+    atomic_write(path, &out)
 }
 
 pub fn set_refresh_time(path: &Path, secs: u16) -> std::io::Result<()> {
@@ -550,5 +605,41 @@ mod tests {
         for (i, (mode, _)) in DISPLAY_OPTIONS.iter().enumerate() {
             assert_eq!(mode.index(), i as u16);
         }
+    }
+
+    #[test]
+    fn concurrent_tray_updates_remain_parseable_and_preserve_all_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("launcher.toml"));
+        std::fs::write(&*path, "# retained\nmonitor_config = \"Monitor3.json\"\n").unwrap();
+
+        let refresh_path = path.clone();
+        let refresh = std::thread::spawn(move || {
+            for _ in 0..12 {
+                set_refresh_time(&refresh_path, 10).unwrap();
+            }
+        });
+        let theme_path = path.clone();
+        let theme = std::thread::spawn(move || {
+            for _ in 0..12 {
+                set_theme(&theme_path, 2).unwrap();
+            }
+        });
+        let display_path = path.clone();
+        let display = std::thread::spawn(move || {
+            for _ in 0..12 {
+                set_display_mode(&display_path, DisplayMode::Off).unwrap();
+            }
+        });
+        refresh.join().unwrap();
+        theme.join().unwrap();
+        display.join().unwrap();
+
+        let text = std::fs::read_to_string(&*path).unwrap();
+        assert!(text.contains("# retained"));
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["refresh_time"].as_integer(), Some(10));
+        assert_eq!(parsed["theme"].as_integer(), Some(2));
+        assert_eq!(parsed["display_mode"].as_str(), Some("off"));
     }
 }

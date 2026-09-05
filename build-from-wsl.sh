@@ -4,13 +4,14 @@
 # Build & test the aoostar-rs workspace from WSL.
 #
 # Usage:
-#   ./build-from-wsl.sh [test|build|windows-check|windows-build]
+#   ./build-from-wsl.sh [test|build|windows-check|windows-build|linux-packages]
 #     test             (default) rustfmt check + unit tests for aster-launcher & aster-sysinfo
 #     build            rustfmt check + debug build of aster-launcher & aster-sysinfo
 #     windows-check    rustfmt check + `cargo check` of aster-launcher for x86_64-pc-windows-msvc
 #                      (compiles the Windows-only tray/process code, which Linux tests skip)
 #     windows-build    build the REAL deployable Windows binaries by calling the Windows
 #                      toolchain directly from WSL (cargo.exe + csc.exe + powershell.exe)
+#     linux-packages   build Linux release binaries and DEB/RPM in dist-linux/
 #
 # WHY this file exists / WSL gotchas it encodes (learned implementing refresh_time):
 #   1. cargo/rustc ARE installed on this WSL host but NOT on PATH.
@@ -63,7 +64,7 @@ run_in_container() {
         debian:bookworm-slim \
         bash -lc "
             apt-get update -qq >/dev/null 2>&1 &&
-            apt-get install -y -qq gcc curl $extra_pkgs >/dev/null 2>&1 &&
+            apt-get install -y -qq gcc curl libdbus-1-dev $extra_pkgs >/dev/null 2>&1 &&
             curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh &&
             sh /tmp/rustup.sh -y --profile minimal --default-toolchain $TOOLCHAIN >/dev/null 2>&1 &&
             export PATH=\"\$HOME/.cargo/bin${extra_path:+:$extra_path}:\$PATH\" &&
@@ -99,6 +100,11 @@ windows_build() {
     echo "done. dist\ is ready: double-click dist\\aster-launcher.exe."
 }
 
+linux_packages() {
+    local cmd="apt-get install -y -qq gcc curl pkg-config libudev-dev libdbus-1-dev desktop-file-utils dpkg-dev rpm >/dev/null 2>&1 && desktop-file-validate /work/linux/io.github.shine911.aoostar.desktop && cargo install cargo-deb cargo-generate-rpm --locked >/dev/null 2>&1 && cargo build --release --bins && mkdir -p /work/dist-linux && cargo deb -p aster-launcher --no-build --output /work/dist-linux/aoostar-rs.deb && cargo generate-rpm -p /work/crates/aster-launcher -o /work/dist-linux/aoostar-rs.rpm && chown -R \$(stat -c %u:%g /work) /work/dist-linux"
+    run_in_container "$cmd"
+}
+
 fmt_check() {
     echo "== rustfmt check (host) =="
     if cargo fmt --all -- --check; then
@@ -131,8 +137,13 @@ case "$ACTION" in
         echo "== real windows build (direct from WSL) =="
         windows_build
         ;;
+    linux-packages)
+        fmt_check
+        echo "== Linux DEB/RPM packages (container) =="
+        linux_packages
+        ;;
     *)
-        echo "usage: $0 [test|build|windows-check|windows-build]" >&2
+        echo "usage: $0 [test|build|windows-check|windows-build|linux-packages]" >&2
         exit 2
         ;;
 esac

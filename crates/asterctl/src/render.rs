@@ -166,11 +166,7 @@ impl PanelRenderer {
 
         for sensor in &panel.sensor {
             let value = values.get(&sensor.label).cloned();
-            let unit = values
-                .get(&format!("{}#unit", sensor.label))
-                .cloned()
-                .or_else(|| sensor.unit.clone())
-                .unwrap_or_default();
+            let unit = resolved_sensor_unit(sensor, values);
 
             if let Some(value) = value {
                 self.render_sensor(&mut background, sensor, &value, &unit)?;
@@ -742,5 +738,52 @@ impl PanelRenderer {
         } else {
             None
         }
+    }
+}
+
+/// Resolve the unit shown by a sensor. Provider metadata wins over the panel
+/// declaration, matching the existing behavior for generic sensor sources.
+/// Linux's built-in mapping points temperature widgets at value-only aliases,
+/// so those aliases naturally fall back to the unit configured by Monitor3.
+fn resolved_sensor_unit(sensor: &Sensor, values: &HashMap<String, String>) -> String {
+    values
+        .get(&format!("{}#unit", sensor.label))
+        .cloned()
+        .or_else(|| sensor.unit.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_only_linux_temperature_alias_does_not_append_provider_unit() {
+        let sensor: Sensor = serde_json::from_str(
+            r#"{"mode":1,"label":"temperature_cpu_value","value":"","x":0,"y":0,"unit":"","integerDigits":-1,"decimalDigits":0,"pic":""}"#,
+        )
+        .unwrap();
+        let mut values = HashMap::new();
+        values.insert("temperature_cpu_value".to_string(), "67.5".to_string());
+        assert_eq!(resolved_sensor_unit(&sensor, &values), "");
+        assert_eq!(
+            format_value(
+                "67.5",
+                sensor.integer_digits.into(),
+                sensor.decimal_digits.unwrap_or_default() as usize,
+                &resolved_sensor_unit(&sensor, &values),
+            ),
+            "68"
+        );
+    }
+
+    #[test]
+    fn configured_unit_remains_available_for_value_only_alias() {
+        let sensor: Sensor = serde_json::from_str(
+            r#"{"mode":1,"label":"temperature_memory_value","value":"","x":0,"y":0,"unit":" ℃","integerDigits":-1,"decimalDigits":0,"pic":""}"#,
+        )
+        .unwrap();
+        let values = HashMap::new();
+        assert_eq!(resolved_sensor_unit(&sensor, &values), " ℃");
     }
 }

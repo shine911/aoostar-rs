@@ -1,7 +1,7 @@
 [package]
 name = "aster-launcher"
 version = "0.1.0"
-description = "Single-exe launcher for aster-sysinfo, asterctl, and hwbridge"
+description = "AOOSTAR LCD launcher and desktop tray supervisor"
 
 rust-version.workspace = true
 edition.workspace = true
@@ -32,3 +32,50 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Devices_DeviceAndDriverInstallation",
 ] }
+
+[target."cfg(target_os = \"linux\")".dependencies]
+tray-item = { version = "0.10.0", features = ["ksni"] }
+signal-hook = "0.3"
+fs2 = "0.4"
+
+[package.metadata.deb]
+name = "aoostar-rs"
+maintainer = "AOOSTAR contributors <noreply@example.invalid>"
+copyright = "2025 AOOSTAR contributors"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+  ["target/release/aster-launcher", "/usr/bin/aster-launcher", "755"],
+  ["target/release/asterctl", "/usr/lib/aoostar-rs/asterctl", "755"],
+  ["target/release/aster-sysinfo", "/usr/lib/aoostar-rs/aster-sysinfo", "755"],
+  ["../../cfg/**/*", "/usr/share/aoostar-rs/cfg/", "644"],
+  ["../../fonts/**/*", "/usr/share/aoostar-rs/fonts/", "644"],
+  ["../../linux/launcher.default.toml", "/usr/share/aoostar-rs/launcher.default.toml", "644"],
+  ["../../linux/io.github.shine911.aoostar.desktop", "/usr/share/applications/io.github.shine911.aoostar.desktop", "644"],
+  ["../../linux/io.github.shine911.aoostar.png", "/usr/share/icons/hicolor/256x256/apps/io.github.shine911.aoostar.png", "644"],
+  ["../../linux/60-aoostar-lcd.rules", "/usr/lib/udev/rules.d/60-aoostar-lcd.rules", "644"],
+  ["../../LICENSE-MIT", "/usr/share/doc/aoostar-rs/LICENSE-MIT", "644"],
+  ["../../LICENSE-APACHE", "/usr/share/doc/aoostar-rs/LICENSE-APACHE", "644"],
+  ["../../docs/linux/README.md", "/usr/share/doc/aoostar-rs/linux-README.md", "644"],
+]
+maintainer-scripts = "../../linux/deb"
+
+[package.metadata.generate-rpm]
+name = "aoostar-rs"
+assets = [
+  { source = "target/release/aster-launcher", dest = "/usr/bin/aster-launcher", mode = "755" },
+  { source = "target/release/asterctl", dest = "/usr/lib/aoostar-rs/asterctl", mode = "755" },
+  { source = "target/release/aster-sysinfo", dest = "/usr/lib/aoostar-rs/aster-sysinfo", mode = "755" },
+  { source = "../../cfg/**/*", dest = "/usr/share/aoostar-rs/cfg/", mode = "644" },
+  { source = "../../fonts/**/*", dest = "/usr/share/aoostar-rs/fonts/", mode = "644" },
+  { source = "../../linux/launcher.default.toml", dest = "/usr/share/aoostar-rs/launcher.default.toml", mode = "644" },
+  { source = "../../linux/io.github.shine911.aoostar.desktop", dest = "/usr/share/applications/io.github.shine911.aoostar.desktop", mode = "644" },
+  { source = "../../linux/io.github.shine911.aoostar.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.shine911.aoostar.png", mode = "644" },
+  { source = "../../linux/60-aoostar-lcd.rules", dest = "/usr/lib/udev/rules.d/60-aoostar-lcd.rules", mode = "644" },
+  { source = "../../LICENSE-MIT", dest = "/usr/share/doc/aoostar-rs/LICENSE-MIT", mode = "644" },
+  { source = "../../LICENSE-APACHE", dest = "/usr/share/doc/aoostar-rs/LICENSE-APACHE", mode = "644" },
+  { source = "../../docs/linux/README.md", dest = "/usr/share/doc/aoostar-rs/linux-README.md", mode = "644" },
+]
+post_install_script = "../../linux/rpm-postinst"
+post_uninstall_script = "../../linux/rpm-postun"

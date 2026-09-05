@@ -5,7 +5,7 @@
 # User guide
 
 - [Installation](installation.md)
-  - [Linux systemd Service](linux/README.md)
+  - [Linux KDE application](linux/README.md)
   - [Windows](windows/README.md)
 - [asterctl Tool](asterctl.md)
 - [Shell Commands](shell_commands.md)

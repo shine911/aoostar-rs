@@ -14,10 +14,14 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
 use std::io::{BufWriter, Write};
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
+#[cfg(target_os = "linux")]
+use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use sysinfo::{Components, DiskKind, Disks, Networks, System};
@@ -499,11 +503,35 @@ impl SysinfoSource {
                 }
 
                 add_sensor(sensors, format!("{label}#unit"), "°C");
-                add_sensor(sensors, label, format!("{temperature:.1}"));
+                let value = format!("{temperature:.1}");
+                add_sensor(sensors, &label, &value);
+                #[cfg(target_os = "linux")]
+                match label.as_str() {
+                    // Monitor3 draws these widgets' units itself. Keep the
+                    // ordinary labels (and their #unit values) available for
+                    // generic consumers, while exposing value-only aliases
+                    // for the Linux mapping used by the built-in panel.
+                    "temperature_cpu" => add_sensor(sensors, "temperature_cpu_value", &value),
+                    "temperature_memory" => add_sensor(sensors, "temperature_memory_value", &value),
+                    "temperature_gpu" => add_sensor(sensors, "temperature_gpu_value", &value),
+                    _ => {}
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            sensors.remove("gpu_core#unit");
+            sensors.remove("gpu_core");
+            if let Some(gpu_busy) = read_gpu_busy_percent(Path::new("/sys/class/drm")) {
+                add_sensor(sensors, "gpu_core#unit", "%");
+                add_sensor(sensors, "gpu_core", gpu_busy);
             }
         }
 
         // Network interfaces name, total data received and total data transmitted:
+        #[cfg(target_os = "linux")]
+        let mut network_candidates = Vec::new();
         for (interface_name, data) in &self.networks {
             // only consider specific interfaces
             // NOTE: the original prefix list ("eth", "en", "em", "wlan", "wlp", "wlo") only
@@ -511,14 +539,32 @@ impl SysinfoSource {
             // sysinfo crate reports the adapter's friendly name instead (e.g. "Ethernet",
             // "Wi-Fi"), so "Wi-Fi" never matched any prefix and was silently dropped --
             // added "wi-fi"/"wifi"/"wireless" to also cover Windows Wi-Fi adapters.
-            let if_name = interface_name.to_lowercase();
-            if ![
-                "eth", "en", "em", "wlan", "wlp", "wlo", "wi-fi", "wifi", "wireless",
-            ]
-            .iter()
-            .any(|i| if_name.starts_with(*i))
+            #[cfg(not(target_os = "linux"))]
             {
-                continue;
+                let if_name = interface_name.to_lowercase();
+                if ![
+                    "eth", "en", "em", "wlan", "wlp", "wlo", "wi-fi", "wifi", "wireless",
+                ]
+                .iter()
+                .any(|i| if_name.starts_with(*i))
+                {
+                    continue;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let mut addresses: Vec<String> = data
+                    .ip_networks()
+                    .iter()
+                    .map(|network| network.addr.to_string())
+                    .collect();
+                addresses.sort();
+                network_candidates.push(NetworkCandidate {
+                    name: interface_name.to_string(),
+                    addresses,
+                    received: data.received(),
+                    transmitted: data.transmitted(),
+                });
             }
             // Sort by address to avoid random order in refreshes
             for (idx, addr) in data
@@ -573,6 +619,44 @@ impl SysinfoSource {
             );
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            for label in [
+                "network_interface_name",
+                "network_ip_address",
+                "network_download_speed",
+                "network_upload_speed",
+            ] {
+                sensors.remove(label);
+            }
+            if let Some(network) = select_network_candidate(&network_candidates) {
+                add_sensor(sensors, "network_interface_name", &network.name);
+                if let Some(address) = network
+                    .addresses
+                    .iter()
+                    .filter_map(|address| IpAddr::from_str(address).ok())
+                    .find(|address| !address.is_loopback())
+                {
+                    add_sensor(sensors, "network_ip_address", address);
+                }
+                if let Some(refresh) = self.refresh_duration {
+                    let interval = refresh.as_millis() as u64;
+                    if interval > 0 {
+                        add_sensor(
+                            sensors,
+                            "network_download_speed",
+                            format!("{}/s", format_bytes(1000 * network.received / interval)),
+                        );
+                        add_sensor(
+                            sensors,
+                            "network_upload_speed",
+                            format!("{}/s", format_bytes(1000 * network.transmitted / interval)),
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -583,6 +667,74 @@ fn add_sensor(
     value: impl Display,
 ) {
     sensors.insert(label.into(), value.to_string());
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkCandidate {
+    name: String,
+    addresses: Vec<String>,
+    received: u64,
+    transmitted: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn select_network_candidate(candidates: &[NetworkCandidate]) -> Option<NetworkCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .addresses
+                .iter()
+                .filter_map(|address| IpAddr::from_str(address).ok())
+                .any(|address| !address.is_loopback())
+        })
+        .max_by(|left, right| {
+            let left_traffic = left.received.saturating_add(left.transmitted);
+            let right_traffic = right.received.saturating_add(right.transmitted);
+            (
+                is_common_uplink_name(&left.name),
+                left_traffic > 0,
+                left_traffic,
+            )
+                .cmp(&(
+                    is_common_uplink_name(&right.name),
+                    right_traffic > 0,
+                    right_traffic,
+                ))
+                // A lexical tie-break makes selection stable despite the
+                // order in which sysinfo reports interfaces.
+                .then_with(|| right.name.cmp(&left.name))
+        })
+        .cloned()
+}
+
+#[cfg(target_os = "linux")]
+fn is_common_uplink_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["eth", "en", "em", "wlan", "wlp", "wlo", "ww"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+#[cfg(target_os = "linux")]
+fn read_gpu_busy_percent(root: &Path) -> Option<String> {
+    let mut entries: Vec<_> = fs::read_dir(root).ok()?.filter_map(Result::ok).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let busy_path = entry.path().join("device/gpu_busy_percent");
+        let Ok(value) = fs::read_to_string(busy_path) else {
+            continue;
+        };
+        let value = value.trim();
+        let Ok(percent) = value.parse::<u8>() else {
+            continue;
+        };
+        if percent <= 100 {
+            return Some(percent.to_string());
+        }
+    }
+    None
 }
 
 fn update_linux_storage_sensors(
@@ -963,5 +1115,103 @@ mod tests {
         for (label, value) in &sensors {
             assert_eq!(parsed.get(label).unwrap(), value);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_alias_selection_prefers_traffic_and_is_name_stable() {
+        let candidates = vec![
+            NetworkCandidate {
+                name: "Meta".into(),
+                addresses: vec!["192.0.2.20".into()],
+                received: 100_000,
+                transmitted: 100_000,
+            },
+            NetworkCandidate {
+                name: "tun0".into(),
+                addresses: vec!["100.64.0.1".into()],
+                received: 90_000,
+                transmitted: 90_000,
+            },
+            NetworkCandidate {
+                name: "docker0".into(),
+                addresses: vec!["172.17.0.1".into()],
+                received: 80_000,
+                transmitted: 80_000,
+            },
+            NetworkCandidate {
+                name: "wlp4s0".into(),
+                addresses: vec!["192.0.2.10".into()],
+                received: 1,
+                transmitted: 1,
+            },
+        ];
+        assert_eq!(
+            select_network_candidate(&candidates).unwrap().name,
+            "wlp4s0"
+        );
+
+        let tied = vec![
+            NetworkCandidate {
+                name: "zeta".into(),
+                addresses: vec!["198.51.100.2".into()],
+                received: 1,
+                transmitted: 1,
+            },
+            NetworkCandidate {
+                name: "alpha".into(),
+                addresses: vec!["198.51.100.3".into()],
+                received: 1,
+                transmitted: 1,
+            },
+        ];
+        assert_eq!(select_network_candidate(&tied).unwrap().name, "alpha");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_alias_falls_back_to_virtual_interface_when_needed() {
+        let candidates = vec![
+            NetworkCandidate {
+                name: "docker0".into(),
+                addresses: vec!["172.17.0.1".into()],
+                received: 5,
+                transmitted: 5,
+            },
+            NetworkCandidate {
+                name: "tun0".into(),
+                addresses: vec!["100.64.0.1".into()],
+                received: 5,
+                transmitted: 5,
+            },
+        ];
+        assert_eq!(
+            select_network_candidate(&candidates).unwrap().name,
+            "docker0"
+        );
+        assert!(
+            select_network_candidate(&[NetworkCandidate {
+                name: "lo".into(),
+                addresses: vec!["127.0.0.1".into()],
+                received: 100,
+                transmitted: 100,
+            }])
+            .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu_busy_percent_reads_valid_sysfs_fixture_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("card0/device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("gpu_busy_percent"), "42\n").unwrap();
+        assert_eq!(read_gpu_busy_percent(dir.path()), Some("42".into()));
+
+        fs::write(device.join("gpu_busy_percent"), "101\n").unwrap();
+        assert_eq!(read_gpu_busy_percent(dir.path()), None);
+        fs::write(device.join("gpu_busy_percent"), "not-a-number\n").unwrap();
+        assert_eq!(read_gpu_busy_percent(dir.path()), None);
     }
 }

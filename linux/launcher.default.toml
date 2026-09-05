@@ -1,0 +1,6 @@
+# AOOSTAR LCD Linux defaults. This file is copied to $XDG_CONFIG_HOME/aoostar-rs.
+monitor_config = "Monitor3.json"
+refresh_time = 5
+theme = 0
+display_mode = "on"
+restart_uart_on_resume = false

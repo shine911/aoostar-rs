@@ -6,6 +6,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'linux/**'
+      - 'docs/linux/**'
       - '.github/workflows/build.yml'
   pull_request:
     branches: [ main ]
@@ -45,7 +47,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libdbus-1-dev
 
       - uses: auguwu/clippy-action@1.4.0
         with:
@@ -109,7 +111,7 @@ jobs:
           echo "ARTIFACT_NAME=${{ env.APP_NAME }}-$APP_VERSION-${{ env.LINUX_ARTIFACT_SUFFIX }}" >> $GITHUB_ENV
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libdbus-1-dev
 
       - name: Cache dependencies
         id: cache-dependencies
@@ -138,6 +140,7 @@ jobs:
         run: |
           ls -la target/release
           mkdir -p ${GITHUB_WORKSPACE}/${{env.BIN_OUTPUT_PATH }}
+          cp target/release/aster-launcher ${GITHUB_WORKSPACE}/${{ env.BIN_OUTPUT_PATH }}
           cp target/release/${{ env.APP_NAME }} ${GITHUB_WORKSPACE}/${{ env.BIN_OUTPUT_PATH }}
           cp target/release/aster-sysinfo ${GITHUB_WORKSPACE}/${{ env.BIN_OUTPUT_PATH }}
           cp linux/*.service ${GITHUB_WORKSPACE}/${{ env.BIN_OUTPUT_PATH }}
