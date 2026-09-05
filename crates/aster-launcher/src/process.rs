@@ -159,14 +159,26 @@ pub(crate) fn kill_all(handles: &[ChildHandle], log_path: &Path) {
 /// tray's refresh menu to restart exactly the refresh-driven processes;
 /// their watchers respawn them with the updated specs). Safe to call with
 /// children already dead.
-pub(crate) fn kill_named(handles: &[ChildHandle], names: &[&str]) {
+pub(crate) fn kill_named(handles: &[ChildHandle], names: &[&str]) -> Result<(), String> {
+    let mut errors = Vec::new();
     for handle in handles {
-        if names.contains(&handle.name)
-            && let Ok(mut guard) = handle.current_child.lock()
-            && let Some(child) = guard.as_mut()
-        {
-            let _ = child.kill();
+        if !names.contains(&handle.name) {
+            continue;
         }
+        let Ok(mut guard) = handle.current_child.lock() else {
+            errors.push(format!("{} child mutex is poisoned", handle.name));
+            continue;
+        };
+        if let Some(child) = guard.as_mut()
+            && let Err(err) = child.kill()
+        {
+            errors.push(format!("failed to restart {}: {err}", handle.name));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 

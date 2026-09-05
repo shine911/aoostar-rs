@@ -539,30 +539,58 @@ pub fn run_linux(
         let log = log_path.to_path_buf();
         let current = current_refresh.clone();
         let paths = paths.to_owned();
-        let id =
-            match tray
-                .inner_mut()
-                .add_menu_item_with_id(&format!("Refresh {secs}s"), move || {
-                    if crate::config::set_refresh_time(&config, secs).is_ok() {
-                        let cfg = crate::config::LauncherConfig::load_with_log(&config, &log);
-                        if let Ok(mut s) = specs.lock() {
-                            *s = crate::process::linux_child_specs(&paths, &cfg);
-                        }
-                        crate::process::kill_named(&handles, &["aster-sysinfo"]);
-                        current.store(secs, Ordering::SeqCst);
-                    } else {
-                        crate::logging::append_line(&log, "failed to persist refresh interval");
-                    }
-                }) {
-                Ok(id) => Some(id),
-                Err(err) => {
+        let id = match tray.inner_mut().add_menu_item_with_id(
+            &format!("Refresh {secs}s"),
+            move || {
+                if let Err(err) = crate::config::set_refresh_time(&config, secs) {
                     crate::logging::append_line(
-                        log_path,
-                        &format!("failed to add refresh item: {err}"),
+                        &log,
+                        &format!("tray: failed to persist refresh_time={secs}: {err}"),
                     );
-                    None
+                    return;
                 }
-            };
+                let cfg = crate::config::LauncherConfig::load_with_log(&config, &log);
+                if cfg.refresh_time != Some(secs) {
+                    crate::logging::append_line(
+                        &log,
+                        &format!(
+                            "tray: reload did not retain refresh_time={secs}; refusing restart"
+                        ),
+                    );
+                    return;
+                }
+                let new_specs = crate::process::linux_child_specs(&paths, &cfg);
+                let Ok(mut s) = specs.lock() else {
+                    crate::logging::append_line(
+                        &log,
+                        "tray: child specs mutex poisoned; refusing refresh restart",
+                    );
+                    return;
+                };
+                *s = new_specs;
+                drop(s);
+                if let Err(err) = crate::process::kill_named(&handles, &["aster-sysinfo"]) {
+                    crate::logging::append_line(&log, &format!("tray: {err}"));
+                    return;
+                }
+                current.store(secs, Ordering::SeqCst);
+                crate::logging::append_line(
+                    &log,
+                    &format!(
+                        "tray: refresh_time={secs} persisted and aster-sysinfo restart requested"
+                    ),
+                );
+            },
+        ) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                crate::logging::append_line(
+                    log_path,
+                    &format!("failed to add refresh item: {err}"),
+                );
+                None
+            }
+        };
         refresh_ids.push(id);
     }
     let _ = tray.add_label("Themes");
@@ -578,16 +606,40 @@ pub fn run_linux(
             match tray
                 .inner_mut()
                 .add_menu_item_with_id(&format!("Theme: {label}"), move || {
-                    if crate::config::set_theme(&config, theme).is_ok() {
-                        let cfg = crate::config::LauncherConfig::load_with_log(&config, &log);
-                        if let Ok(mut s) = specs.lock() {
-                            *s = crate::process::linux_child_specs(&paths, &cfg);
-                        }
-                        crate::process::kill_named(&handles, &["asterctl"]);
-                        current.store(theme, Ordering::SeqCst);
-                    } else {
-                        crate::logging::append_line(&log, "failed to persist theme selection");
+                    if let Err(err) = crate::config::set_theme(&config, theme) {
+                        crate::logging::append_line(
+                            &log,
+                            &format!("tray: failed to persist theme={theme}: {err}"),
+                        );
+                        return;
                     }
+                    let cfg = crate::config::LauncherConfig::load_with_log(&config, &log);
+                    if cfg.theme != Some(theme) {
+                        crate::logging::append_line(
+                            &log,
+                            &format!("tray: reload did not retain theme={theme}; refusing restart"),
+                        );
+                        return;
+                    }
+                    let new_specs = crate::process::linux_child_specs(&paths, &cfg);
+                    let Ok(mut s) = specs.lock() else {
+                        crate::logging::append_line(
+                            &log,
+                            "tray: child specs mutex poisoned; refusing theme restart",
+                        );
+                        return;
+                    };
+                    *s = new_specs;
+                    drop(s);
+                    if let Err(err) = crate::process::kill_named(&handles, &["asterctl"]) {
+                        crate::logging::append_line(&log, &format!("tray: {err}"));
+                        return;
+                    }
+                    current.store(theme, Ordering::SeqCst);
+                    crate::logging::append_line(
+                        &log,
+                        &format!("tray: theme={theme} persisted and asterctl restart requested"),
+                    );
                 }) {
                 Ok(id) => Some(id),
                 Err(err) => {
@@ -608,20 +660,27 @@ pub fn run_linux(
         }
         let display = display.clone();
         let config = config_path.to_path_buf();
-        let id = match tray
-            .inner_mut()
-            .add_menu_item_with_id(&format!("Display: {label}"), move || {
-                display.apply(mode, &config)
-            }) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                crate::logging::append_line(
-                    log_path,
-                    &format!("failed to add display item: {err}"),
-                );
-                None
-            }
-        };
+        let log = log_path.to_path_buf();
+        let id =
+            match tray
+                .inner_mut()
+                .add_menu_item_with_id(&format!("Display: {label}"), move || {
+                    if !display.apply(mode, &config) {
+                        crate::logging::append_line(
+                            &log,
+                            &format!("tray: display mode {mode:?} was not applied"),
+                        );
+                    }
+                }) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    crate::logging::append_line(
+                        log_path,
+                        &format!("failed to add display item: {err}"),
+                    );
+                    None
+                }
+            };
         display_ids.push(id);
     }
     let quit_cb = quit.clone();

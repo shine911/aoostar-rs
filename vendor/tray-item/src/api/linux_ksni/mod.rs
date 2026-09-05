@@ -1,6 +1,6 @@
 use crate::{IconSource, TIError};
 use ksni::{menu::StandardItem, Handle, Icon};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 enum TrayItem {
     Label { id: u32, label: String },
@@ -16,11 +16,15 @@ struct Tray {
     title: String,
     icon: IconSource,
     actions: Vec<TrayItem>,
-    next_id: u32,
 }
 
 pub struct TrayItemLinux {
     tray: Handle<Tray>,
+    // ksni::Handle::update queues the mutation asynchronously. Keep the
+    // sequence in this caller instead of reading it back from the queued
+    // closure, which previously returned 0 for every item under normal KDE
+    // scheduling and made later label/checkmark updates target nothing.
+    next_id: u32,
 }
 
 impl ksni::Tray for Tray {
@@ -89,13 +93,15 @@ impl TrayItemLinux {
             title: title.to_string(),
             icon,
             actions: vec![],
-            next_id: 0,
         });
 
         let handle = svc.handle();
         svc.spawn();
 
-        Ok(Self { tray: handle })
+        Ok(Self {
+            tray: handle,
+            next_id: 0,
+        })
     }
 
     pub fn set_icon(&mut self, icon: IconSource) -> Result<(), TIError> {
@@ -110,16 +116,14 @@ impl TrayItemLinux {
     }
 
     pub fn add_label_with_id(&mut self, label: &str) -> Result<u32, TIError> {
-        let item_id = Arc::new(Mutex::new(0));
-        let item_id_clone = Arc::clone(&item_id);
+        let item_id = self.allocate_id();
         self.tray.update(move |tray| {
-            let mut id = item_id_clone.lock().unwrap();
-            *id = tray.next_id;
-            tray.next_id += 1;
-            tray.actions.push(TrayItem::Label { id: *id, label: label.to_string() });
+            tray.actions.push(TrayItem::Label {
+                id: item_id,
+                label: label.to_string(),
+            });
         });
-        let final_id = *item_id.lock().unwrap();
-        Ok(final_id)
+        Ok(item_id)
     }
 
     pub fn add_menu_item<F>(&mut self, label: &str, cb: F) -> Result<(), TIError>
@@ -135,23 +139,23 @@ impl TrayItemLinux {
         F: Fn() + Send + Sync + 'static,
     {
         let action = Arc::new(cb);
-        let item_id = Arc::new(Mutex::new(0));
-        let item_id_clone = Arc::clone(&item_id);
+        let item_id = self.allocate_id();
 
         self.tray.update(move |tray| {
-            let mut id = item_id_clone.lock().unwrap();
-            *id = tray.next_id;
-            tray.next_id += 1;
-
             tray.actions.push(TrayItem::MenuItem {
-                id: *id,
+                id: item_id,
                 label: label.to_string(),
                 action: action.clone(),
             });
         });
 
-        let final_id = *item_id.lock().unwrap();
-        Ok(final_id)
+        Ok(item_id)
+    }
+
+    fn allocate_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
     }
 
     pub fn set_menu_item_label(&mut self, label: &str, id: u32) -> Result<(), TIError> {

@@ -462,13 +462,15 @@ impl DisplayControl {
         this.write_state(mode == DisplayMode::On);
         this
     }
-    fn write_state(&self, on: bool) {
+    fn write_state(&self, on: bool) -> bool {
         if let Err(e) = write_state_file(&self.state_file, on) {
             crate::logging::append_line(
                 &self.log_path,
                 &format!("failed writing display state: {e}"),
             );
+            return false;
         }
+        true
     }
     pub(crate) fn heartbeat(&self) {
         let on = self.mode.load(std::sync::atomic::Ordering::SeqCst) == DisplayMode::On.index();
@@ -477,7 +479,7 @@ impl DisplayControl {
     pub(crate) fn force_off(&self) {
         self.write_state(false);
     }
-    pub(crate) fn apply(&self, mode: DisplayMode, config_path: &Path) {
+    pub(crate) fn apply(&self, mode: DisplayMode, config_path: &Path) -> bool {
         let mode = if mode == DisplayMode::Follow {
             crate::logging::append_line(
                 &self.log_path,
@@ -492,11 +494,26 @@ impl DisplayControl {
                 &self.log_path,
                 &format!("failed to persist display mode: {e}"),
             );
-            return;
+            return false;
+        }
+        let cfg = crate::config::LauncherConfig::load_with_log(config_path, &self.log_path);
+        if cfg.display_mode != Some(mode) {
+            crate::logging::append_line(
+                &self.log_path,
+                &format!("tray: reload did not retain display_mode={mode:?}"),
+            );
+            return false;
+        }
+        if !self.write_state(mode == DisplayMode::On) {
+            return false;
         }
         self.mode
             .store(mode.index(), std::sync::atomic::Ordering::SeqCst);
-        self.write_state(mode == DisplayMode::On);
+        crate::logging::append_line(
+            &self.log_path,
+            &format!("tray: display mode {mode:?} persisted and applied"),
+        );
+        true
     }
 }
 

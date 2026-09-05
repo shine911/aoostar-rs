@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Fixed Linux KDE tray choices persisting/applying, including repair of legacy concatenated or duplicate `launcher.toml` entries and correct async menu IDs/checkmarks.
 - Add a KDE Plasma 5/6 Linux tray launcher with XDG paths, single-instance
   locking, clean signal shutdown, and DEB/RPM packaging for x86_64.
 - Linux sensor panels now use stable aliases for CPU, memory, GPU temperature,
