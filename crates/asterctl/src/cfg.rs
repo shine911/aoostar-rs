@@ -809,4 +809,39 @@ mod tests {
         // both flags default to false -> empty set -> keep mianban
         assert_eq!(cfg.active_panels, vec![1]);
     }
+
+    #[test]
+    fn linux_sensor_mapping_resolves_percent_and_temperature_aliases() {
+        let mut cfg: MonitorConfig = serde_json::from_str(
+            r#"{
+                "setup": {"refresh": 1},
+                "mianban": [1],
+                "diy": [{"sensor": [
+                    {"mode": 1, "label": "cpu_percent", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": 0, "pic": "", "x": 0, "y": 0},
+                    {"mode": 1, "label": "memory_usage", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": 0, "pic": "", "x": 0, "y": 0},
+                    {"mode": 1, "label": "cpu_temperature", "value": "", "unit": "", "integerDigits": -1, "decimalDigits": 0, "pic": "", "x": 0, "y": 0}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        cfg.set_sensor_mapping(HashMap::from([
+            ("cpu_percent".into(), "cpu_usage_percent".into()),
+            ("memory_usage".into(), "mem_usage_percent".into()),
+            ("cpu_temperature".into(), "temperature_cpu_value".into()),
+        ]));
+
+        let labels: Vec<_> = cfg.panels[0]
+            .sensor
+            .iter()
+            .map(|sensor| sensor.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "cpu_usage_percent",
+                "mem_usage_percent",
+                "temperature_cpu_value"
+            ]
+        );
+    }
 }

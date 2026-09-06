@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Fixed Linux KDE tray choices persisting/applying, including repair of legacy concatenated or duplicate `launcher.toml` entries and correct async menu IDs/checkmarks.
+- Add a KDE Plasma 5/6 Linux tray launcher with XDG paths, single-instance
+  locking, clean signal shutdown, and DEB/RPM packaging for x86_64.
+- Linux CI releases now publish versioned DEB and RPM packages instead of the
+  previous tarball, with package metadata derived from the release tag.
+- Linux sensor panels now use stable aliases for CPU, memory, GPU temperature,
+  network speed/address, and available GPU utilization; launcher config writes
+  are serialized and atomically replaced.
+- Linux Monitor3 mapping now restores CPU/RAM usage percentages and uses
+  value-only temperature aliases so built-in degree symbols are not duplicated.
+
 ## v0.4.0 - 2026-08-17
 
 ### Changed

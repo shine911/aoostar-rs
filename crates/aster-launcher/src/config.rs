@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 /// Allowed sensor refresh intervals, in seconds. A single `refresh_time`
 /// value is applied to both `aster-sysinfo` and `hwbridge`.
@@ -101,6 +102,16 @@ pub struct LauncherConfig {
     pub restart_uart_on_resume: bool,
 }
 
+const CONFIG_KEYS: [&str; 7] = [
+    "monitor_config",
+    "refresh_time",
+    "theme",
+    "display_mode",
+    "sysinfo_refresh",
+    "hwbridge_refresh",
+    "restart_uart_on_resume",
+];
+
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
@@ -123,17 +134,32 @@ impl LauncherConfig {
     /// missing or cannot be parsed. Never panics, never returns `Err` —
     /// there is no valid state for the launcher to refuse to start in.
     pub fn load(path: &Path) -> Self {
-        let mut cfg = match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
+        let log_path = path.with_file_name("launcher.log");
+        Self::load_with_log(path, &log_path)
+    }
+
+    /// Variant used by the Linux launcher so diagnostics live under XDG
+    /// state while the TOML remains in the user config directory.
+    pub fn load_with_log(path: &Path, log_path: &Path) -> Self {
+        // A previous launcher release could concatenate adjacent assignments
+        // while replacing a line (for example `refresh_time = 2theme = 0`).
+        // Repair that small, known corruption before parsing so upgrading is
+        // sufficient; users do not have to delete their custom config.
+        let _guard = toml_write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cfg = match read_and_repair(path, log_path) {
+            Ok(Some(text)) => toml::from_str(&text).unwrap_or_else(|err| {
                 crate::logging::append_line(
-                    &path.with_file_name("launcher.log"),
+                    log_path,
                     &format!("launcher.toml is invalid, using defaults: {err}"),
                 );
                 Self::default()
             }),
+            Ok(None) => Self::default(),
             Err(_) => Self::default(),
         };
-        cfg.sanitize_values(path);
+        cfg.sanitize_values(log_path);
         cfg
     }
 
@@ -224,25 +250,265 @@ impl LauncherConfig {
 /// pre-quoted string for TOML strings (e.g. `"follow"`).
 /// Creates the file with just that option if it does not exist yet.
 /// Does not validate `value` — callers pass one of the allowed options.
-fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+static TOML_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn toml_write_lock() -> &'static Mutex<()> {
+    TOML_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Atomically replaces a file on the same filesystem. Unix rename is an
+/// atomic replacement; Windows does not replace an existing path, so remove
+/// it while the process-wide writer lock is held before renaming the complete
+/// temporary file. This keeps concurrent tray callbacks from interleaving
+/// bytes and preserves the never-panic launcher contract.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("launcher.toml");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut temp = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)?;
+    if let Err(err) = temp.write_all(contents.as_bytes()) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    temp.sync_all()?;
+    drop(temp);
+
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Splits adjacent assignments produced by the old line writer. This is
+/// intentionally conservative: only lines beginning with a known launcher
+/// key are inspected, and only another known `key =` marker is split. Thus
+/// arbitrary user keys, comments, and quoted values are left untouched.
+fn repair_toml_text(text: &str) -> (String, bool) {
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len() + 16);
+    for src in text.split_inclusive('\n') {
+        let ending = if src.ends_with("\r\n") {
+            "\r\n"
+        } else if src.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let body = src.strip_suffix(ending).unwrap_or(src);
+        let trimmed = body.trim_start();
+        let starts_with_known_key = CONFIG_KEYS.iter().any(|key| {
+            trimmed
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        if !starts_with_known_key {
+            out.push_str(src);
+            continue;
+        }
+
+        let mut repaired = body.to_string();
+        let mut search_from = repaired.find('=').unwrap_or(0) + 1;
+        while search_from < repaired.len() {
+            let found = next_assignment(&repaired, search_from);
+            let Some(at) = found else { break };
+            repaired.insert(at, '\n');
+            changed = true;
+            search_from = at + 2;
+        }
+        out.push_str(&repaired);
+        out.push_str(ending);
+    }
+    let (out, deduplicated) = deduplicate_known_keys(&out);
+    (out, changed || deduplicated)
+}
+
+/// TOML rejects duplicate keys. The old writer could leave a stale copy of a
+/// key behind after a concatenation, so retain the last assignment (the most
+/// recent tray choice) and turn earlier copies into comments. Commenting the
+/// old line keeps its value and any inline user note recoverable without
+/// changing unrelated custom configuration.
+fn deduplicate_known_keys(text: &str) -> (String, bool) {
+    let mut last = std::collections::HashMap::new();
+    for (line_index, src) in text.split_inclusive('\n').enumerate() {
+        let ending = if src.ends_with("\r\n") {
+            "\r\n"
+        } else if src.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let body = src.strip_suffix(ending).unwrap_or(src);
+        if let Some(key) = assignment_key(body) {
+            last.insert(key, line_index);
+        }
+    }
+
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for (line_index, src) in text.split_inclusive('\n').enumerate() {
+        let ending = if src.ends_with("\r\n") {
+            "\r\n"
+        } else if src.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let body = src.strip_suffix(ending).unwrap_or(src);
+        if let Some(key) = assignment_key(body)
+            && last
+                .get(key)
+                .is_some_and(|last_index| *last_index != line_index)
+        {
+            let indent: String = body
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            out.push_str(&indent);
+            out.push_str("# migrated duplicate: ");
+            out.push_str(body.trim_start());
+            out.push_str(ending);
+            changed = true;
+        } else {
+            out.push_str(src);
+        }
+    }
+    (out, changed)
+}
+
+fn assignment_key(body: &str) -> Option<&'static str> {
+    let candidate = body.split('#').next()?.split('=').next()?.trim();
+    CONFIG_KEYS.iter().find(|key| **key == candidate).copied()
+}
+
+/// Finds a known assignment marker outside quoted strings and comments.
+/// Scanning from the beginning is deliberate: `start` may point into a
+/// quoted value, and only a full lexical pass can distinguish that from the
+/// unquoted concatenation the migration is intended to repair.
+fn next_assignment(text: &str, start: usize) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted && ch == '#' {
+            break;
+        }
+        if index < start || quoted {
+            continue;
+        }
+        if let Some(key) = CONFIG_KEYS
+            .iter()
+            .find(|key| text[index..].starts_with(*key))
+        {
+            let after = &text[index + key.len()..];
+            if after.trim_start().starts_with('=') {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// Reads a config and repairs known concatenated assignments while holding
+/// the caller's process-wide writer lock. `None` means the file is absent.
+fn read_and_repair(path: &Path, log_path: &Path) -> std::io::Result<Option<String>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
+    let (repaired, changed) = repair_toml_text(&text);
+    if changed {
+        atomic_write(path, &repaired)?;
+        crate::logging::append_line(
+            log_path,
+            &format!("repaired concatenated assignments in {}", path.display()),
+        );
+    }
+    Ok(Some(repaired))
+}
+
+fn inline_comment(body: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == '#' && !quoted {
+            return &body[index..];
+        }
+    }
+    ""
+}
+
+fn set_toml_value(path: &Path, key: &str, value: &str, log_path: &Path) -> std::io::Result<()> {
+    let _guard = toml_write_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let text = read_and_repair(path, log_path)?.unwrap_or_default();
 
     let line = format!("{key} = {value}");
     let mut rewritten = false;
     let mut out = String::with_capacity(text.len() + line.len() + 2);
     for src in text.split_inclusive('\n') {
-        let entry_key = src.trim().split('=').next().unwrap_or("").trim();
+        let ending = if src.ends_with("\r\n") {
+            "\r\n"
+        } else if src.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let body = src.strip_suffix(ending).unwrap_or(src);
+        let entry_key = body
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim();
         if entry_key == key {
             // keep the original indentation, drop any trailing comment
-            let indent: String = src.chars().take_while(|c| c.is_whitespace()).collect();
+            let indent: String = body
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
             out.push_str(&indent);
             out.push_str(&line);
-            if !src.ends_with('\n') {
+            out.push_str(inline_comment(body));
+            if ending.is_empty() {
                 out.push('\n');
+            } else {
+                out.push_str(ending);
             }
             rewritten = true;
         } else {
@@ -256,27 +522,46 @@ fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
         out.push_str(&line);
         out.push('\n');
     }
-    std::fs::write(path, out)
+    atomic_write(path, &out)
 }
 
+#[cfg(test)]
 pub fn set_refresh_time(path: &Path, secs: u16) -> std::io::Result<()> {
-    set_toml_value(path, "refresh_time", &secs.to_string())
+    set_refresh_time_with_log(path, &path.with_file_name("launcher.log"), secs)
+}
+
+pub fn set_refresh_time_with_log(path: &Path, log_path: &Path, secs: u16) -> std::io::Result<()> {
+    set_toml_value(path, "refresh_time", &secs.to_string(), log_path)
 }
 
 /// Persists the `theme = <N>` line in `launcher.toml` (see [`set_toml_value`]).
+#[cfg(test)]
 pub fn set_theme(path: &Path, theme: u16) -> std::io::Result<()> {
-    set_toml_value(path, "theme", &theme.to_string())
+    set_theme_with_log(path, &path.with_file_name("launcher.log"), theme)
+}
+
+pub fn set_theme_with_log(path: &Path, log_path: &Path, theme: u16) -> std::io::Result<()> {
+    set_toml_value(path, "theme", &theme.to_string(), log_path)
 }
 
 /// Persists the `display_mode = "<mode>"` line in `launcher.toml` (see
 /// [`set_toml_value`]).
+#[cfg(test)]
 pub fn set_display_mode(path: &Path, mode: DisplayMode) -> std::io::Result<()> {
+    set_display_mode_with_log(path, &path.with_file_name("launcher.log"), mode)
+}
+
+pub fn set_display_mode_with_log(
+    path: &Path,
+    log_path: &Path,
+    mode: DisplayMode,
+) -> std::io::Result<()> {
     let value = match mode {
         DisplayMode::On => "on",
         DisplayMode::Off => "off",
         DisplayMode::Follow => "follow",
     };
-    set_toml_value(path, "display_mode", &format!("\"{value}\""))
+    set_toml_value(path, "display_mode", &format!("\"{value}\""), log_path)
 }
 
 #[cfg(test)]
@@ -408,6 +693,157 @@ mod tests {
         assert_eq!(cfg.refresh_time, Some(30));
         assert_eq!(cfg.sysinfo_refresh_effective(), 30);
         assert_eq!(cfg.hwbridge_refresh_effective(), 30);
+    }
+
+    #[test]
+    fn replacing_a_newline_terminated_key_keeps_the_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        std::fs::write(&path, "refresh_time = 5\ntheme = 0\n").unwrap();
+
+        set_refresh_time(&path, 30).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "refresh_time = 30\ntheme = 0\n");
+        assert_eq!(
+            toml::from_str::<toml::Value>(&text).unwrap()["theme"].as_integer(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn successive_tray_updates_remain_parseable_and_reload_with_all_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        std::fs::write(&path, "monitor_config = \"Monitor3.json\"\n").unwrap();
+
+        set_refresh_time(&path, 10).unwrap();
+        set_theme(&path, 2).unwrap();
+        set_display_mode(&path, DisplayMode::Off).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(toml::from_str::<toml::Value>(&text).is_ok());
+        let cfg = LauncherConfig::load(&path);
+        assert_eq!(cfg.refresh_time, Some(10));
+        assert_eq!(cfg.theme, Some(2));
+        assert_eq!(cfg.display_mode, Some(DisplayMode::Off));
+    }
+
+    #[test]
+    fn migration_does_not_split_key_text_inside_strings_or_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        std::fs::write(
+            &path,
+            "monitor_config = \"theme = custom\" # theme = ignored\nrefresh_time = 5\n",
+        )
+        .unwrap();
+
+        let cfg = LauncherConfig::load(&path);
+
+        assert_eq!(cfg.monitor_config, "theme = custom");
+        assert_eq!(cfg.refresh_time, Some(5));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "monitor_config = \"theme = custom\" # theme = ignored\nrefresh_time = 5\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reloaded_tray_values_flow_into_linux_restart_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        std::fs::write(&path, "monitor_config = \"Monitor3.json\"\n").unwrap();
+        set_refresh_time(&path, 30).unwrap();
+        set_theme(&path, 3).unwrap();
+
+        let cfg = LauncherConfig::load(&path);
+        let paths = crate::paths::LauncherPaths {
+            assets: dir.path().join("assets"),
+            binaries: dir.path().join("bin"),
+            config: dir.path().join("config"),
+            state: dir.path().join("state"),
+            runtime: dir.path().join("runtime"),
+            logs: dir.path().join("logs"),
+            lock: dir.path().join("runtime/launcher.lock"),
+            display_state: dir.path().join("runtime/display.state"),
+            stuck_file: dir.path().join("runtime/uart.stuck"),
+            sensors: dir.path().join("runtime/sensors"),
+        };
+        let specs = crate::process::linux_child_specs(&paths, &cfg);
+
+        assert_eq!(
+            specs[0].args,
+            vec![
+                "--shm".to_string(),
+                "--refresh".to_string(),
+                "30".to_string()
+            ]
+        );
+        assert!(
+            specs[1]
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--theme".to_string(), "3".to_string()] })
+        );
+    }
+
+    #[test]
+    fn repairs_real_world_concatenated_assignments_and_persists_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        let log = dir.path().join("launcher.log");
+        std::fs::write(
+            &path,
+            "# keep me\nmonitor_config = \"Custom.json\"\nrefresh_time = 2theme = 0\ndisplay_mode = \"on\"restart_uart_on_resume = false\nrestart_uart_on_resume = false\ntheme = 0\n",
+        )
+        .unwrap();
+
+        let cfg = LauncherConfig::load_with_log(&path, &log);
+
+        assert_eq!(cfg.monitor_config, "Custom.json");
+        assert_eq!(cfg.refresh_time, Some(2));
+        assert_eq!(cfg.theme, Some(0));
+        assert_eq!(cfg.display_mode_effective(), DisplayMode::On);
+        assert!(!cfg.restart_uart_on_resume);
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("refresh_time = 2\n# migrated duplicate: theme = 0\n"));
+        assert!(repaired.contains("# migrated duplicate: theme = 0\n"));
+        assert!(repaired.contains(
+            "display_mode = \"on\"\n# migrated duplicate: restart_uart_on_resume = false\n"
+        ));
+        assert!(toml::from_str::<toml::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn repairs_theme_and_display_concatenation_without_losing_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        let log = dir.path().join("launcher.log");
+        std::fs::write(&path, "theme = 1display_mode = \"on\" # user choice\n").unwrap();
+
+        let cfg = LauncherConfig::load_with_log(&path, &log);
+
+        assert_eq!(cfg.theme, Some(1));
+        assert_eq!(cfg.display_mode_effective(), DisplayMode::On);
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("theme = 1\ndisplay_mode = \"on\" # user choice\n"));
+        assert!(toml::from_str::<toml::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn tray_repair_logs_to_supplied_log_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        let custom_log = dir.path().join("logs").join("launcher.log");
+        std::fs::write(&path, "refresh_time = 2theme = 1\n").unwrap();
+
+        set_refresh_time_with_log(&path, &custom_log, 10).unwrap();
+
+        let log = std::fs::read_to_string(&custom_log).unwrap();
+        assert!(log.contains("repaired concatenated assignments"));
+        assert!(!path.with_file_name("launcher.log").exists());
     }
 
     #[test]
@@ -550,5 +986,41 @@ mod tests {
         for (i, (mode, _)) in DISPLAY_OPTIONS.iter().enumerate() {
             assert_eq!(mode.index(), i as u16);
         }
+    }
+
+    #[test]
+    fn concurrent_tray_updates_remain_parseable_and_preserve_all_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("launcher.toml"));
+        std::fs::write(&*path, "# retained\nmonitor_config = \"Monitor3.json\"\n").unwrap();
+
+        let refresh_path = path.clone();
+        let refresh = std::thread::spawn(move || {
+            for _ in 0..12 {
+                set_refresh_time(&refresh_path, 10).unwrap();
+            }
+        });
+        let theme_path = path.clone();
+        let theme = std::thread::spawn(move || {
+            for _ in 0..12 {
+                set_theme(&theme_path, 2).unwrap();
+            }
+        });
+        let display_path = path.clone();
+        let display = std::thread::spawn(move || {
+            for _ in 0..12 {
+                set_display_mode(&display_path, DisplayMode::Off).unwrap();
+            }
+        });
+        refresh.join().unwrap();
+        theme.join().unwrap();
+        display.join().unwrap();
+
+        let text = std::fs::read_to_string(&*path).unwrap();
+        assert!(text.contains("# retained"));
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["refresh_time"].as_integer(), Some(10));
+        assert_eq!(parsed["theme"].as_integer(), Some(2));
+        assert_eq!(parsed["display_mode"].as_str(), Some("off"));
     }
 }

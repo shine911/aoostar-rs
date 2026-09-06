@@ -11,6 +11,9 @@ Cargo.lock.tmp
 # windows launcher: packaged output of windows/package-dist.ps1
 /dist
 
+# Linux DEB/RPM package output
+/dist-linux
+
 # hwbridge: track source, vendored DLLs (see hwbridge/NOTICE.md), and notice; exclude build output
 /hwbridge/*
 !/hwbridge/*.cs

@@ -1,0 +1,2 @@
+# AOOSTAR WTR MAX / GEM12+ PRO LCD UART
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="90a1", TAG+="uaccess"

@@ -12,12 +12,12 @@ pub struct ChildSpec {
     pub log_path: PathBuf,
 }
 
-/// Builds the 3 child process specs, all paths relative to `base_dir` (the
-/// launcher's own exe directory) so a copied/zipped `dist/` folder keeps
-/// working wherever it's placed.
-pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
+/// Builds the platform child process specs. Windows keeps its portable
+/// `dist/` layout; Linux uses the XDG-aware resolver and starts two children.
+#[cfg(windows)]
+pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> Vec<ChildSpec> {
     let logs_dir = base_dir.join("logs");
-    [
+    vec![
         ChildSpec {
             name: "aster-sysinfo",
             base_dir: base_dir.to_path_buf(),
@@ -72,7 +72,60 @@ pub fn child_specs(base_dir: &Path, cfg: &LauncherConfig) -> [ChildSpec; 3] {
     ]
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+pub fn linux_child_specs(
+    paths: &crate::paths::LauncherPaths,
+    cfg: &LauncherConfig,
+) -> Vec<ChildSpec> {
+    let mut ctl_args = vec![
+        "--config".into(),
+        paths
+            .monitor_config(&cfg.monitor_config)
+            .to_string_lossy()
+            .into_owned(),
+        "--config-dir".into(),
+        paths.assets_cfg().to_string_lossy().into_owned(),
+        "--font-dir".into(),
+        paths.fonts().to_string_lossy().into_owned(),
+        "--sensor-mapping".into(),
+        paths
+            .assets_cfg()
+            .join("sensor-mapping-linux.cfg")
+            .to_string_lossy()
+            .into_owned(),
+        "--sensor-path".into(),
+        paths.sensors.to_string_lossy().into_owned(),
+        "--shm".into(),
+        "--display-state".into(),
+        paths.display_state.to_string_lossy().into_owned(),
+        "--stuck-file".into(),
+        paths.stuck_file.to_string_lossy().into_owned(),
+    ];
+    if let Some(theme) = cfg.theme {
+        ctl_args.extend(["--theme".into(), theme.to_string()]);
+    }
+    vec![
+        ChildSpec {
+            name: "aster-sysinfo",
+            base_dir: paths.assets.clone(),
+            exe_path: paths.binaries.join("aster-sysinfo"),
+            args: vec![
+                "--shm".into(),
+                "--refresh".into(),
+                cfg.sysinfo_refresh_effective().to_string(),
+            ],
+            log_path: paths.logs.join("aster-sysinfo.log"),
+        },
+        ChildSpec {
+            name: "asterctl",
+            base_dir: paths.assets.clone(),
+            exe_path: paths.binaries.join("asterctl"),
+            args: ctl_args,
+            log_path: paths.logs.join("asterctl.log"),
+        },
+    ]
+}
+
 #[derive(Clone)]
 pub struct ChildHandle {
     pub name: &'static str,
@@ -87,7 +140,6 @@ pub struct ChildHandle {
 /// failed `TerminateProcess` used to be swallowed silently — both are why
 /// the watcher threads force-kill their own children on quit/suspend too
 /// (see `spawn_and_watch`). Safe to call with children already dead.
-#[cfg(windows)]
 pub(crate) fn kill_all(handles: &[ChildHandle], log_path: &Path) {
     for handle in handles {
         if let Ok(mut guard) = handle.current_child.lock()
@@ -107,15 +159,26 @@ pub(crate) fn kill_all(handles: &[ChildHandle], log_path: &Path) {
 /// tray's refresh menu to restart exactly the refresh-driven processes;
 /// their watchers respawn them with the updated specs). Safe to call with
 /// children already dead.
-#[cfg(windows)]
-pub(crate) fn kill_named(handles: &[ChildHandle], names: &[&str]) {
+pub(crate) fn kill_named(handles: &[ChildHandle], names: &[&str]) -> Result<(), String> {
+    let mut errors = Vec::new();
     for handle in handles {
-        if names.contains(&handle.name)
-            && let Ok(mut guard) = handle.current_child.lock()
-            && let Some(child) = guard.as_mut()
-        {
-            let _ = child.kill();
+        if !names.contains(&handle.name) {
+            continue;
         }
+        let Ok(mut guard) = handle.current_child.lock() else {
+            errors.push(format!("{} child mutex is poisoned", handle.name));
+            continue;
+        };
+        if let Some(child) = guard.as_mut()
+            && let Err(err) = child.kill()
+        {
+            errors.push(format!("failed to restart {}: {err}", handle.name));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -124,7 +187,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Base delay between a child exiting (or failing to start) and the next
 /// spawn attempt.
-#[cfg(windows)]
 const RETRY_DELAY_SECS: u64 = 2;
 
 /// Grace period the watchers wait (after the launcher signals its shutdown
@@ -133,18 +195,15 @@ const RETRY_DELAY_SECS: u64 = 2;
 /// "off" display-state once (it re-polls every ~1s, see `STATE_POLL_STEP`
 /// in asterctl) so the LCD is blanked before the processes die. main.rs
 /// uses the same value for its own pre-kill sleep.
-#[cfg(windows)]
 pub(crate) const QUIT_KILL_GRACE_SECS: u64 = 2;
 
 /// Number of consecutive *spawn failures* tolerated at the base delay before
 /// the delay starts widening. A child that can never start (missing exe,
 /// blocked by policy, ...) would otherwise be retried — and logged — every
 /// 2 seconds forever.
-#[cfg(windows)]
 const FAILURE_BACKOFF_THRESHOLD: u32 = 3;
 
 /// Upper bound on the widened retry delay.
-#[cfg(windows)]
 const MAX_BACKOFF_SECS: u64 = 60;
 
 /// How long a child may run and still count as a "quick" exit for backoff
@@ -171,7 +230,6 @@ fn is_quick_failure(status: Option<std::process::ExitStatus>, uptime: std::time:
 
 /// Retry delay for the given number of consecutive spawn failures: the base
 /// delay up to the threshold, then doubling, capped at [`MAX_BACKOFF_SECS`].
-#[cfg(windows)]
 fn retry_delay(consecutive_failures: u32) -> std::time::Duration {
     let secs = if consecutive_failures > FAILURE_BACKOFF_THRESHOLD {
         let shift = (consecutive_failures - FAILURE_BACKOFF_THRESHOLD).min(5);
@@ -185,7 +243,6 @@ fn retry_delay(consecutive_failures: u32) -> std::time::Duration {
 /// Sleeps for up to `total`, waking early as soon as `quit` is set. Used for
 /// the restart/backoff delays so shutdown never has to wait out a delay
 /// (up to [`MAX_BACKOFF_SECS`]) before the watcher thread can be joined.
-#[cfg(windows)]
 fn sleep_until_quit(quit: &std::sync::atomic::AtomicBool, total: std::time::Duration) {
     use std::sync::atomic::Ordering;
 
@@ -218,6 +275,21 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
         .spawn()
 }
 
+#[cfg(unix)]
+fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&spec.log_path)?;
+    let log_file_err = log_file.try_clone()?;
+    std::process::Command::new(&spec.exe_path)
+        .args(&spec.args)
+        .current_dir(&spec.base_dir)
+        .stdout(log_file)
+        .stderr(log_file_err)
+        .spawn()
+}
+
 /// Spawns the child at `index` of the shared `specs` in a background thread
 /// that keeps it running: on unexpected exit it logs a restart marker and
 /// relaunches, until `quit` is set. The specs are read fresh on every spawn
@@ -237,10 +309,9 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
 /// shutdown (e.g. HwBridge.exe after Quit). `shutting_down` anchors the
 /// clean-quit grace so the force-kill cannot preempt asterctl blanking the
 /// LCD (see [`QUIT_KILL_GRACE_SECS`]).
-#[cfg(windows)]
 pub fn spawn_and_watch(
     index: usize,
-    specs: std::sync::Arc<std::sync::Mutex<[ChildSpec; 3]>>,
+    specs: std::sync::Arc<std::sync::Mutex<Vec<ChildSpec>>>,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     suspended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -422,6 +493,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(windows)]
     #[test]
     fn builds_specs_relative_to_base_dir_using_config_values() {
         let base_dir = Path::new("C:\\dist");
@@ -491,6 +563,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn legacy_refresh_values_flow_through_when_no_shared_refresh_time() {
         let base_dir = Path::new("C:\\dist");
@@ -510,6 +583,7 @@ mod tests {
         assert_eq!(specs[2].args, vec!["--shm".to_string(), "30".to_string()]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn theme_flag_flows_through_to_asterctl_args() {
         let base_dir = Path::new("C:\\dist");
@@ -549,6 +623,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn refresh_and_theme_flow_through_together() {
         let base_dir = Path::new("C:\\dist");
@@ -587,6 +662,38 @@ mod tests {
                 "2".to_string()
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_specs_have_two_children_and_absolute_runtime_arguments() {
+        let paths = crate::paths::LauncherPaths {
+            assets: PathBuf::from("/usr/share/aoostar-rs"),
+            binaries: PathBuf::from("/usr/lib/aoostar-rs"),
+            config: PathBuf::from("/tmp/c"),
+            state: PathBuf::from("/tmp/s"),
+            runtime: PathBuf::from("/tmp/r"),
+            logs: PathBuf::from("/tmp/s/logs"),
+            lock: PathBuf::from("/tmp/r/launcher.lock"),
+            display_state: PathBuf::from("/tmp/r/display.state"),
+            stuck_file: PathBuf::from("/tmp/r/uart.stuck"),
+            sensors: PathBuf::from("/tmp/r/sensors"),
+        };
+        let specs = linux_child_specs(&paths, &LauncherConfig::default());
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|s| s.exe_path.is_absolute()));
+        assert!(
+            specs[1]
+                .args
+                .windows(2)
+                .any(|w| w == ["--config-dir", "/usr/share/aoostar-rs/cfg"])
+        );
+        assert!(specs[1].args.windows(2).any(|w| w
+            == [
+                "--sensor-mapping",
+                "/usr/share/aoostar-rs/cfg/sensor-mapping-linux.cfg"
+            ]));
+        assert!(!specs.iter().any(|s| s.name == "hwbridge"));
     }
 
     #[test]

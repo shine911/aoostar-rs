@@ -222,7 +222,9 @@ impl DisplayControl {
     /// and applies it immediately. Never panics — a persist failure is
     /// logged (the menu simply does not stick across restarts).
     pub(crate) fn apply(&self, mode: DisplayMode, config_path: &Path) {
-        if let Err(err) = crate::config::set_display_mode(config_path, mode) {
+        if let Err(err) =
+            crate::config::set_display_mode_with_log(config_path, &self.log_path, mode)
+        {
             crate::logging::append_line(
                 &self.log_path,
                 &format!(
@@ -423,6 +425,98 @@ impl DisplayControl {
                 PowerSettingUnregisterNotification(registration);
             }
         });
+    }
+}
+
+/// Linux controller: display power is explicit On/Off.  Follow screen state
+/// is intentionally not exposed by the Linux tray because KDE/Wayland does
+/// not provide one portable display-power event API.
+#[cfg(target_os = "linux")]
+pub(crate) struct DisplayControl {
+    pub mode: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    state_file: std::path::PathBuf,
+    log_path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl DisplayControl {
+    pub(crate) fn new(
+        initial_mode: DisplayMode,
+        state_file: std::path::PathBuf,
+        log_path: std::path::PathBuf,
+    ) -> std::sync::Arc<Self> {
+        let mode = if initial_mode == DisplayMode::Follow {
+            DisplayMode::On
+        } else {
+            initial_mode
+        };
+        let this = std::sync::Arc::new(Self {
+            mode: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(mode.index())),
+            state_file,
+            log_path,
+        });
+        if initial_mode == DisplayMode::Follow {
+            crate::logging::append_line(
+                &this.log_path,
+                "display_mode=follow is unsupported on Linux; using On",
+            );
+        }
+        this.write_state(mode == DisplayMode::On);
+        this
+    }
+    fn write_state(&self, on: bool) -> bool {
+        if let Err(e) = write_state_file(&self.state_file, on) {
+            crate::logging::append_line(
+                &self.log_path,
+                &format!("failed writing display state: {e}"),
+            );
+            return false;
+        }
+        true
+    }
+    pub(crate) fn heartbeat(&self) {
+        let on = self.mode.load(std::sync::atomic::Ordering::SeqCst) == DisplayMode::On.index();
+        self.write_state(on);
+    }
+    pub(crate) fn force_off(&self) {
+        self.write_state(false);
+    }
+    pub(crate) fn apply(&self, mode: DisplayMode, config_path: &Path) -> bool {
+        let mode = if mode == DisplayMode::Follow {
+            crate::logging::append_line(
+                &self.log_path,
+                "tray: Follow screen state is unsupported on Linux; using On",
+            );
+            DisplayMode::On
+        } else {
+            mode
+        };
+        if let Err(e) = crate::config::set_display_mode_with_log(config_path, &self.log_path, mode)
+        {
+            crate::logging::append_line(
+                &self.log_path,
+                &format!("failed to persist display mode: {e}"),
+            );
+            return false;
+        }
+        let cfg = crate::config::LauncherConfig::load_with_log(config_path, &self.log_path);
+        if cfg.display_mode != Some(mode) {
+            crate::logging::append_line(
+                &self.log_path,
+                &format!("tray: reload did not retain display_mode={mode:?}"),
+            );
+            return false;
+        }
+        if !self.write_state(mode == DisplayMode::On) {
+            return false;
+        }
+        self.mode
+            .store(mode.index(), std::sync::atomic::Ordering::SeqCst);
+        crate::logging::append_line(
+            &self.log_path,
+            &format!("tray: display mode {mode:?} persisted and applied"),
+        );
+        true
     }
 }
 

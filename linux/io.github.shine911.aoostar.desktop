@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AOOSTAR LCD
+Comment=AOOSTAR second LCD tray controller
+Exec=/usr/bin/aster-launcher
+Icon=io.github.shine911.aoostar
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupNotify=false

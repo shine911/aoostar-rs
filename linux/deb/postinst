@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications || true
+command -v update-icon-caches >/dev/null 2>&1 && update-icon-caches /usr/share/icons/hicolor || true
+command -v udevadm >/dev/null 2>&1 && udevadm control --reload-rules || true
+exit 0
