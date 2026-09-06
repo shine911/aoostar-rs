@@ -39,7 +39,7 @@ fn apply_refresh(
     current: &AtomicU16,
 ) {
     // 1. persist the choice so it survives a launcher restart
-    if let Err(err) = crate::config::set_refresh_time(config_path, secs) {
+    if let Err(err) = crate::config::set_refresh_time_with_log(config_path, log_path, secs) {
         crate::logging::append_line(
             log_path,
             &format!(
@@ -73,7 +73,10 @@ fn apply_refresh(
 
     // 3. kill the two refresh-driven children; their watchers respawn them
     //    with the updated arguments within ~2s
-    crate::process::kill_named(handles, &["aster-sysinfo", "hwbridge"]);
+    if let Err(err) = crate::process::kill_named(handles, &["aster-sysinfo", "hwbridge"]) {
+        crate::logging::append_line(log_path, &format!("tray: {err}"));
+        return;
+    }
 
     current.store(secs, Ordering::SeqCst);
 }
@@ -93,7 +96,7 @@ fn apply_theme(
     current: &AtomicU16,
 ) {
     // 1. persist the choice so it survives a launcher restart
-    if let Err(err) = crate::config::set_theme(config_path, theme) {
+    if let Err(err) = crate::config::set_theme_with_log(config_path, log_path, theme) {
         crate::logging::append_line(
             log_path,
             &format!(
@@ -126,7 +129,10 @@ fn apply_theme(
     *guard = crate::process::child_specs(base_dir, &new_cfg);
 
     // 3. kill asterctl; its watcher respawns it with the updated args
-    crate::process::kill_named(handles, &["asterctl"]);
+    if let Err(err) = crate::process::kill_named(handles, &["asterctl"]) {
+        crate::logging::append_line(log_path, &format!("tray: {err}"));
+        return;
+    }
 
     current.store(theme, Ordering::SeqCst);
 }
@@ -542,7 +548,7 @@ pub fn run_linux(
         let id = match tray.inner_mut().add_menu_item_with_id(
             &format!("Refresh {secs}s"),
             move || {
-                if let Err(err) = crate::config::set_refresh_time(&config, secs) {
+                if let Err(err) = crate::config::set_refresh_time_with_log(&config, &log, secs) {
                     crate::logging::append_line(
                         &log,
                         &format!("tray: failed to persist refresh_time={secs}: {err}"),
@@ -606,7 +612,7 @@ pub fn run_linux(
             match tray
                 .inner_mut()
                 .add_menu_item_with_id(&format!("Theme: {label}"), move || {
-                    if let Err(err) = crate::config::set_theme(&config, theme) {
+                    if let Err(err) = crate::config::set_theme_with_log(&config, &log, theme) {
                         crate::logging::append_line(
                             &log,
                             &format!("tray: failed to persist theme={theme}: {err}"),

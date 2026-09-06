@@ -222,7 +222,9 @@ impl DisplayControl {
     /// and applies it immediately. Never panics — a persist failure is
     /// logged (the menu simply does not stick across restarts).
     pub(crate) fn apply(&self, mode: DisplayMode, config_path: &Path) {
-        if let Err(err) = crate::config::set_display_mode(config_path, mode) {
+        if let Err(err) =
+            crate::config::set_display_mode_with_log(config_path, &self.log_path, mode)
+        {
             crate::logging::append_line(
                 &self.log_path,
                 &format!(
@@ -489,7 +491,8 @@ impl DisplayControl {
         } else {
             mode
         };
-        if let Err(e) = crate::config::set_display_mode(config_path, mode) {
+        if let Err(e) = crate::config::set_display_mode_with_log(config_path, &self.log_path, mode)
+        {
             crate::logging::append_line(
                 &self.log_path,
                 &format!("failed to persist display mode: {e}"),

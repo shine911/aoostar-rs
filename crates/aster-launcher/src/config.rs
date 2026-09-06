@@ -470,11 +470,11 @@ fn inline_comment(body: &str) -> &str {
     ""
 }
 
-fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+fn set_toml_value(path: &Path, key: &str, value: &str, log_path: &Path) -> std::io::Result<()> {
     let _guard = toml_write_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let text = read_and_repair(path, &path.with_file_name("launcher.log"))?.unwrap_or_default();
+    let text = read_and_repair(path, log_path)?.unwrap_or_default();
 
     let line = format!("{key} = {value}");
     let mut rewritten = false;
@@ -525,24 +525,43 @@ fn set_toml_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     atomic_write(path, &out)
 }
 
+#[cfg(test)]
 pub fn set_refresh_time(path: &Path, secs: u16) -> std::io::Result<()> {
-    set_toml_value(path, "refresh_time", &secs.to_string())
+    set_refresh_time_with_log(path, &path.with_file_name("launcher.log"), secs)
+}
+
+pub fn set_refresh_time_with_log(path: &Path, log_path: &Path, secs: u16) -> std::io::Result<()> {
+    set_toml_value(path, "refresh_time", &secs.to_string(), log_path)
 }
 
 /// Persists the `theme = <N>` line in `launcher.toml` (see [`set_toml_value`]).
+#[cfg(test)]
 pub fn set_theme(path: &Path, theme: u16) -> std::io::Result<()> {
-    set_toml_value(path, "theme", &theme.to_string())
+    set_theme_with_log(path, &path.with_file_name("launcher.log"), theme)
+}
+
+pub fn set_theme_with_log(path: &Path, log_path: &Path, theme: u16) -> std::io::Result<()> {
+    set_toml_value(path, "theme", &theme.to_string(), log_path)
 }
 
 /// Persists the `display_mode = "<mode>"` line in `launcher.toml` (see
 /// [`set_toml_value`]).
+#[cfg(test)]
 pub fn set_display_mode(path: &Path, mode: DisplayMode) -> std::io::Result<()> {
+    set_display_mode_with_log(path, &path.with_file_name("launcher.log"), mode)
+}
+
+pub fn set_display_mode_with_log(
+    path: &Path,
+    log_path: &Path,
+    mode: DisplayMode,
+) -> std::io::Result<()> {
     let value = match mode {
         DisplayMode::On => "on",
         DisplayMode::Off => "off",
         DisplayMode::Follow => "follow",
     };
-    set_toml_value(path, "display_mode", &format!("\"{value}\""))
+    set_toml_value(path, "display_mode", &format!("\"{value}\""), log_path)
 }
 
 #[cfg(test)]
@@ -811,6 +830,20 @@ mod tests {
         let repaired = std::fs::read_to_string(&path).unwrap();
         assert!(repaired.contains("theme = 1\ndisplay_mode = \"on\" # user choice\n"));
         assert!(toml::from_str::<toml::Value>(&repaired).is_ok());
+    }
+
+    #[test]
+    fn tray_repair_logs_to_supplied_log_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.toml");
+        let custom_log = dir.path().join("logs").join("launcher.log");
+        std::fs::write(&path, "refresh_time = 2theme = 1\n").unwrap();
+
+        set_refresh_time_with_log(&path, &custom_log, 10).unwrap();
+
+        let log = std::fs::read_to_string(&custom_log).unwrap();
+        assert!(log.contains("repaired concatenated assignments"));
+        assert!(!path.with_file_name("launcher.log").exists());
     }
 
     #[test]

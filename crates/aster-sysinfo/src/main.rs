@@ -565,8 +565,10 @@ impl SysinfoSource {
                     received: data.received(),
                     transmitted: data.transmitted(),
                 });
+                continue;
             }
             // Sort by address to avoid random order in refreshes
+            #[allow(unreachable_code)]
             for (idx, addr) in data
                 .ip_networks()
                 .iter()

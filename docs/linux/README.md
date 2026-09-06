@@ -8,7 +8,7 @@ not install or enable an autostart service. Install the DEB or RPM, then launch
 
 ## Build and install
 
-On a Debian-like development system, install Rust, `cargo-deb`, and
+On a Debian-like development system, install Rust, `cargo-deb`, `dpkg-dev`, and
 `cargo-generate-rpm`, then run `./linux/package.sh all`. Packages are written
 to `dist-linux/`. The WSL helper can build both packages in its Debian
 container with `./build-from-wsl.sh linux-packages`. GitHub releases publish
