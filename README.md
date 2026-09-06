@@ -51,7 +51,7 @@ Note: Multiple attempts to contact the manufacturer for documentation have recei
 With that out of the way, on to the fun stuff!
 
 - Browse the source code or read the [User Guide](https://shine911.github.io/aoostar-rs)
-- See [releases](https://github.com/shine911/aoostar-rs/releases) for binary Linux x64 releases. Debian and RPM packages can be built with `./linux/package.sh all`; see the [KDE Linux guide](docs/linux/README.md).
+- See [releases](https://github.com/shine911/aoostar-rs/releases) for versioned Linux x64 DEB and RPM packages. They can also be built locally with `./linux/package.sh all`; see the [KDE Linux guide](docs/linux/README.md).
 
 ## Contributing
 

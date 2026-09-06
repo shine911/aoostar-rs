@@ -11,7 +11,8 @@ not install or enable an autostart service. Install the DEB or RPM, then launch
 On a Debian-like development system, install Rust, `cargo-deb`, and
 `cargo-generate-rpm`, then run `./linux/package.sh all`. Packages are written
 to `dist-linux/`. The WSL helper can build both packages in its Debian
-container with `./build-from-wsl.sh linux-packages`.
+container with `./build-from-wsl.sh linux-packages`. GitHub releases publish
+both versioned packages directly; the Linux tarball is no longer produced.
 
 The package installs immutable assets in `/usr/share/aoostar-rs`, child
 executables in `/usr/lib/aoostar-rs`, the launcher at `/usr/bin/aster-launcher`,

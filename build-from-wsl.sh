@@ -101,7 +101,7 @@ windows_build() {
 }
 
 linux_packages() {
-    local cmd="apt-get install -y -qq gcc curl pkg-config libudev-dev libdbus-1-dev desktop-file-utils dpkg-dev rpm >/dev/null 2>&1 && desktop-file-validate /work/linux/io.github.shine911.aoostar.desktop && cargo install cargo-deb cargo-generate-rpm --locked >/dev/null 2>&1 && cargo build --release --bins && mkdir -p /work/dist-linux && cargo deb -p aster-launcher --no-build --output /work/dist-linux/aoostar-rs.deb && cargo generate-rpm -p /work/crates/aster-launcher -o /work/dist-linux/aoostar-rs.rpm && chown -R \$(stat -c %u:%g /work) /work/dist-linux"
+    local cmd="apt-get install -y -qq gcc curl git pkg-config libudev-dev libdbus-1-dev desktop-file-utils dpkg-dev rpm >/dev/null 2>&1 && cargo install cargo-deb cargo-generate-rpm --locked >/dev/null 2>&1 && /work/linux/package.sh all && chown -R \$(stat -c %u:%g /work) /work/dist-linux"
     run_in_container "$cmd"
 }
 
