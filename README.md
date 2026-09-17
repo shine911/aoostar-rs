@@ -1,76 +1,190 @@
-# AOOSTAR WTR MAX / GEM12+ PRO Screen Control
+# AOOSTAR LCD setup guide
 
-Reverse engineering the [AOOSTAR WTR MAX](https://aoostar.com/products/aoostar-wtr-max-amd-r7-pro-8845hs-11-bays-mini-pc)
-display protocol, with a proof-of-concept application written in Rust.  
-It has only been tested on the WTR MAX, but should also support the GEM12+ PRO device.
+[![Git](https://img.shields.io/github/last-commit/shine911/aoostar-rs?label=git)](https://github.com/shine911/aoostar-rs/commits)
+[![Build](https://github.com/shine911/aoostar-rs/actions/workflows/build.yml/badge.svg)](https://github.com/shine911/aoostar-rs/actions/workflows/build.yml)
+[![Version](https://img.shields.io/github/v/release/shine911/aoostar-rs?label=version)](https://github.com/shine911/aoostar-rs/releases)
 
-Check out the **[User Guide](https://shine911.github.io/aoostar-rs)** for a list of features and installation and usage information.
+This project controls the secondary LCD in the AOOSTAR WTR MAX and GEM12+ PRO.
+It is a fork of the original [zehnm/aoostar-rs](https://github.com/zehnm/aoostar-rs).
 
-## Features
+> **Hardware warning:** this protocol is reverse engineered. Use it at your own
+> risk; a failed display update may require a power cycle.
 
-- Control the AOOSTAR WTR MAX and GEM12+ PRO second screen from Linux or Windows.
-- Switch the display on or off.
-    - Also possible with standard [Linux shell commands](docs/shell_commands.md).
-    - [Linux KDE tray application](docs/linux/README.md) for Plasma 5/6 (X11 and Wayland).
-- Display images (with automatic scaling and partial update support).
-- Render dynamic sensor panels defined from the AOOSTAR-X software.
-    - Update sensor values from simple text files and/or the `AOOSTAR_HW_STATS` shared memory region.
-    - Rotate through multiple panels in a defined interval.
-    - On Windows, [hwbridge](hwbridge/HwBridge.cs) supplements `aster-sysinfo` with CPU/GPU/motherboard/memory
-      temperatures and GPU load (via `LibreHardwareMonitorLib.dll`), data aster-sysinfo cannot read on Windows alone.
-      In `--shm` mode (used by the launcher) `HwBridge` and `aster-sysinfo` publish sensor values into the
-      `AOOSTAR_HW_STATS` shared memory region, which `asterctl --shm` reads directly — no file I/O in the hot path.
-- USB device/serial port selection.
+## Choose an installation method
 
-## Requirements
+| Platform | Download or install | Start command |
+| --- | --- | --- |
+| Windows 10/11 x64 | `*-windows-x64.zip` from Releases | `aster-launcher.exe` |
+| Debian/Ubuntu | `.deb` from Releases | `aster-launcher` |
+| Fedora/RHEL-family | `.rpm` from Releases | `aster-launcher` |
+| Arch Linux | Build `linux/PKGBUILD` | `aster-launcher` |
 
-- **Linux**: no extra requirements beyond the runtime binaries themselves.
-- **Windows**: the hardware temperature / GPU sensors in the sensor panels are read by
-  [`hwbridge`](hwbridge/HwBridge.cs), which loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X
-  itself uses — an AOOSTAR-X build backed by the **PawnIO** driver stack. Install the official
-  AOOSTAR-X prerequisite **`PawnIO.exe`** (download and install it first, per the AOOSTAR-X software
-  requirements) before first run; otherwise those hardware sensors will not be available. The LCD
-  display, serial protocol, and basic system sensors (CPU/memory/disk/network) work without it.
+On Linux, the launcher is a KDE Plasma 5/6 tray application. It works on X11
+and Wayland and does not install an autostart service.
 
-## Disclaimer
+## Windows
 
-> I take no responsibility for the use of this software.  
-> There is no official documentation available;
-> all display control commands have been reverse engineered from the original AOOSTAR-X software.
+1. Download the latest `aoostar-rs-*-windows-x64.zip` from
+   [Releases](https://github.com/shine911/aoostar-rs/releases) and extract it.
+2. Move the extracted files to an Administrator-writable directory such as
+   `C:\Program Files\AOOSTAR LCD`. Do not run it from a user-writable folder:
+   the launcher and its children run elevated.
+3. Download and install [PawnIO](https://pawnio.eu/) before starting if you
+   need CPU/GPU/motherboard temperatures and GPU load. Basic LCD control and
+   system sensors work without it.
+4. Start `aster-launcher.exe` and approve the Administrator prompt. Use its
+   tray icon to set refresh time, theme, display state, or quit.
 
-Even though this software works fine **for me**, I cannot guarantee that it is risk-free:
+Edit `launcher.toml` to select a panel or set `refresh_time` to `2`, `5`,
+`10`, or `30` seconds. Logs are in `logs\`.
 
-- It may or may not work.
-- It could crash the display firmware, requiring a power cycle.
-- It could even brick the display firmware.
-- You have been warned!
+<details>
+<summary>Build the Windows distribution from source</summary>
 
-The risk remains until the manufacturer provides official documentation, and the protocol can be reviewed.
-Note: Multiple attempts to contact the manufacturer for documentation have received no response.
+Install Rust 1.88 or newer with the MSVC toolchain, Visual Studio Build Tools
+with **Desktop development with C++**, and .NET Framework 4.x. Then run
+PowerShell from the repository root:
 
-With that out of the way, on to the fun stuff!
+```powershell
+git clone https://github.com/shine911/aoostar-rs.git
+cd aoostar-rs
+cargo build --release
 
-- Browse the source code or read the [User Guide](https://shine911.github.io/aoostar-rs)
-- See [releases](https://github.com/shine911/aoostar-rs/releases) for versioned Linux x64 DEB and RPM packages. They can also be built locally with `./linux/package.sh all`; see the [KDE Linux guide](docs/linux/README.md).
+cd hwbridge
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs
+cd ..
 
-## Contributing
+.\windows\package-dist.ps1
+```
 
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+The complete portable installation is written to `dist\`.
+</details>
 
-Please note that this software is currently in its initial development and will have major changes until the mentioned
-goals above are reached!
+## Debian and Ubuntu
 
-## Credits
+1. Download the latest `.deb` from
+   [Releases](https://github.com/shine911/aoostar-rs/releases).
+2. Install it:
 
-This is a fork of [zehnm/aoostar-rs](https://github.com/zehnm/aoostar-rs), the original project by
-[Markus Zehnder](https://github.com/zehnm) reverse-engineering the AOOSTAR display protocol. All credit for the
-original work goes to the upstream project; this fork adds Windows support on top of it.
+   ```bash
+   sudo apt install ./aoostar-rs-*.deb
+   ```
+
+3. Open **AOOSTAR LCD** from the application launcher, or run
+   `aster-launcher`.
+
+Remove it with `sudo apt remove aoostar-rs`.
+
+<details>
+<summary>Build the DEB from source</summary>
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libudev-dev libdbus-1-dev \
+  dpkg-dev desktop-file-utils curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+
+git clone https://github.com/shine911/aoostar-rs.git
+cd aoostar-rs
+cargo install cargo-deb --locked
+./linux/package.sh deb
+sudo apt install ./dist-linux/*.deb
+```
+</details>
+
+## Fedora and related distributions
+
+1. Download the latest `.rpm` from
+   [Releases](https://github.com/shine911/aoostar-rs/releases).
+2. Install it:
+
+   ```bash
+   sudo dnf install ./aoostar-rs-*.rpm
+   ```
+
+3. Open **AOOSTAR LCD** from the application launcher, or run
+   `aster-launcher`.
+
+Remove it with `sudo dnf remove aoostar-rs`.
+
+<details>
+<summary>Build the RPM from source</summary>
+
+```bash
+sudo dnf install -y gcc pkgconf-pkg-config systemd-devel dbus-devel \
+  rpm-build desktop-file-utils curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+
+git clone https://github.com/shine911/aoostar-rs.git
+cd aoostar-rs
+cargo install cargo-generate-rpm --locked
+./linux/package.sh rpm
+sudo dnf install ./dist-linux/*.rpm
+```
+</details>
+
+## Arch Linux
+
+No official Arch binary package is published. After installing with the
+PKGBUILD below, open **AOOSTAR LCD** from KDE Plasma's application launcher
+or run `aster-launcher`.
+
+Remove it with `sudo pacman -Rns aoostar-rs`.
+
+<details>
+<summary>Build and install the Arch package</summary>
+
+Build as a regular user:
+
+```bash
+sudo pacman -S --needed base-devel rust cargo pkgconf systemd dbus
+git clone https://github.com/shine911/aoostar-rs.git
+cd aoostar-rs/linux
+makepkg -si
+```
+</details>
+
+## Linux configuration and troubleshooting
+
+The launcher creates only per-user state:
+
+- Configuration: `$XDG_CONFIG_HOME/aoostar-rs/launcher.toml`
+- Logs: `$XDG_STATE_HOME/aoostar-rs/logs/`
+- Runtime files and sensor data: `$XDG_RUNTIME_DIR/aoostar-rs/`
+
+If the LCD cannot be opened, confirm that the desktop session has a working
+`uaccess` seat and inspect the permissions on its `/dev/tty*` device. If Plasma
+hides the tray icon, mark **AOOSTAR LCD** as visible or always shown in System
+Tray settings.
+
+<details>
+<summary>Development builds and checks</summary>
+
+For a Linux checkout, install the distribution's Rust, C compiler,
+`pkg-config`, libudev development files, and D-Bus development files. Then:
+
+```bash
+cargo build --release
+AOOSTAR_ASSET_DIR="$PWD" AOOSTAR_BIN_DIR="$PWD/target/release" \
+  ./target/release/aster-launcher
+
+cargo fmt --all -- --check
+cargo test -p aster-launcher -p aster-sysinfo
+```
+
+From WSL, use the repository helper:
+
+```bash
+./build-from-wsl.sh test
+./build-from-wsl.sh linux-packages
+```
+</details>
+
+For panel formats, sensor mappings, and shell display controls, see the
+[documentation](docs/README.md) and [Linux shell commands](docs/shell_commands.md).
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).

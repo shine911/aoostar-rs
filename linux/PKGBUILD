@@ -1,0 +1,49 @@
+# Maintainer: AOOSTAR contributors <noreply@example.invalid>
+
+_pkgname=aoostar-rs
+pkgname=$_pkgname-git
+pkgver=$(git -C "$startdir/.." describe --tags --long --always |
+  sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/; s/-/./g')
+pkgrel=1
+pkgdesc='Development version of the AOOSTAR WTR MAX and GEM12+ PRO LCD controller'
+arch=('x86_64')
+url='https://github.com/shine911/aoostar-rs'
+license=('MIT' 'Apache-2.0')
+options=(!debug)
+depends=('libdbus-1.so' 'libgcc_s.so' 'libudev.so')
+makedepends=('cargo' 'pkgconf' 'systemd')
+optdepends=('plasma-workspace: KDE Plasma system-tray integration')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=()
+
+build() {
+  cd "$startdir/.."
+  cargo build --locked --release -p aster-launcher -p asterctl -p aster-sysinfo
+}
+
+check() {
+  cd "$startdir/.."
+  cargo test --locked -p aster-launcher -p aster-sysinfo
+}
+
+package() {
+  cd "$startdir/.."
+
+  install -Dm755 target/release/aster-launcher "$pkgdir/usr/bin/aster-launcher"
+  install -Dm755 target/release/asterctl "$pkgdir/usr/lib/$_pkgname/asterctl"
+  install -Dm755 target/release/aster-sysinfo "$pkgdir/usr/lib/$_pkgname/aster-sysinfo"
+
+  install -d "$pkgdir/usr/share/$_pkgname"
+  cp -a cfg fonts "$pkgdir/usr/share/$_pkgname/"
+  install -Dm644 linux/launcher.default.toml "$pkgdir/usr/share/$_pkgname/launcher.default.toml"
+  install -Dm644 linux/io.github.shine911.aoostar.desktop \
+    "$pkgdir/usr/share/applications/io.github.shine911.aoostar.desktop"
+  install -Dm644 linux/io.github.shine911.aoostar.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/io.github.shine911.aoostar.png"
+  install -Dm644 linux/60-aoostar-lcd.rules "$pkgdir/usr/lib/udev/rules.d/60-aoostar-lcd.rules"
+
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 docs/linux/README.md "$pkgdir/usr/share/doc/$pkgname/README-linux.md"
+}
