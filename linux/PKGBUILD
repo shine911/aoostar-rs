@@ -2,23 +2,20 @@
 
 _pkgname=aoostar-rs
 pkgname=$_pkgname-git
-pkgver=0.r0.g0000000
+pkgver=$(git -C "$startdir/.." describe --tags --long --always |
+  sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/; s/-/./g')
 pkgrel=1
 pkgdesc='Development version of the AOOSTAR WTR MAX and GEM12+ PRO LCD controller'
 arch=('x86_64')
 url='https://github.com/shine911/aoostar-rs'
 license=('MIT' 'Apache-2.0')
+options=(!debug)
 depends=('libdbus-1.so' 'libgcc_s.so' 'libudev.so')
 makedepends=('cargo' 'pkgconf' 'systemd')
 optdepends=('plasma-workspace: KDE Plasma system-tray integration')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 source=()
-
-pkgver() {
-  git -C "$startdir/.." describe --tags --long --always |
-    sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/; s/-/./g'
-}
 
 build() {
   cd "$startdir/.."
