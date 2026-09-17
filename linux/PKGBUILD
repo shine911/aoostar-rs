@@ -1,38 +1,45 @@
 # Maintainer: AOOSTAR contributors <noreply@example.invalid>
 
-pkgname=aoostar-rs
-pkgver=0.5.0
+_pkgname=aoostar-rs
+pkgname=$_pkgname-git
+pkgver=0.r0.g0000000
 pkgrel=1
-pkgdesc='Tray controller for the AOOSTAR WTR MAX and GEM12+ PRO LCD'
+pkgdesc='Development version of the AOOSTAR WTR MAX and GEM12+ PRO LCD controller'
 arch=('x86_64')
 url='https://github.com/shine911/aoostar-rs'
 license=('MIT' 'Apache-2.0')
 depends=('libdbus-1.so' 'libgcc_s.so' 'libudev.so')
 makedepends=('cargo' 'pkgconf' 'systemd')
 optdepends=('plasma-workspace: KDE Plasma system-tray integration')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-b2sums=('a4b7d7d770184bf7500ee5ac7b64bb423099339f9c9b8b74e9f553032d7ac6a9e91916457b27331ba86d6c9db9a40e90b7a731dc72eadd4ff3f16d05ec97627a')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=()
+
+pkgver() {
+  git -C "$startdir/.." describe --tags --long --always |
+    sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/; s/-/./g'
+}
 
 build() {
-  cd "$pkgname-$pkgver"
+  cd "$startdir/.."
   cargo build --locked --release -p aster-launcher -p asterctl -p aster-sysinfo
 }
 
 check() {
-  cd "$pkgname-$pkgver"
+  cd "$startdir/.."
   cargo test --locked -p aster-launcher -p aster-sysinfo
 }
 
 package() {
-  cd "$pkgname-$pkgver"
+  cd "$startdir/.."
 
   install -Dm755 target/release/aster-launcher "$pkgdir/usr/bin/aster-launcher"
-  install -Dm755 target/release/asterctl "$pkgdir/usr/lib/$pkgname/asterctl"
-  install -Dm755 target/release/aster-sysinfo "$pkgdir/usr/lib/$pkgname/aster-sysinfo"
+  install -Dm755 target/release/asterctl "$pkgdir/usr/lib/$_pkgname/asterctl"
+  install -Dm755 target/release/aster-sysinfo "$pkgdir/usr/lib/$_pkgname/aster-sysinfo"
 
-  install -d "$pkgdir/usr/share/$pkgname"
-  cp -a cfg fonts "$pkgdir/usr/share/$pkgname/"
-  install -Dm644 linux/launcher.default.toml "$pkgdir/usr/share/$pkgname/launcher.default.toml"
+  install -d "$pkgdir/usr/share/$_pkgname"
+  cp -a cfg fonts "$pkgdir/usr/share/$_pkgname/"
+  install -Dm644 linux/launcher.default.toml "$pkgdir/usr/share/$_pkgname/launcher.default.toml"
   install -Dm644 linux/io.github.shine911.aoostar.desktop \
     "$pkgdir/usr/share/applications/io.github.shine911.aoostar.desktop"
   install -Dm644 linux/io.github.shine911.aoostar.png \
