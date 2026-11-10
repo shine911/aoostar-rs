@@ -12,6 +12,17 @@
 //                     (default: cfg\sensors\hwbridge.txt) that asterctl
 //                     picks up via its sensor file watcher.
 //
+// Usage: HwBridge.exe --shm [refresh] [--raw] [--verbose]
+//        HwBridge.exe <file> [refresh] [--raw] [--verbose]
+//   --raw      diagnostics: also publish every individual sensor under a
+//              raw "hw_<HardwareType>_<SensorType>_<Name>" key (~140 keys
+//              on a typical machine; nothing in asterctl consumes them, and
+//              they make the payload ~10x larger, so they are off by default).
+//   --verbose  print the "wrote N sensors" summary on every tick. By default
+//              it is printed on the first successful tick and then only when
+//              the published sensor count changes (or after an error), so the
+//              launcher's hwbridge.log does not grow forever.
+//
 // The shared memory layout (little-endian, offsets relative to the slot) is
 // defined in crates/aster-hwstats/src/lib.rs and MUST stay in sync:
 //   0   magic        u32   = 0x48575331 ("HWS1")
@@ -106,33 +117,67 @@ namespace HwBridge
 
         // Monotonic writer counter, bumped by 2 on every snapshot write
         // (odd/even seqlock: the slot is marked odd while writing, even when
-        // the snapshot is complete).
+        // the snapshot is complete). Seeded from the slot when the region is
+        // first opened so a restarted writer never re-emits old numbers.
         private static long Sequence = 0;
+
+        // Shared memory handles, opened lazily and kept for the process
+        // lifetime (keeping a handle also keeps the pagefile-backed section
+        // alive for readers that open it later). Dropped on any error.
+        private static MemoryMappedFile SharedMmf = null;
+        private static MemoryMappedViewAccessor SharedView = null;
+
+        private static bool Raw = false;
+        private static bool Verbose = false;
+
+        // Reused per tick to avoid garbage.
+        private static readonly Dictionary<string, string> Values = new Dictionary<string, string>();
+        private static readonly StringBuilder PayloadBuilder = new StringBuilder();
+        private static readonly Dictionary<ISensor, string> RawKeys = new Dictionary<ISensor, string>();
+        private static readonly List<SensorEntry> AllSensors = new List<SensorEntry>();
+        private static int SensorSignature = -1;
 
         private static int Main(string[] args)
         {
             bool useShm = false;
             string outPath = "cfg\\sensors\\hwbridge.txt";
             int refreshSeconds = DefaultRefreshSeconds;
+            List<string> positional = new List<string>();
 
-            if (args.Length > 0)
+            for (int i = 0; i < args.Length; i++)
             {
-                if (args[0] == "--shm")
+                string arg = args[i];
+                if (arg == "--shm")
                 {
                     useShm = true;
                 }
+                else if (arg == "--raw")
+                {
+                    Raw = true;
+                }
+                else if (arg == "--verbose")
+                {
+                    Verbose = true;
+                }
+                else if (arg.StartsWith("--", StringComparison.Ordinal))
+                {
+                    Console.Error.WriteLine("HwBridge: unknown flag '" + arg + "' ignored (known: --shm, --raw, --verbose).");
+                }
                 else
                 {
-                    outPath = args[0];
+                    positional.Add(arg);
                 }
             }
-            if (args.Length > 1)
-            {
-                refreshSeconds = ParseRefresh(args[1]);
-            }
 
-            string outDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
-            Directory.CreateDirectory(outDir);
+            int next = 0;
+            if (!useShm && positional.Count > next)
+            {
+                outPath = positional[next++];
+            }
+            if (positional.Count > next)
+            {
+                refreshSeconds = ParseRefresh(positional[next]);
+            }
 
             if (useShm)
             {
@@ -140,6 +185,8 @@ namespace HwBridge
             }
             else
             {
+                string outDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
+                Directory.CreateDirectory(outDir);
                 Console.WriteLine("HwBridge: writing to " + Path.GetFullPath(outPath) + " every " + refreshSeconds + "s. Ctrl+C to stop.");
             }
             Console.WriteLine("HwBridge: this needs Administrator privileges to read hardware sensors via PawnIO.");
@@ -161,6 +208,8 @@ namespace HwBridge
             }
 
             UpdateVisitor visitor = new UpdateVisitor();
+            int lastLoggedCount = -1;
+            string lastError = null;
 
             while (true)
             {
@@ -168,35 +217,51 @@ namespace HwBridge
                 {
                     computer.Accept(visitor);
 
-                    List<SensorEntry> allSensors = new List<SensorEntry>();
-                    CollectSensors(computer.Hardware, allSensors);
-
-                    Dictionary<string, string> values = new Dictionary<string, string>();
-
-                    // Dump every individual sensor too, under a descriptive raw key --
-                    // useful for inspecting the real sensor names on this hardware and
-                    // refining the "best pick" logic below if it guesses wrong.
-                    for (int i = 0; i < allSensors.Count; i++)
+                    // Sensors can appear after the first Update, so re-collect
+                    // whenever the hardware/sensor totals change.
+                    int signature = CountSensors(computer.Hardware);
+                    if (signature != SensorSignature)
                     {
-                        SensorEntry entry = allSensors[i];
-                        if (!entry.Sensor.Value.HasValue)
+                        AllSensors.Clear();
+                        RawKeys.Clear();
+                        CollectSensors(computer.Hardware, AllSensors);
+                        SensorSignature = signature;
+                    }
+
+                    Values.Clear();
+
+                    // Optional diagnostics: every individual sensor under a
+                    // descriptive raw key, to inspect the real sensor names
+                    // on this hardware and refine the "best pick" logic.
+                    if (Raw)
+                    {
+                        for (int i = 0; i < AllSensors.Count; i++)
                         {
-                            continue;
+                            SensorEntry entry = AllSensors[i];
+                            if (!entry.Sensor.Value.HasValue)
+                            {
+                                continue;
+                            }
+                            string rawKey;
+                            if (!RawKeys.TryGetValue(entry.Sensor, out rawKey))
+                            {
+                                rawKey = "hw_" + entry.Hardware.HardwareType + "_" + entry.Sensor.SensorType + "_" + Sanitize(entry.Sensor.Name);
+                                RawKeys[entry.Sensor] = rawKey;
+                            }
+                            Values[rawKey] = entry.Sensor.Value.Value.ToString("F1", CultureInfo.InvariantCulture);
                         }
-                        string rawKey = "hw_" + entry.Hardware.HardwareType + "_" + entry.Sensor.SensorType + "_" + Sanitize(entry.Sensor.Name);
-                        values[rawKey] = entry.Sensor.Value.Value.ToString("F1", CultureInfo.InvariantCulture);
                     }
 
                     // Best-effort picks matching AOOSTAR-X's own panel label names directly,
                     // so no extra sensor-mapping.cfg entry is needed for these.
-                    AddBestPick(values, allSensors, "cpu_temperature", HardwareType.Cpu, SensorType.Temperature,
+                    AddBestPick(Values, AllSensors, "cpu_temperature", HardwareType.Cpu, SensorType.Temperature,
                         new string[] { "Package", "Tctl", "Tdie", "Core (Tctl", "CPU Core" });
 
-                    bool haveMobo = AddBestPick(values, allSensors, "motherboard_temperature", HardwareType.Motherboard, SensorType.Temperature,
+                    bool haveMobo = AddBestPick(Values, AllSensors, "motherboard_temperature", HardwareType.Motherboard, SensorType.Temperature,
                         new string[] { "System", "Motherboard", "CPU" });
                     if (!haveMobo)
                     {
-                        AddBestPick(values, allSensors, "motherboard_temperature", HardwareType.SuperIO, SensorType.Temperature,
+                        AddBestPick(Values, AllSensors, "motherboard_temperature", HardwareType.SuperIO, SensorType.Temperature,
                             new string[] { "System", "Motherboard", "CPU" });
                     }
 
@@ -204,47 +269,66 @@ namespace HwBridge
                     // matching AOOSTAR-X's "Average Temperature". A plain highest-value
                     // pick would grab the SPD hub's "Thermal Sensor Critical High Limit"
                     // (a fixed 85 C threshold), not a real temperature.
-                    AddAverage(values, allSensors, "memory_Temperature", HardwareType.Memory, SensorType.Temperature, "DIMM");
+                    AddAverage(Values, AllSensors, "memory_Temperature", HardwareType.Memory, SensorType.Temperature, "DIMM");
 
-                    AddBestPick(values, allSensors, "gpu_core", HardwareType.GpuNvidia, SensorType.Load, new string[] { "GPU Core", "D3D" });
-                    AddBestPick(values, allSensors, "gpu_temperature", HardwareType.GpuNvidia, SensorType.Temperature, new string[] { "GPU Core", "GPU Hot Spot" });
-                    AddBestPick(values, allSensors, "gpu_core", HardwareType.GpuAmd, SensorType.Load, new string[] { "GPU Core", "D3D" });
-                    AddBestPick(values, allSensors, "gpu_temperature", HardwareType.GpuAmd, SensorType.Temperature, new string[] { "GPU Core", "GPU Hot Spot" });
-                    AddBestPick(values, allSensors, "gpu_core", HardwareType.GpuIntel, SensorType.Load, new string[] { "GPU Core", "D3D" });
-                    AddBestPick(values, allSensors, "gpu_temperature", HardwareType.GpuIntel, SensorType.Temperature, new string[] { "GPU Core", "GPU Hot Spot" });
+                    AddBestPick(Values, AllSensors, "gpu_core", HardwareType.GpuNvidia, SensorType.Load, GpuLoadPrefs);
+                    AddBestPick(Values, AllSensors, "gpu_temperature", HardwareType.GpuNvidia, SensorType.Temperature, GpuTempPrefs);
+                    AddBestPick(Values, AllSensors, "gpu_core", HardwareType.GpuAmd, SensorType.Load, GpuLoadPrefs);
+                    AddBestPick(Values, AllSensors, "gpu_temperature", HardwareType.GpuAmd, SensorType.Temperature, GpuTempPrefs);
+                    AddBestPick(Values, AllSensors, "gpu_core", HardwareType.GpuIntel, SensorType.Load, GpuLoadPrefs);
+                    AddBestPick(Values, AllSensors, "gpu_temperature", HardwareType.GpuIntel, SensorType.Temperature, GpuTempPrefs);
 
                     if (useShm)
                     {
-                        WriteSharedMemory(values);
+                        WriteSharedMemory(Values);
                     }
                     else
                     {
-                        WriteAtomic(outPath, values);
+                        WriteAtomic(outPath, Values);
                     }
 
-                    string summary = "[" + DateTime.Now.ToString("HH:mm:ss") + "] wrote " + values.Count + " sensors";
-                    if (values.ContainsKey("cpu_temperature"))
+                    // Log the first success, count changes and recovery from
+                    // an error; every tick only with --verbose.
+                    if (Verbose || lastLoggedCount != Values.Count)
                     {
-                        summary += ", cpu_temperature=" + values["cpu_temperature"];
+                        string summary = "[" + DateTime.Now.ToString("HH:mm:ss") + "] wrote " + Values.Count + " sensors";
+                        string v;
+                        if (Values.TryGetValue("cpu_temperature", out v))
+                        {
+                            summary += ", cpu_temperature=" + v;
+                        }
+                        if (Values.TryGetValue("gpu_core", out v))
+                        {
+                            summary += ", gpu_core=" + v;
+                        }
+                        if (Values.TryGetValue("gpu_temperature", out v))
+                        {
+                            summary += ", gpu_temperature=" + v;
+                        }
+                        Console.WriteLine(summary);
+                        lastLoggedCount = Values.Count;
                     }
-                    if (values.ContainsKey("gpu_core"))
-                    {
-                        summary += ", gpu_core=" + values["gpu_core"];
-                    }
-                    if (values.ContainsKey("gpu_temperature"))
-                    {
-                        summary += ", gpu_temperature=" + values["gpu_temperature"];
-                    }
-                    Console.WriteLine(summary);
+                    lastError = null;
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine("HwBridge: update error: " + ex.Message);
+                    // Drop the shared memory handles so the next tick reopens
+                    // them; repeated identical errors are logged once.
+                    CloseSharedMemory();
+                    lastLoggedCount = -1;
+                    if (lastError != ex.Message)
+                    {
+                        Console.Error.WriteLine("HwBridge: update error: " + ex.Message);
+                        lastError = ex.Message;
+                    }
                 }
 
                 Thread.Sleep(refreshSeconds * 1000);
             }
         }
+
+        private static readonly string[] GpuLoadPrefs = new string[] { "GPU Core", "D3D" };
+        private static readonly string[] GpuTempPrefs = new string[] { "GPU Core", "GPU Hot Spot" };
 
         // Parses a refresh interval argument, falling back to the default
         // (with a warning) when it is not one of the allowed values.
@@ -265,6 +349,18 @@ namespace HwBridge
             return DefaultRefreshSeconds;
         }
 
+        // Cheap change detector: total hardware + sensor count over the tree.
+        private static int CountSensors(IList<IHardware> hardwareList)
+        {
+            int total = 0;
+            for (int i = 0; i < hardwareList.Count; i++)
+            {
+                IHardware hw = hardwareList[i];
+                total += 1 + hw.Sensors.Length + CountSensors(hw.SubHardware);
+            }
+            return total;
+        }
+
         private static void CollectSensors(IList<IHardware> hardwareList, List<SensorEntry> into)
         {
             for (int i = 0; i < hardwareList.Count; i++)
@@ -279,43 +375,45 @@ namespace HwBridge
             }
         }
 
+        private static bool Matches(SensorEntry entry, HardwareType hwType, SensorType sensorType)
+        {
+            return entry.Hardware.HardwareType == hwType && entry.Sensor.SensorType == sensorType && entry.Sensor.Value.HasValue;
+        }
+
         private static bool AddBestPick(Dictionary<string, string> values, List<SensorEntry> all,
             string outKey, HardwareType hwType, SensorType sensorType, string[] namePreferences)
         {
-            List<ISensor> candidates = new List<ISensor>();
-            for (int i = 0; i < all.Count; i++)
-            {
-                SensorEntry entry = all[i];
-                if (entry.Hardware.HardwareType == hwType && entry.Sensor.SensorType == sensorType && entry.Sensor.Value.HasValue)
-                {
-                    candidates.Add(entry.Sensor);
-                }
-            }
-            if (candidates.Count == 0)
-            {
-                return false;
-            }
-
+            // First sensor (in collection order) matching the earliest
+            // name preference wins.
             for (int p = 0; p < namePreferences.Length; p++)
             {
                 string pref = namePreferences[p];
-                for (int c = 0; c < candidates.Count; c++)
+                for (int i = 0; i < all.Count; i++)
                 {
-                    if (candidates[c].Name.IndexOf(pref, StringComparison.OrdinalIgnoreCase) >= 0)
+                    SensorEntry entry = all[i];
+                    if (Matches(entry, hwType, sensorType)
+                        && entry.Sensor.Name.IndexOf(pref, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        values[outKey] = candidates[c].Value.Value.ToString("F1", CultureInfo.InvariantCulture);
+                        values[outKey] = entry.Sensor.Value.Value.ToString("F1", CultureInfo.InvariantCulture);
                         return true;
                     }
                 }
             }
 
-            ISensor best = candidates[0];
-            for (int c = 1; c < candidates.Count; c++)
+            // No preference matched: fall back to the highest value.
+            ISensor best = null;
+            for (int i = 0; i < all.Count; i++)
             {
-                if (candidates[c].Value.Value > best.Value.Value)
+                SensorEntry entry = all[i];
+                if (Matches(entry, hwType, sensorType)
+                    && (best == null || entry.Sensor.Value.Value > best.Value.Value))
                 {
-                    best = candidates[c];
+                    best = entry.Sensor;
                 }
+            }
+            if (best == null)
+            {
+                return false;
             }
             values[outKey] = best.Value.Value.ToString("F1", CultureInfo.InvariantCulture);
             return true;
@@ -381,6 +479,65 @@ namespace HwBridge
             File.Move(tmpPath, outPath);
         }
 
+        // Opens (once) the shared region and slot view, seeding Sequence from
+        // whatever the slot already holds. Keeping the handles open also
+        // keeps the pagefile-backed section alive when no reader has it open.
+        private static void EnsureSharedMemory()
+        {
+            if (SharedView != null)
+            {
+                return;
+            }
+            MemoryMappedFile mmf = null;
+            MemoryMappedViewAccessor view = null;
+            try
+            {
+                mmf = MemoryMappedFile.CreateOrOpen(RegionName, RegionSize, MemoryMappedFileAccess.ReadWrite);
+                view = mmf.CreateViewAccessor(SlotOffset, SlotSize);
+
+                // Never go backwards: readers treat an unchanged sequence as
+                // "no new data". Round up to even (a crashed writer may have
+                // left an odd in-progress value).
+                if (view.ReadUInt32(MagicOffset) == Magic)
+                {
+                    long existing = (long)view.ReadUInt64(SequenceOffset);
+                    existing += existing & 1;
+                    if (existing > Sequence)
+                    {
+                        Sequence = existing;
+                    }
+                }
+            }
+            catch
+            {
+                if (view != null)
+                {
+                    view.Dispose();
+                }
+                if (mmf != null)
+                {
+                    mmf.Dispose();
+                }
+                throw;
+            }
+            SharedMmf = mmf;
+            SharedView = view;
+        }
+
+        private static void CloseSharedMemory()
+        {
+            if (SharedView != null)
+            {
+                try { SharedView.Dispose(); } catch { }
+                SharedView = null;
+            }
+            if (SharedMmf != null)
+            {
+                try { SharedMmf.Dispose(); } catch { }
+                SharedMmf = null;
+            }
+        }
+
         // Serializes the sensor values into the "label: value\n" payload and
         // publishes it into slot 0 of the AOOSTAR_HW_STATS shared memory
         // region. Odd/even seqlock: the sequence is first written as the odd
@@ -388,7 +545,8 @@ namespace HwBridge
         // so readers never observe a half-written snapshot.
         private static void WriteSharedMemory(Dictionary<string, string> values)
         {
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = PayloadBuilder;
+            sb.Length = 0;
             Dictionary<string, string>.Enumerator e = values.GetEnumerator();
             while (e.MoveNext())
             {
@@ -406,37 +564,28 @@ namespace HwBridge
                 payload = truncated;
             }
 
+            EnsureSharedMemory();
+            MemoryMappedViewAccessor view = SharedView;
+
             long nowMs = (long)(DateTime.UtcNow - UnixEpoch).TotalMilliseconds;
             long newSeq = Sequence + 2; // even: snapshot-complete value
 
-            MemoryMappedFile mmf = MemoryMappedFile.CreateOrOpen(RegionName, RegionSize, MemoryMappedFileAccess.ReadWrite);
-            try
-            {
-                using (MemoryMappedViewAccessor view = mmf.CreateViewAccessor(SlotOffset, SlotSize))
-                {
-                    // 1. Mark the snapshot as in progress (odd).
-                    view.Write(SequenceOffset, newSeq - 1);
-                    Thread.MemoryBarrier();
+            // 1. Mark the snapshot as in progress (odd).
+            view.Write(SequenceOffset, newSeq - 1);
+            Thread.MemoryBarrier();
 
-                    // 2. Header + payload.
-                    view.Write(MagicOffset, Magic);
-                    view.Write(VersionOffset, Version);
-                    view.Write(TimestampOffset, nowMs);
-                    view.WriteArray<byte>(PayloadOffset, payload, 0, payload.Length);
-                    view.Write(PayloadLenOffset, payload.Length);
+            // 2. Header + payload.
+            view.Write(MagicOffset, Magic);
+            view.Write(VersionOffset, Version);
+            view.Write(TimestampOffset, nowMs);
+            view.WriteArray<byte>(PayloadOffset, payload, 0, payload.Length);
+            view.Write(PayloadLenOffset, payload.Length);
 
-                    // 3. Publish: store the final even value. The barrier
-                    // makes all payload writes visible before the bump the
-                    // readers synchronize on.
-                    Thread.MemoryBarrier();
-                    view.Write(SequenceOffset, newSeq);
-                    Sequence = newSeq;
-                }
-            }
-            finally
-            {
-                mmf.Dispose();
-            }
+            // 3. Publish: store the final even value. The barrier makes all
+            // payload writes visible before the bump readers synchronize on.
+            Thread.MemoryBarrier();
+            view.Write(SequenceOffset, newSeq);
+            Sequence = newSeq;
         }
     }
 }
