@@ -143,7 +143,7 @@ fn run_demo(
             renderer.set_save_progress_layer(save_images);
 
             match renderer.render(panel, &demo_values) {
-                Ok(image) => screen.send_image(&image)?,
+                Ok(image) => screen.send_image(image)?,
                 Err(e) => error!("Error rendering panel '{}': {e:?}", panel.friendly_name()),
             }
         } else {

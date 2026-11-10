@@ -12,6 +12,7 @@ use asterctl::{cfg, img};
 use asterctl_lcd::{AooScreen, AooScreenBuilder, DISPLAY_SIZE};
 
 use anyhow::anyhow;
+use chrono::Local;
 use clap::Parser;
 use env_logger::Env;
 use log::{debug, error, info};
@@ -412,7 +413,7 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         None
     };
 
-    let refresh = Duration::from_millis((cfg.setup.refresh * 1000f32) as u64);
+    let refresh = cfg.setup.refresh_interval();
 
     let switch_time = cfg
         .setup
@@ -422,13 +423,26 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         .map(|v| Duration::from_millis((v * 1000.0) as u64))
         .unwrap_or(Duration::from_secs(5));
 
+    // Skips rendering and sending frames whose content did not change.
+    let mut frame_gate = FrameGate::default();
+    let mut render_error_log = RepeatLogLimiter::default();
+    // Identity (address) of the panel currently shown.
+    let mut current_panel: Option<usize> = None;
+
     // panel switching loop
     loop {
         let panel = cfg
             .get_next_active_panel()
             .ok_or(anyhow!("No active panel"))?;
 
-        info!("Switching panel: {}", panel.friendly_name());
+        let panel_id = panel as *const Panel as usize;
+        if current_panel != Some(panel_id) {
+            info!("Switching panel: {}", panel.friendly_name());
+            current_panel = Some(panel_id);
+            frame_gate.invalidate();
+        } else {
+            debug!("Keeping panel: {}", panel.friendly_name());
+        }
         let panel_switch_time = Instant::now();
 
         // active panel refresh loop
@@ -452,6 +466,10 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                 }
                 skip_render = !display_on;
             }
+            if skip_render {
+                // the display must be refreshed once it is switched on again
+                frame_gate.invalidate();
+            }
 
             if !skip_render {
                 if img_save_path.is_some() {
@@ -464,22 +482,53 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                     let mut values = sensor_values.write().expect("RwLock is poisoned");
                     provider.update(&mut *values);
                 }
+                // Render under the read lock, but release it before the
+                // (possibly multi-second) serial transfer so the sensor file
+                // watcher is never blocked by display I/O.
+                let now = Local::now();
                 let values = sensor_values.read().expect("RwLock is poisoned");
-                if let Err(e) = update_panel(screen, &mut renderer, panel, &values) {
-                    // Serial communication failed (e.g. after resume). Don't
-                    // exit — drop the stale handle, reopen + re-init the port
-                    // with backoff, and continue the panel loop. The frame cache
-                    // was cleared by `reconnect`, so the next send is a full
-                    // frame that repairs whatever the display was left showing.
-                    // Report the failure so the launcher can escalate (USB
-                    // remove+rescan) instead of letting the backoff loop spin
-                    // against a panel that needs a USB-level reset.
-                    error!("Display communication failed: {e:?} — reconnecting with backoff");
-                    report_stuck_if_set(stuck_file.as_deref());
-                    screen.reconnect_with_retry();
-                    clear_stuck_if_set(stuck_file.as_deref());
+                let key = renderer.content_key(panel, &values, &now);
+                if img_save_path.is_none()
+                    && !frame_gate.needs_send(key, screen.generation(), Instant::now())
+                {
+                    drop(values);
+                    debug!("Panel content unchanged, frame skipped");
+                } else {
+                    debug!("Displaying panel '{}'...", panel.friendly_name());
+                    let rendered = renderer.render_at(panel, &values, &now);
+                    drop(values);
+                    match rendered {
+                        Ok(image) => match screen.send_image(image) {
+                            Ok(()) => frame_gate.sent(key, screen.generation(), Instant::now()),
+                            Err(e) => {
+                                // Serial communication failed (e.g. after resume).
+                                // Don't exit — drop the stale handle, reopen +
+                                // re-init the port with backoff, and continue the
+                                // panel loop. The frame cache was cleared by
+                                // `reconnect` (and the screen generation changed),
+                                // so the next send is a full frame that repairs
+                                // whatever the display was left showing. Report
+                                // the failure so the launcher can escalate (USB
+                                // remove+rescan) instead of letting the backoff
+                                // loop spin against a panel that needs a USB-level
+                                // reset.
+                                error!(
+                                    "Display communication failed: {e:?} — reconnecting with backoff"
+                                );
+                                report_stuck_if_set(stuck_file.as_deref());
+                                screen.reconnect_with_retry();
+                                clear_stuck_if_set(stuck_file.as_deref());
+                            }
+                        },
+                        Err(e) => {
+                            let msg =
+                                format!("Error rendering panel '{}': {e:?}", panel.friendly_name());
+                            if render_error_log.should_log(&msg, Instant::now()) {
+                                error!("{msg}");
+                            }
+                        }
+                    }
                 }
-                drop(values);
             }
 
             let elapsed = upd_start_time.elapsed();
@@ -505,6 +554,9 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                             );
                             return Ok(());
                         }
+                        if !display_on {
+                            frame_gate.invalidate();
+                        }
                     }
                 } else {
                     sleep(remaining);
@@ -520,6 +572,72 @@ fn run_sensor_panel<B: Into<PathBuf>>(
     }
 }
 
+/// Longest time an unchanged frame is skipped: after this, the frame is
+/// rendered and sent again even if no sensor value changed. Unchanged image
+/// blocks are still skipped by the screen's diff cache, so this resend is
+/// only the frame headers on the wire — enough to notice a serial port that
+/// went stale (e.g. after resume) within seconds and reconnect, and to keep
+/// the panel seeing regular traffic as it did with per-tick sends.
+const FORCED_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Skip-unchanged logic for the panel loop: a frame is only rendered and
+/// sent when its content key changed, the display needs a refresh (screen
+/// generation changed, e.g. after a reconnect, or the gate was invalidated
+/// by a panel switch / display off), or [`FORCED_RESEND_INTERVAL`] passed.
+#[derive(Debug, Default)]
+struct FrameGate {
+    /// (content key, screen generation, time) of the last frame sent.
+    last_sent: Option<(u64, u64, Instant)>,
+}
+
+impl FrameGate {
+    /// Forget the last frame: the next one is sent unconditionally.
+    fn invalidate(&mut self) {
+        self.last_sent = None;
+    }
+
+    /// Whether a frame with content `key` must be rendered and sent.
+    fn needs_send(&self, key: u64, generation: u64, now: Instant) -> bool {
+        match self.last_sent {
+            Some((last_key, last_generation, at)) => {
+                last_key != key
+                    || last_generation != generation
+                    || now.saturating_duration_since(at) >= FORCED_RESEND_INTERVAL
+            }
+            None => true,
+        }
+    }
+
+    /// Record a successfully sent frame.
+    fn sent(&mut self, key: u64, generation: u64, now: Instant) {
+        self.last_sent = Some((key, generation, now));
+    }
+}
+
+/// How often an identical error message is repeated in the log.
+const REPEAT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for an error that would otherwise be logged on every frame:
+/// a new message is logged at once, the same message again only after
+/// [`REPEAT_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct RepeatLogLimiter {
+    last: Option<(String, Instant)>,
+}
+
+impl RepeatLogLimiter {
+    fn should_log(&mut self, msg: &str, now: Instant) -> bool {
+        if let Some((last_msg, at)) = &self.last
+            && last_msg == msg
+            && now.saturating_duration_since(*at) < REPEAT_LOG_INTERVAL
+        {
+            return false;
+        }
+        self.last = Some((msg.to_string(), now));
+        true
+    }
+}
+
 /// How long the display-state file may go without being rewritten before
 /// asterctl considers its writer (aster-launcher) dead. The launcher
 /// rewrites the file roughly every 2s while it runs; keep this at a
@@ -531,21 +649,33 @@ const LAUNCHER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// quickly even when the panel refresh interval is long (up to 30s).
 const STATE_POLL_STEP: Duration = Duration::from_secs(1);
 
-/// Reads the display-state file written by aster-launcher. Returns `true`
-/// when the display should be on. A missing or unreadable file means "on":
-/// launchers without this feature never write the file, and a transient
-/// read error must not blank the display.
-fn read_display_state(path: &Path) -> bool {
+/// Reads the display-state file written by aster-launcher. Returns
+/// `Some(true)` when the display should be on, `Some(false)` for off and
+/// `None` when the file is empty (keep the current state).
+///
+/// A missing or unreadable file means "on": launchers without this feature
+/// never write the file, and a transient read error must not blank the
+/// display.
+fn read_display_state(path: &Path) -> Option<bool> {
     match std::fs::read_to_string(path) {
-        Ok(text) => display_state_text_is_on(&text),
-        Err(_) => true,
+        Ok(text) => display_state_from_text(&text),
+        Err(_) => Some(true),
     }
 }
 
 /// Parses the content of a display-state file: exactly `off` (after
-/// trimming) turns the display off; anything else keeps it on.
-fn display_state_text_is_on(text: &str) -> bool {
-    text.trim() != "off"
+/// trimming) turns the display off, empty or whitespace-only content keeps
+/// the current state (`None`), anything else turns it on.
+///
+/// Empty content is what a read sees between the launcher truncating and
+/// rewriting the file; treating it as "on" flashed the display on while it
+/// was supposed to stay off.
+fn display_state_from_text(text: &str) -> Option<bool> {
+    match text.trim() {
+        "" => None,
+        "off" => Some(false),
+        _ => Some(true),
+    }
 }
 
 /// True when the display-state file's writer (aster-launcher) is gone:
@@ -606,7 +736,7 @@ fn poll_display_state(
         return false;
     }
 
-    let want_on = read_display_state(state_file);
+    let want_on = read_display_state(state_file).unwrap_or(*display_on);
     if want_on != *display_on {
         let (action, result) = if want_on {
             ("on", screen.on())
@@ -631,22 +761,6 @@ fn poll_display_state(
         }
     }
     true
-}
-
-fn update_panel(
-    screen: &mut AooScreen,
-    renderer: &mut PanelRenderer,
-    panel: &Panel,
-    values: &HashMap<String, String>,
-) -> anyhow::Result<()> {
-    debug!("Displaying panel '{}'...", panel.friendly_name());
-
-    match renderer.render(panel, values) {
-        Ok(image) => screen.send_image(&image)?,
-        Err(e) => error!("Error rendering panel '{}': {e:?}", panel.friendly_name()),
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -750,25 +864,34 @@ mod tests {
 
     #[test]
     fn display_state_text_off_turns_display_off() {
-        assert!(!display_state_text_is_on("off\n"));
-        assert!(!display_state_text_is_on("off"));
-        assert!(!display_state_text_is_on("  off  \n"));
+        assert_eq!(display_state_from_text("off\n"), Some(false));
+        assert_eq!(display_state_from_text("off"), Some(false));
+        assert_eq!(display_state_from_text("  off  \n"), Some(false));
     }
 
     #[test]
-    fn display_state_text_on_or_garbage_keeps_display_on() {
-        assert!(display_state_text_is_on("on\n"));
-        assert!(display_state_text_is_on("on"));
-        assert!(display_state_text_is_on(""));
-        assert!(display_state_text_is_on("garbage"));
+    fn display_state_text_on_or_garbage_turns_display_on() {
+        assert_eq!(display_state_from_text("on\n"), Some(true));
+        assert_eq!(display_state_from_text("on"), Some(true));
+        assert_eq!(display_state_from_text("garbage"), Some(true));
         // case-sensitive: anything but exactly "off" means on
-        assert!(display_state_text_is_on("OFF"));
+        assert_eq!(display_state_from_text("OFF"), Some(true));
+    }
+
+    #[test]
+    fn display_state_text_empty_keeps_current_state() {
+        // a read between the launcher's truncate and write
+        assert_eq!(display_state_from_text(""), None);
+        assert_eq!(display_state_from_text(" \n\t"), None);
     }
 
     #[test]
     fn read_display_state_missing_file_keeps_display_on() {
         let dir = tempdir().unwrap();
-        assert!(read_display_state(&dir.path().join("no-such-file")));
+        assert_eq!(
+            read_display_state(&dir.path().join("no-such-file")),
+            Some(true)
+        );
     }
 
     #[test]
@@ -776,9 +899,97 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("display.state");
         fs::write(&path, "off\n").unwrap();
-        assert!(!read_display_state(&path));
+        assert_eq!(read_display_state(&path), Some(false));
         fs::write(&path, "on\n").unwrap();
-        assert!(read_display_state(&path));
+        assert_eq!(read_display_state(&path), Some(true));
+        fs::write(&path, "").unwrap();
+        assert_eq!(read_display_state(&path), None);
+    }
+
+    #[test]
+    fn display_stays_off_while_state_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        let mut screen = AooScreenBuilder::new()
+            .simulate_with_port(asterctl_lcd::FakeSerialPort::new().without_delay())
+            .unwrap();
+        let mut display_on = true;
+        fs::write(&path, "off\n").unwrap();
+        assert!(poll_display_state(
+            &mut screen,
+            &path,
+            None,
+            &mut display_on
+        ));
+        assert!(!display_on);
+        // truncated by the launcher, not yet rewritten
+        fs::write(&path, "").unwrap();
+        assert!(poll_display_state(
+            &mut screen,
+            &path,
+            None,
+            &mut display_on
+        ));
+        assert!(
+            !display_on,
+            "empty state file must not switch the display on"
+        );
+        fs::write(&path, "on\n").unwrap();
+        assert!(poll_display_state(
+            &mut screen,
+            &path,
+            None,
+            &mut display_on
+        ));
+        assert!(display_on);
+    }
+
+    #[test]
+    fn frame_gate_sends_first_and_changed_frames_only() {
+        let t0 = Instant::now();
+        let mut gate = FrameGate::default();
+        assert!(gate.needs_send(1, 0, t0), "first frame");
+        gate.sent(1, 0, t0);
+        assert!(!gate.needs_send(1, 0, t0 + Duration::from_secs(1)));
+        assert!(
+            gate.needs_send(2, 0, t0 + Duration::from_secs(1)),
+            "content"
+        );
+        assert!(
+            gate.needs_send(1, 1, t0 + Duration::from_secs(1)),
+            "reconnect"
+        );
+    }
+
+    #[test]
+    fn frame_gate_forces_periodic_resend() {
+        let t0 = Instant::now();
+        let mut gate = FrameGate::default();
+        gate.sent(7, 3, t0);
+        let just_before = t0 + FORCED_RESEND_INTERVAL - Duration::from_millis(1);
+        assert!(!gate.needs_send(7, 3, just_before));
+        assert!(gate.needs_send(7, 3, t0 + FORCED_RESEND_INTERVAL));
+    }
+
+    #[test]
+    fn frame_gate_invalidate_forces_send() {
+        let t0 = Instant::now();
+        let mut gate = FrameGate::default();
+        gate.sent(7, 3, t0);
+        gate.invalidate();
+        assert!(gate.needs_send(7, 3, t0));
+    }
+
+    #[test]
+    fn repeat_log_limiter_dedupes_identical_messages() {
+        let t0 = Instant::now();
+        let mut limiter = RepeatLogLimiter::default();
+        assert!(limiter.should_log("a", t0));
+        assert!(!limiter.should_log("a", t0 + Duration::from_secs(1)));
+        assert!(limiter.should_log("b", t0 + Duration::from_secs(2)));
+        assert!(limiter.should_log("a", t0 + Duration::from_secs(3)));
+        assert!(!limiter.should_log("a", t0 + Duration::from_secs(4)));
+        assert!(limiter.should_log("a", t0 + Duration::from_secs(3) + REPEAT_LOG_INTERVAL));
     }
 
     #[test]
