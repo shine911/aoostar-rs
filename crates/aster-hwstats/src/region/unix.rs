@@ -3,9 +3,19 @@
 
 //! POSIX backend: a named shared-memory object (`shm_open`/`mmap`).
 //!
-//! Used to exercise the protocol with real OS shared memory in unit tests on
-//! Linux (the production path is Windows). The creator unlinks the name on
-//! drop; openers of an existing object do not.
+//! Used by the Linux launcher's children (`aster-sysinfo --shm` writes,
+//! `asterctl --shm` reads) and to exercise the protocol with real OS shared
+//! memory in unit tests.
+//!
+//! The name is never unlinked in production. Unlike a Windows named
+//! mapping, which lives exactly as long as some process holds a handle, a
+//! POSIX object whose name is unlinked keeps existing only for the
+//! processes that already mapped it: if the creator (say asterctl) unlinked
+//! it on a clean exit while aster-sysinfo kept writing, the respawned
+//! asterctl would create a *new* object and never see sysinfo's data again.
+//! Leaving the name in place costs one 128 KiB object on tmpfs (`/dev/shm`)
+//! until reboot; the next writer simply overwrites its slot. Only tests use
+//! [`Mapping::open_scoped`], which unlinks an object it created on drop.
 
 use std::ffi::CString;
 use std::io;
@@ -27,14 +37,29 @@ unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
+    /// Opens (or creates) the named object; never unlinks it (see the
+    /// module docs).
     pub fn open(name: &str, size: usize) -> Result<Self, Error> {
+        Self::open_inner(name, size, false)
+    }
+
+    /// Like [`Mapping::open`], but unlinks the name on drop if this call
+    /// created the object, so unit tests with unique names do not leak
+    /// objects into `/dev/shm`.
+    #[cfg(test)]
+    pub fn open_scoped(name: &str, size: usize) -> Result<Self, Error> {
+        Self::open_inner(name, size, true)
+    }
+
+    fn open_inner(name: &str, size: usize, unlink_if_created: bool) -> Result<Self, Error> {
         let mut full = String::with_capacity(name.len() + 1);
         full.push('/');
         full.push_str(name);
         let cname = CString::new(full).map_err(|_| Error::InvalidName)?;
 
-        // Try to create first, so we know whether to unlink on drop; fall
-        // back to opening when the object already exists.
+        // Try to create first, so we know whether we own the name (only
+        // relevant to `open_scoped`); fall back to opening when the object
+        // already exists.
         let mut fd = unsafe {
             libc::shm_open(
                 cname.as_ptr(),
@@ -42,7 +67,7 @@ impl Mapping {
                 0o600,
             )
         };
-        let mut unlink_on_drop = true;
+        let mut created = true;
         if fd < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::EEXIST) {
@@ -52,14 +77,16 @@ impl Mapping {
             if fd < 0 {
                 return Err(Error::os(io::Error::last_os_error()));
             }
-            unlink_on_drop = false;
+            created = false;
         }
+        // On a setup failure an object this call just created is removed
+        // again in any mode: it was never usable, so nobody depends on it.
 
         if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
             let err = io::Error::last_os_error();
             // SAFETY: `fd` is open.
             unsafe { libc::close(fd) };
-            if unlink_on_drop {
+            if created {
                 // SAFETY: `cname` is a valid C string.
                 unsafe { libc::shm_unlink(cname.as_ptr()) };
             }
@@ -82,7 +109,7 @@ impl Mapping {
 
         if ptr == MAP_FAILED {
             let err = io::Error::last_os_error();
-            if unlink_on_drop {
+            if created {
                 // SAFETY: `cname` is a valid C string.
                 unsafe { libc::shm_unlink(cname.as_ptr()) };
             }
@@ -93,7 +120,7 @@ impl Mapping {
             ptr: ptr.cast::<u8>(),
             len: size,
             name: cname,
-            unlink_on_drop,
+            unlink_on_drop: created && unlink_if_created,
         })
     }
 
@@ -117,5 +144,15 @@ impl Drop for Mapping {
             // SAFETY: `name` is a valid C string.
             unsafe { libc::shm_unlink(self.name.as_ptr()) };
         }
+    }
+}
+
+/// Removes the object `name` (test cleanup for objects opened without
+/// [`Mapping::open_scoped`]).
+#[cfg(test)]
+pub fn unlink(name: &str) {
+    if let Ok(cname) = CString::new(format!("/{name}")) {
+        // SAFETY: `cname` is a valid C string.
+        unsafe { libc::shm_unlink(cname.as_ptr()) };
     }
 }

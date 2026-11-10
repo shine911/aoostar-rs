@@ -18,9 +18,11 @@
 //! system sleep — a plain display-power poll would miss those.
 //!
 //! The state file doubles as the launcher's heartbeat: the tray loop
-//! rewrites it roughly every 2s ([`DisplayControl::heartbeat`]), and
-//! asterctl switches the display off — and exits — when the file goes
-//! stale, so a closed or killed launcher never leaves the LCD stuck on.
+//! refreshes its mtime roughly every 2s ([`DisplayControl::heartbeat`];
+//! the content is rewritten — atomically — only when the on/off state
+//! changes, see [`sync_state_file`]), and asterctl switches the display
+//! off — and exits — when the file goes stale, so a closed or killed
+//! launcher never leaves the LCD stuck on.
 //! On a clean launcher shutdown [`DisplayControl::force_off`] blanks the
 //! display before asterctl is killed; while the machine sleeps
 //! [`DisplayControl::suspend`] does the same (the heartbeat keeps writing
@@ -89,15 +91,126 @@ pub(crate) fn display_state_is_on(state: u8) -> bool {
     state != 0
 }
 
-/// Writes `cfg/display.state` (`on\n` / `off\n`), creating the parent
-/// directory if needed. `asterctl --display-state` polls this file and
-/// switches the LCD accordingly.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn write_state_file(path: &Path, on: bool) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Content of `cfg/display.state` for a state: `on\n` / `off\n`.
+fn state_text(on: bool) -> &'static str {
+    if on { "on\n" } else { "off\n" }
+}
+
+/// Serializes every write to the state file within this process: the tray
+/// loop (heartbeat, menu), the power daemon (suspend/resume) and the follow
+/// watcher all write it, and they share one temp-file name. Process-wide
+/// (not per `DisplayControl`) so it also covers the follow watcher thread.
+static STATE_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Unconditional atomic write of the state file (tests only; production
+/// goes through [`sync_state_file`]).
+#[cfg(test)]
+fn write_state_file(path: &Path, on: bool) -> std::io::Result<()> {
+    let _guard = STATE_FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    replace_state_file_locked(path, on)
+}
+
+/// Atomically replaces `cfg/display.state` with `on\n` / `off\n`:
+/// writes `display.state.tmp` next to it and renames it over the target,
+/// so asterctl (which polls the file every ~1s) never observes the empty
+/// window a truncate-then-write leaves. The parent directory is created
+/// only when the first write finds it missing (not on every call).
+///
+/// Windows: asterctl only ever opens the file briefly through std, which
+/// always requests `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`,
+/// so a concurrent read does not block the replace (and std's `rename`
+/// replaces an existing target). Should the rename still fail — e.g. an
+/// antivirus or indexer holding the file without `FILE_SHARE_DELETE` — fall
+/// back to an in-place write: a state change (manual Display Off, suspend
+/// blank) must land even at the cost of a brief truncate window.
+fn replace_state_file_locked(path: &Path, on: bool) -> std::io::Result<()> {
+    let text = state_text(on);
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+
+    if let Err(err) = std::fs::write(&tmp, text) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err);
+        }
+        // First write into a fresh install / tmpfs: create the directory.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&tmp, text)?;
     }
-    std::fs::write(path, if on { "on\n" } else { "off\n" })
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, text)
+        }
+    }
+}
+
+/// Brings `cfg/display.state` to `on` with the least I/O, and refreshes its
+/// mtime — the launcher heartbeat asterctl watches (it switches the LCD
+/// off and exits when the mtime is older than its
+/// `LAUNCHER_HEARTBEAT_TIMEOUT`, see asterctl `launcher_is_dead`):
+/// - content already right: only bump the mtime (`File::set_modified`, an
+///   attribute update — no truncate, no rewrite);
+/// - content differs, the file is missing, or the mtime bump fails: full
+///   atomic write ([`replace_state_file_locked`]), whose new file has a fresh mtime.
+///
+/// The file is compared on every call (it is 3-4 bytes) instead of cached,
+/// so an external edit or deletion self-heals on the next heartbeat.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub(crate) fn sync_state_file(path: &Path, on: bool) -> std::io::Result<()> {
+    let _guard = STATE_FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(current) = std::fs::read(path)
+        && current == state_text(on).as_bytes()
+        && touch(path).is_ok()
+    {
+        return Ok(());
+    }
+    replace_state_file_locked(path, on)
+}
+
+/// Sets the file's mtime to now without changing its content. Opening with
+/// `write(true)` (no truncate) grants the attribute-write access
+/// `set_modified` needs on Windows.
+fn touch(path: &Path) -> std::io::Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(path)?
+        .set_modified(std::time::SystemTime::now())
+}
+
+/// [`sync_state_file`] plus logging: a failure is logged through `dedup`
+/// (one line per distinct error, not one per heartbeat), a success re-arms
+/// it. Returns whether the state file is now up to date.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn sync_and_log(
+    state_file: &Path,
+    on: bool,
+    log_path: &Path,
+    dedup: &crate::logging::LogDedup,
+) -> bool {
+    match sync_state_file(state_file, on) {
+        Ok(()) => {
+            dedup.reset();
+            true
+        }
+        Err(err) => {
+            dedup.append_line(
+                log_path,
+                &format!(
+                    "failed to write display.state ({}): {err}",
+                    state_file.display()
+                ),
+            );
+            false
+        }
+    }
 }
 
 /// Effective on/off state for a display mode, given the last Windows
@@ -189,6 +302,10 @@ pub(crate) struct DisplayControl {
     suspend_off: Arc<AtomicBool>,
     state_file: PathBuf,
     log_path: PathBuf,
+    /// Rate-limits the "failed to write display.state" line: the heartbeat
+    /// retries every ~2s, so a persistent failure must not flood the log.
+    /// Shared with the follow watcher, which writes the same file.
+    write_errors: Arc<crate::logging::LogDedup>,
 }
 
 #[cfg(windows)]
@@ -212,6 +329,7 @@ impl DisplayControl {
             suspend_off: Arc::new(AtomicBool::new(false)),
             state_file,
             log_path,
+            write_errors: Arc::new(crate::logging::LogDedup::new()),
         });
         this.write_for_mode(initial_mode);
         this.start_follow_watcher();
@@ -263,12 +381,16 @@ impl DisplayControl {
     }
 
     /// Periodic heartbeat, called from the tray loop roughly every 2s:
-    /// rewrites `cfg/display.state` with the current state (off while the
-    /// machine is asleep — see [`heartbeat_state_on`]). The rewrite keeps
-    /// the file's mtime fresh, which is what asterctl uses to detect a
-    /// dead launcher — when the file goes stale it switches the display
-    /// off and exits. The content is idempotent, so the extra writes are
-    /// harmless.
+    /// keeps `cfg/display.state` at the current state (off while the
+    /// machine is asleep — see [`heartbeat_state_on`]) and refreshes its
+    /// mtime, which is what asterctl uses to detect a dead launcher — when
+    /// the file goes stale it switches the display off and exits. With the
+    /// state unchanged only the mtime is bumped (see [`sync_state_file`]).
+    ///
+    /// Must keep running while the machine is suspended (it then writes
+    /// "off"): the stuck-marker path in `power.rs` holds `suspended` for a
+    /// few seconds without a real sleep, and an asterctl respawned after it
+    /// would find a stale file and exit at once.
     pub(crate) fn heartbeat(&self) {
         let mode = DisplayMode::from_index(self.mode.load(Ordering::SeqCst));
         let on = heartbeat_state_on(
@@ -309,15 +431,7 @@ impl DisplayControl {
     }
 
     fn write_state(&self, on: bool) {
-        if let Err(err) = write_state_file(&self.state_file, on) {
-            crate::logging::append_line(
-                &self.log_path,
-                &format!(
-                    "failed to write display.state ({}): {err}",
-                    self.state_file.display()
-                ),
-            );
-        }
+        sync_and_log(&self.state_file, on, &self.log_path, &self.write_errors);
     }
 
     /// Spawns the follow watcher daemon: registers for
@@ -337,6 +451,7 @@ impl DisplayControl {
         let suspend_off = self.suspend_off.clone();
         let state_file = self.state_file.clone();
         let log_path = self.log_path.clone();
+        let write_errors = self.write_errors.clone();
 
         std::thread::spawn(move || {
             unsafe {
@@ -411,15 +526,7 @@ impl DisplayControl {
                         } else {
                             display_state_is_on(state)
                         };
-                        if let Err(err) = write_state_file(&state_file, on) {
-                            crate::logging::append_line(
-                                &log_path,
-                                &format!(
-                                    "failed to write display.state ({}): {err}",
-                                    state_file.display()
-                                ),
-                            );
-                        }
+                        sync_and_log(&state_file, on, &log_path, &write_errors);
                     }
                 }
                 PowerSettingUnregisterNotification(registration);
@@ -436,6 +543,8 @@ pub(crate) struct DisplayControl {
     pub mode: std::sync::Arc<std::sync::atomic::AtomicU16>,
     state_file: std::path::PathBuf,
     log_path: std::path::PathBuf,
+    /// Rate-limits the per-heartbeat write-failure line (see Windows).
+    write_errors: crate::logging::LogDedup,
 }
 
 #[cfg(target_os = "linux")]
@@ -454,6 +563,7 @@ impl DisplayControl {
             mode: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(mode.index())),
             state_file,
             log_path,
+            write_errors: crate::logging::LogDedup::new(),
         });
         if initial_mode == DisplayMode::Follow {
             crate::logging::append_line(
@@ -465,15 +575,10 @@ impl DisplayControl {
         this
     }
     fn write_state(&self, on: bool) -> bool {
-        if let Err(e) = write_state_file(&self.state_file, on) {
-            crate::logging::append_line(
-                &self.log_path,
-                &format!("failed writing display state: {e}"),
-            );
-            return false;
-        }
-        true
+        sync_and_log(&self.state_file, on, &self.log_path, &self.write_errors)
     }
+    /// Heartbeat (tray loop, ~2s): refreshes the mtime asterctl watches and
+    /// rewrites the content only when it differs (see [`sync_state_file`]).
     pub(crate) fn heartbeat(&self) {
         let on = self.mode.load(std::sync::atomic::Ordering::SeqCst) == DisplayMode::On.index();
         self.write_state(on);
@@ -544,6 +649,97 @@ mod tests {
 
         write_state_file(&path, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "on\n");
+        // The atomic write leaves no temp file behind.
+        assert!(!dir.path().join("nested").join("display.state.tmp").exists());
+    }
+
+    fn set_mtime_ago(path: &Path, ago: std::time::Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - ago)
+            .unwrap();
+    }
+
+    fn age(path: &Path) -> std::time::Duration {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn sync_with_unchanged_state_only_bumps_mtime() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        write_state_file(&path, false).unwrap();
+        // Pretend the last heartbeat was a minute ago: asterctl would
+        // consider the launcher dead (timeout 10s).
+        set_mtime_ago(&path, std::time::Duration::from_secs(60));
+        assert!(age(&path) >= std::time::Duration::from_secs(59));
+
+        sync_state_file(&path, false).unwrap();
+
+        // Heartbeat visible to asterctl's mtime check, content untouched.
+        assert!(age(&path) < std::time::Duration::from_secs(30));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "off\n");
+        assert!(!dir.path().join("display.state.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_with_unchanged_state_keeps_the_same_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        write_state_file(&path, true).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        sync_state_file(&path, true).unwrap();
+        // No temp+rename happened: the heartbeat did not rewrite the file.
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // A state change does replace it (atomic rename).
+        sync_state_file(&path, false).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn sync_rewrites_when_state_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        write_state_file(&path, true).unwrap();
+        set_mtime_ago(&path, std::time::Duration::from_secs(60));
+
+        sync_state_file(&path, false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "off\n");
+        assert!(age(&path) < std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sync_recreates_a_missing_file_and_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime").join("display.state");
+
+        sync_state_file(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "on\n");
+
+        // Deleted behind our back (e.g. tmpfs cleanup): the next heartbeat
+        // puts it back instead of only failing to bump the mtime.
+        std::fs::remove_file(&path).unwrap();
+        sync_state_file(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "on\n");
+    }
+
+    #[test]
+    fn sync_heals_unexpected_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        std::fs::write(&path, "").unwrap();
+        sync_state_file(&path, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "off\n");
     }
 
     #[test]

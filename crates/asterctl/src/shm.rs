@@ -7,10 +7,12 @@
 //! [`SharedMemoryProvider`] polls both producer slots of the shared region
 //! and merges new sensor values into the same `HashMap<String, String>` the
 //! file slurper fills, so rendering and panel configs are unaffected. New
-//! data is detected via each producer's sequence number; timestamps are used
-//! to warn about stale data (e.g. a producer frozen after sleep/resume).
+//! data is detected via each producer's sequence number
+//! ([`SharedStatsRegion::read_if_changed`] checks it before copying the
+//! payload, so an idle poll allocates nothing); timestamps are used to warn
+//! about stale data (e.g. a producer frozen after sleep/resume).
 
-use aster_hwstats::{Producer, REGION_NAME, SharedStatsRegion, parse_key_value};
+use aster_hwstats::{Error, Producer, REGION_NAME, SharedStatsRegion, SlotUpdate, parse_key_value};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,7 +42,13 @@ fn producer_name(producer: Producer) -> &'static str {
 /// memory region.
 pub struct SharedMemoryProvider {
     region: Option<SharedStatsRegion>,
-    last_sequences: [u64; 2],
+    /// Sequence of the last snapshot merged per producer (`None`: nothing
+    /// read yet, so the next read always copies).
+    last_sequences: [Option<u64>; 2],
+    /// Writer timestamp of that snapshot. It only changes together with the
+    /// sequence, so it stays valid for the stale check while the slot is
+    /// unchanged.
+    last_timestamps: [Option<u64>; 2],
     connected_logged: [bool; 2],
     stale_warned: [bool; 2],
 }
@@ -51,7 +59,8 @@ impl SharedMemoryProvider {
     pub fn new() -> Self {
         Self {
             region: None,
-            last_sequences: [0; 2],
+            last_sequences: [None; 2],
+            last_timestamps: [None; 2],
             connected_logged: [false; 2],
             stale_warned: [false; 2],
         }
@@ -78,12 +87,26 @@ impl SharedMemoryProvider {
             }
         }
 
-        let region = self.region.as_mut().expect("region initialized above");
+        let region = self.region.as_ref().expect("region initialized above");
         for producer in PRODUCERS {
             let idx = producer_index(producer);
-            let snapshot = match region.read_snapshot(producer) {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => {
+            match region.read_if_changed(producer, self.last_sequences[idx]) {
+                Ok(SlotUpdate::Changed(snapshot)) => {
+                    debug!(
+                        "Shared memory sensors updated ({} slot, sequence {}): {} payload bytes",
+                        producer_name(producer),
+                        snapshot.sequence,
+                        snapshot.payload.len()
+                    );
+                    for (key, value) in parse_key_value(&snapshot.payload) {
+                        values.insert(key, value);
+                    }
+                    self.last_sequences[idx] = Some(snapshot.sequence);
+                    self.last_timestamps[idx] = Some(snapshot.timestamp_ms);
+                    self.connected_logged[idx] = false;
+                }
+                Ok(SlotUpdate::Unchanged) => {}
+                Ok(SlotUpdate::Empty) => {
                     if !self.connected_logged[idx] {
                         info!(
                             "Shared memory sensor slot not written by {} yet",
@@ -93,6 +116,15 @@ impl SharedMemoryProvider {
                     }
                     continue;
                 }
+                Err(Error::Contended) => {
+                    // The producer was mid-write for every retry: routine
+                    // at high poll rates; the next poll picks it up.
+                    debug!(
+                        "Shared memory sensors busy ({} slot), retrying next poll",
+                        producer_name(producer)
+                    );
+                    continue;
+                }
                 Err(e) => {
                     warn!(
                         "Failed to read shared memory sensors ({}): {e}",
@@ -100,21 +132,10 @@ impl SharedMemoryProvider {
                     );
                     continue;
                 }
-            };
-
-            if snapshot.sequence != self.last_sequences[idx] {
-                debug!(
-                    "Shared memory sensors updated ({} slot, sequence {}): {} payload bytes",
-                    producer_name(producer),
-                    snapshot.sequence,
-                    snapshot.payload.len()
-                );
-                for (key, value) in parse_key_value(&snapshot.payload) {
-                    values.insert(key, value);
-                }
-                self.last_sequences[idx] = snapshot.sequence;
-                self.connected_logged[idx] = false;
             }
+            let Some(timestamp_ms) = self.last_timestamps[idx] else {
+                continue;
+            };
 
             // Stale detection: producers update their timestamp on every
             // write, so an old timestamp means they stopped (e.g. after
@@ -123,13 +144,13 @@ impl SharedMemoryProvider {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let age_ms = now_ms.saturating_sub(snapshot.timestamp_ms);
+            let age_ms = now_ms.saturating_sub(timestamp_ms);
             if age_ms > STALE_AFTER_MS {
                 if !self.stale_warned[idx] {
                     warn!(
                         "Shared memory sensors are stale ({} slot): last update {age_ms}ms ago (sequence {}) — producer may be stuck",
                         producer_name(producer),
-                        snapshot.sequence
+                        self.last_sequences[idx].unwrap_or_default()
                     );
                     self.stale_warned[idx] = true;
                 }

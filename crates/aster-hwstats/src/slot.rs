@@ -7,7 +7,7 @@
 //! unit-testable without OS shared memory; [`crate::SharedStatsRegion`] hands
 //! them the mapped bytes of the real region.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::{
     Error, MAGIC, MAGIC_OFFSET, MAX_PAYLOAD, PAYLOAD_LEN_OFFSET, PAYLOAD_OFFSET, SEQUENCE_OFFSET,
@@ -23,6 +23,19 @@ pub struct SlotSnapshot {
     pub timestamp_ms: u64,
     /// The raw `label: value\n` payload bytes.
     pub payload: Vec<u8>,
+}
+
+/// Outcome of a change-aware slot read
+/// ([`crate::SharedStatsRegion::read_if_changed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotUpdate {
+    /// The producer never wrote its slot (magic absent): not started yet.
+    Empty,
+    /// The slot still holds the snapshot with the caller's last sequence;
+    /// nothing was copied or allocated.
+    Unchanged,
+    /// A new, consistent snapshot.
+    Changed(SlotSnapshot),
 }
 
 /// Returns the byte range of the slot at `slot_offset`, `None` if the region
@@ -66,11 +79,15 @@ pub(crate) fn write_slot(
     let seq_ptr = unsafe { slot.as_mut_ptr().add(SEQUENCE_OFFSET) } as *mut AtomicU64;
     debug_assert_eq!(seq_ptr as usize % 8, 0, "sequence must be 8-byte aligned");
 
-    // 1. Mark the snapshot as in progress (odd). Release so it is visible
-    //    before the payload writes below.
+    // 1. Mark the snapshot as in progress (odd). A release *store* only
+    //    orders the writes before it; the release *fence* after it is what
+    //    keeps the payload writes below from becoming visible before the
+    //    odd marker (textbook seqlock writer), so a reader that sees any
+    //    new payload byte also sees the odd/changed sequence.
     // SAFETY: `seq_ptr` points into `slot`, which is 8-byte aligned and
     // exclusively borrowed here (no aliasing references are live).
     unsafe { (*seq_ptr).store(sequence - 1, Ordering::Release) };
+    fence(Ordering::Release);
 
     // 2. Payload + header fields.
     let n = payload.len().min(MAX_PAYLOAD);
@@ -94,12 +111,35 @@ pub(crate) fn write_slot(
 /// version mismatch or a write racing with the read (sequence changed between
 /// the two atomic reads) is reported as an error; the caller should retry.
 pub(crate) fn read_slot(region: &[u8], slot_offset: usize) -> Result<Option<SlotSnapshot>, Error> {
+    match read_slot_if_changed(region, slot_offset, None)? {
+        SlotUpdate::Changed(snapshot) => Ok(Some(snapshot)),
+        // `Unchanged` needs a last sequence to compare against; with `None`
+        // only `Empty` and `Changed` are possible.
+        SlotUpdate::Empty | SlotUpdate::Unchanged => Ok(None),
+    }
+}
+
+/// Like [`read_slot`], but first compares the header sequence with
+/// `last_sequence` and returns [`SlotUpdate::Unchanged`] — without copying
+/// or allocating the payload — when the producer has not written since.
+/// `None` always reads.
+///
+/// Seqlock reader: `seq1` (acquire) → payload copy → acquire fence →
+/// `seq2`; the snapshot is accepted only if both are the same even value.
+/// The fence keeps the payload reads from being reordered after the second
+/// sequence load (an acquire *load* alone would not), pairing with the
+/// writer's release fence after its odd store.
+pub(crate) fn read_slot_if_changed(
+    region: &[u8],
+    slot_offset: usize,
+    last_sequence: Option<u64>,
+) -> Result<SlotUpdate, Error> {
     let slot = region
         .get(slot_range(region.len(), slot_offset).ok_or(Error::BadRegion)?)
         .ok_or(Error::BadRegion)?;
 
     if read_u32(slot, MAGIC_OFFSET) != MAGIC {
-        return Ok(None);
+        return Ok(SlotUpdate::Empty);
     }
     let version = read_u32(slot, VERSION_OFFSET);
     if version != VERSION {
@@ -111,11 +151,19 @@ pub(crate) fn read_slot(region: &[u8], slot_offset: usize) -> Result<Option<Slot
     // SAFETY: `seq_ptr` points into `slot`, which is 8-byte aligned and
     // remains alive for the duration of this function (immutable borrow of
     // `region`).
-    for _ in 0..4 {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            // The writer is mid-update (it holds the slot for a memcpy of
+            // at most 64 KiB): back off politely before re-reading.
+            std::hint::spin_loop();
+        }
         // An odd sequence means the writer is mid-update: retry.
         let seq1 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
         if seq1 % 2 == 1 {
             continue;
+        }
+        if last_sequence == Some(seq1) {
+            return Ok(SlotUpdate::Unchanged);
         }
         let len = read_u32(slot, PAYLOAD_LEN_OFFSET) as usize;
         if len > MAX_PAYLOAD {
@@ -125,11 +173,12 @@ pub(crate) fn read_slot(region: &[u8], slot_offset: usize) -> Result<Option<Slot
         let mut payload = vec![0u8; len];
         payload.copy_from_slice(&slot[PAYLOAD_OFFSET..PAYLOAD_OFFSET + len]);
         let timestamp_ms = read_u64(slot, TIMESTAMP_OFFSET);
-        let seq2 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
+        fence(Ordering::Acquire);
+        let seq2 = unsafe { (*seq_ptr).load(Ordering::Relaxed) };
         // Accept only an unchanged EVEN sequence: any writer activity during
         // the read either left the sequence odd or bumped it, so seq1 != seq2.
-        if seq1 == seq2 && seq2 % 2 == 0 {
-            return Ok(Some(SlotSnapshot {
+        if seq1 == seq2 {
+            return Ok(SlotUpdate::Changed(SlotSnapshot {
                 sequence: seq1,
                 timestamp_ms,
                 payload,
@@ -252,6 +301,61 @@ mod tests {
         // simulate a writer stuck between the odd and even stores
         write_u64(&mut bytes, SEQUENCE_OFFSET, 3); // odd
         assert!(matches!(read_slot(&bytes, 0), Err(Error::Contended)));
+    }
+
+    #[test]
+    fn read_if_changed_skips_an_unchanged_slot() {
+        let mut bytes = region();
+        assert_eq!(
+            read_slot_if_changed(&bytes, 0, None).unwrap(),
+            SlotUpdate::Empty
+        );
+        assert_eq!(
+            read_slot_if_changed(&bytes, 0, Some(2)).unwrap(),
+            SlotUpdate::Empty
+        );
+
+        write_slot(&mut bytes, 0, b"a: 1\n", 2, 100).unwrap();
+        let SlotUpdate::Changed(snap) = read_slot_if_changed(&bytes, 0, None).unwrap() else {
+            panic!("first read must return the snapshot");
+        };
+        assert_eq!(snap.sequence, 2);
+        assert_eq!(snap.payload, b"a: 1\n");
+
+        // Same sequence: nothing new, nothing copied.
+        assert_eq!(
+            read_slot_if_changed(&bytes, 0, Some(snap.sequence)).unwrap(),
+            SlotUpdate::Unchanged
+        );
+
+        // Writer published again: the new snapshot comes through.
+        write_slot(&mut bytes, 0, b"a: 2\n", 4, 200).unwrap();
+        assert_eq!(
+            read_slot_if_changed(&bytes, 0, Some(2)).unwrap(),
+            SlotUpdate::Changed(SlotSnapshot {
+                sequence: 4,
+                timestamp_ms: 200,
+                payload: b"a: 2\n".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn read_if_changed_still_rejects_in_progress_and_bad_versions() {
+        let mut bytes = region();
+        write_slot(&mut bytes, 0, b"a: 1\n", 2, 1).unwrap();
+        // Writer stuck mid-update: an odd sequence is never "unchanged".
+        write_u64(&mut bytes, SEQUENCE_OFFSET, 3);
+        assert!(matches!(
+            read_slot_if_changed(&bytes, 0, Some(3)),
+            Err(Error::Contended)
+        ));
+        write_u64(&mut bytes, SEQUENCE_OFFSET, 2);
+        write_u32(&mut bytes, VERSION_OFFSET, VERSION + 1);
+        assert!(matches!(
+            read_slot_if_changed(&bytes, 0, Some(2)),
+            Err(Error::VersionMismatch(_))
+        ));
     }
 
     #[test]

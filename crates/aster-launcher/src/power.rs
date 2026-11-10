@@ -19,9 +19,11 @@
 //! protocol in the `gem10-miniscreen` docs). A daemon then watches
 //! `cfg/uart.stuck` — the marker asterctl writes on **every**
 //! display-communication failure — and each time it appears, re-enumerates
-//! the USB UART and lets the watcher respawn asterctl (cooldown 30s), so a
-//! panel that wedges again minutes after wake (deep sleep) still recovers.
-//! When `restart_uart_on_resume` is `false`, only the soft re-init runs.
+//! the USB UART and lets the watcher respawn asterctl (cooldown 30s,
+//! doubling up to 10 min while rescans keep failing, see
+//! [`StuckBackoff`]), so a panel that wedges again minutes after wake (deep
+//! sleep) still recovers. When `restart_uart_on_resume` is `false`, only
+//! the soft re-init runs (and the stuck-marker daemon is not needed).
 //!
 //! On suspend the LCD is blanked first (CloseTFT 0x0A, via the
 //! `cfg/display.state` file) and asterctl gets a short grace to apply it
@@ -97,9 +99,102 @@ const STUCK_POLL_STEP_SECS: u64 = 2;
 /// Minimum gap between USB re-enumerations triggered by the stuck-marker
 /// watcher: asterctl reports every display-communication failure, so the
 /// cooldown stops a permanently dead panel from being torn down in a tight
-/// loop while still retrying on every failure.
-#[cfg(windows)]
+/// loop while still retrying on every failure. It is the *base* value: each
+/// consecutive rescan that does not bring the panel back doubles it, up to
+/// [`STUCK_RESCAN_MAX_COOLDOWN_SECS`] (see [`stuck_rescan_cooldown`]).
 const STUCK_RESCAN_COOLDOWN_SECS: u64 = 30;
+
+/// Upper bound of the stuck-rescan cooldown: an unplugged or dead panel is
+/// still retried every 10 minutes (so replugging it recovers without a
+/// launcher restart) instead of tearing the USB device down every 30s
+/// forever.
+const STUCK_RESCAN_MAX_COOLDOWN_SECS: u64 = 600;
+
+/// How long the stuck marker must stay absent (machine awake) before the
+/// panel counts as healthy again and the rescan cooldown resets to its base.
+/// Deliberately much longer than one asterctl init cycle: a respawned
+/// asterctl retries the display init in-process for ~30s+ (backoff 1, 2, 4,
+/// 8, 16s plus serial timeouts) before it writes the marker again, so a
+/// short marker-free window right after a rescan does not mean the panel
+/// recovered. For the same reason asterctl's uptime is no health signal —
+/// a dead panel keeps it alive well past the quick-exit threshold.
+const STUCK_CLEAR_RESET_SECS: u64 = 180;
+
+/// Cooldown before the next stuck-marker rescan, given how many rescans in
+/// a row did not bring the panel back: the base 30s for the first retry,
+/// then doubling (60s, 120s, ...) up to [`STUCK_RESCAN_MAX_COOLDOWN_SECS`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn stuck_rescan_cooldown(failed_rescans: u32) -> std::time::Duration {
+    let shift = failed_rescans.saturating_sub(1).min(16);
+    let secs = STUCK_RESCAN_COOLDOWN_SECS
+        .saturating_mul(1u64 << shift)
+        .min(STUCK_RESCAN_MAX_COOLDOWN_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Rescan bookkeeping of the stuck-marker watcher, kept free of I/O so the
+/// backoff is unit-testable with synthetic instants.
+///
+/// - `last_rescan`: `None` until the first rescan, so the first marker acts
+///   immediately (no `Instant` arithmetic that could underflow right after
+///   boot — `Instant::now() - 30s` panics on Windows when the monotonic
+///   clock is younger than that);
+/// - `failed_rescans`: rescans since the panel was last seen healthy;
+///   drives [`stuck_rescan_cooldown`];
+/// - `clear_since`: start of the current marker-free, awake window; once it
+///   lasts [`STUCK_CLEAR_RESET_SECS`] the panel counts as healthy and
+///   `failed_rescans` resets.
+#[derive(Debug, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct StuckBackoff {
+    last_rescan: Option<std::time::Instant>,
+    failed_rescans: u32,
+    clear_since: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl StuckBackoff {
+    /// Records one poll while the machine is awake. Returns `true` when this
+    /// observation reset the backoff (panel healthy again).
+    fn observe(&mut self, now: std::time::Instant, marker_present: bool) -> bool {
+        if marker_present {
+            self.clear_since = None;
+            return false;
+        }
+        let since = *self.clear_since.get_or_insert(now);
+        if self.failed_rescans > 0
+            && now.saturating_duration_since(since)
+                >= std::time::Duration::from_secs(STUCK_CLEAR_RESET_SECS)
+        {
+            self.failed_rescans = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Records a poll while the children are suspended (sleep, or a rescan
+    /// in progress): asterctl is not running, so a missing marker proves
+    /// nothing about the panel.
+    fn observe_suspended(&mut self) {
+        self.clear_since = None;
+    }
+
+    /// True once the cooldown for the current failure streak has passed
+    /// (always true before the first rescan).
+    fn cooldown_elapsed(&self, now: std::time::Instant) -> bool {
+        self.last_rescan.is_none_or(|last| {
+            now.saturating_duration_since(last) >= stuck_rescan_cooldown(self.failed_rescans)
+        })
+    }
+
+    /// Records a rescan at `now`; returns the cooldown before the next one.
+    fn record_rescan(&mut self, now: std::time::Instant) -> std::time::Duration {
+        self.last_rescan = Some(now);
+        self.failed_rescans = self.failed_rescans.saturating_add(1);
+        self.clear_since = None;
+        stuck_rescan_cooldown(self.failed_rescans)
+    }
+}
 
 #[cfg(windows)]
 use crate::process::ChildHandle;
@@ -278,7 +373,8 @@ pub(crate) fn start(
 /// Daemon thread watching `cfg/uart.stuck` — the marker `asterctl` writes
 /// on every display-communication failure (init or mid-session, e.g. "The
 /// semaphore timeout period has expired"). Each time the marker appears —
-/// spaced by [`STUCK_RESCAN_COOLDOWN_SECS`] — the launcher re-enumerates
+/// spaced by the [`StuckBackoff`] cooldown (30s, doubling up to 10 min while
+/// rescans keep failing) — the launcher re-enumerates
 /// the USB UART (remove+rescan) and lets the watcher respawn asterctl, so
 /// every failure gets one fresh hardware-level retry instead of asterctl's
 /// soft reconnect loop spinning against a panel that needs a USB reset.
@@ -286,6 +382,8 @@ pub(crate) fn start(
 /// Unlike the old wake-window escalation, this runs for the process
 /// lifetime: a panel that wedges again minutes after wake (deep sleep
 /// case) still recovers. Never joined (daemon thread, like `start`).
+/// With `restart_uart_on_resume = false` it can never act, so the thread
+/// exits right away instead of polling every 2s for nothing.
 #[cfg(windows)]
 fn start_stuck_watcher(
     suspended: Arc<AtomicBool>,
@@ -300,22 +398,42 @@ fn start_stuck_watcher(
         // A stale marker from a previous session must not trigger an
         // immediate rescan before the children even spawn.
         let _ = std::fs::remove_file(&stuck_file);
-        let mut last_rescan =
-            std::time::Instant::now() - std::time::Duration::from_secs(STUCK_RESCAN_COOLDOWN_SECS);
+        if !restart_uart_on_resume {
+            // Soft-only mode: `stuck_watcher_should_act` can never be true,
+            // so don't keep a thread waking every 2s for the process
+            // lifetime.
+            crate::logging::append_line(
+                &log_path,
+                "power: restart_uart_on_resume = false, stuck-marker USB rescans disabled",
+            );
+            return;
+        }
+        let mut backoff = StuckBackoff::default();
 
         loop {
             std::thread::sleep(std::time::Duration::from_secs(STUCK_POLL_STEP_SECS));
-            if quit.load(Ordering::SeqCst)
-                || !stuck_watcher_should_act(
-                    restart_uart_on_resume,
-                    suspended.load(Ordering::SeqCst),
-                    stuck_file.exists(),
-                    last_rescan.elapsed()
-                        >= std::time::Duration::from_secs(STUCK_RESCAN_COOLDOWN_SECS),
-                )
-            {
-                // Quitting, soft-only mode, machine asleep (the wake flow
-                // handles that), no marker, or still on cooldown.
+            if quit.load(Ordering::SeqCst) {
+                continue;
+            }
+            let now = std::time::Instant::now();
+            let asleep = suspended.load(Ordering::SeqCst);
+            let marker = stuck_file.exists();
+            if asleep {
+                backoff.observe_suspended();
+            } else if backoff.observe(now, marker) {
+                crate::logging::append_line(
+                    &log_path,
+                    "power: LCD healthy again, stuck-marker rescan cooldown reset",
+                );
+            }
+            if !stuck_watcher_should_act(
+                restart_uart_on_resume,
+                asleep,
+                marker,
+                backoff.cooldown_elapsed(now),
+            ) {
+                // Machine asleep (the wake flow handles that), no marker,
+                // or still on cooldown.
                 continue;
             }
 
@@ -332,18 +450,25 @@ fn start_stuck_watcher(
             // Re-check the conditions under the lock: the daemon may have
             // started handling a suspend (or respawned children) while we
             // waited.
+            let now = std::time::Instant::now();
             if !stuck_watcher_should_act(
                 restart_uart_on_resume,
                 suspended.load(Ordering::SeqCst),
                 stuck_file.exists(),
-                last_rescan.elapsed() >= std::time::Duration::from_secs(STUCK_RESCAN_COOLDOWN_SECS),
+                backoff.cooldown_elapsed(now),
             ) {
                 continue;
             }
-            last_rescan = std::time::Instant::now();
+            let next_cooldown = backoff.record_rescan(now);
             crate::logging::append_line(
                 &log_path,
-                "power: LCD unresponsive (stuck marker), re-enumerating USB UART",
+                &format!(
+                    "power: LCD unresponsive (stuck marker), re-enumerating USB UART \
+                     (rescan {} since the panel was last healthy; next one no sooner \
+                     than {}s)",
+                    backoff.failed_rescans,
+                    next_cooldown.as_secs()
+                ),
             );
             // Pause the watchers so asterctl is not respawned while the
             // device node is being torn down, then re-enumerate and let it
@@ -508,6 +633,92 @@ mod tests {
     fn classifies_unrelated_messages_as_other() {
         assert_eq!(classify_power_event(0), PowerEvent::Other);
         assert_eq!(classify_power_event(12345), PowerEvent::Other);
+    }
+
+    #[test]
+    fn stuck_rescan_cooldown_doubles_from_30s_and_caps_at_10_minutes() {
+        let secs: Vec<u64> = (0..=8)
+            .map(|n| stuck_rescan_cooldown(n).as_secs())
+            .collect();
+        assert_eq!(secs, vec![30, 30, 60, 120, 240, 480, 600, 600, 600]);
+        // No overflow for absurd streaks.
+        assert_eq!(stuck_rescan_cooldown(u32::MAX).as_secs(), 600);
+    }
+
+    #[test]
+    fn first_stuck_marker_acts_immediately_without_instant_underflow() {
+        // `Instant::now() - 30s` used to seed `last_rescan`, which panics
+        // on Windows shortly after boot; a fresh backoff needs no history.
+        let backoff = StuckBackoff::default();
+        assert!(backoff.cooldown_elapsed(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn stuck_backoff_grows_while_rescans_do_not_help() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut backoff = StuckBackoff::default();
+
+        // Dead panel: every rescan is followed by a fresh marker once the
+        // respawned asterctl's ~30s init retries give up.
+        let mut now = t0;
+        let mut cooldowns = Vec::new();
+        for _ in 0..7 {
+            assert!(backoff.cooldown_elapsed(now));
+            let cooldown = backoff.record_rescan(now);
+            cooldowns.push(cooldown.as_secs());
+            // marker absent for 40s (asterctl retrying init), then back
+            backoff.observe(now + Duration::from_secs(2), false);
+            backoff.observe(now + Duration::from_secs(40), false);
+            backoff.observe(now + Duration::from_secs(42), true);
+            assert!(!backoff.cooldown_elapsed(now + cooldown - Duration::from_secs(1)));
+            now += cooldown.max(Duration::from_secs(42));
+        }
+        assert_eq!(cooldowns, vec![30, 60, 120, 240, 480, 600, 600]);
+    }
+
+    #[test]
+    fn stuck_backoff_resets_after_a_long_marker_free_window() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut backoff = StuckBackoff::default();
+        backoff.record_rescan(t0);
+        backoff.record_rescan(t0 + Duration::from_secs(30));
+        assert_eq!(backoff.failed_rescans, 2);
+
+        // Marker-free but not yet long enough: no reset.
+        let clear = t0 + Duration::from_secs(31);
+        assert!(!backoff.observe(clear, false));
+        assert!(!backoff.observe(
+            clear + Duration::from_secs(STUCK_CLEAR_RESET_SECS - 1),
+            false
+        ));
+        assert_eq!(backoff.failed_rescans, 2);
+        // Window long enough: panel healthy, cooldown back to base.
+        assert!(backoff.observe(clear + Duration::from_secs(STUCK_CLEAR_RESET_SECS), false));
+        assert_eq!(backoff.failed_rescans, 0);
+        assert_eq!(stuck_rescan_cooldown(backoff.failed_rescans).as_secs(), 30);
+    }
+
+    #[test]
+    fn stuck_backoff_marker_or_suspend_restarts_the_healthy_window() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut backoff = StuckBackoff::default();
+        backoff.record_rescan(t0);
+
+        backoff.observe(t0 + Duration::from_secs(10), false);
+        // A marker in between breaks the window...
+        backoff.observe(t0 + Duration::from_secs(100), true);
+        assert!(!backoff.observe(t0 + Duration::from_secs(200), false));
+        // ...and so does a suspend (asterctl not running proves nothing).
+        backoff.observe_suspended();
+        assert!(!backoff.observe(t0 + Duration::from_secs(300), false));
+        assert_eq!(backoff.failed_rescans, 1);
+        assert!(backoff.observe(
+            t0 + Duration::from_secs(300 + STUCK_CLEAR_RESET_SECS),
+            false
+        ));
     }
 
     #[test]

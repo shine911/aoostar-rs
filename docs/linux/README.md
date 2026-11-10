@@ -46,7 +46,9 @@ creates all writable directories and never writes under `/usr`.
 ## Troubleshooting and uninstall
 
 Read `launcher.log`, `asterctl.log`, and `aster-sysinfo.log` in the state logs
-directory. A second click is harmless: the per-user lock exits without starting
+directory (a log past 5 MB is moved to `<name>.log.1`). If the launcher dies,
+`aster-sysinfo` receives SIGTERM with it, while `asterctl` blanks the LCD and
+exits on its own once the heartbeat goes stale. A second click is harmless: the per-user lock exits without starting
 duplicate children. Quit from the tray before replacing binaries. To remove,
 use the package manager (`sudo apt remove aoostar-rs` or `sudo rpm -e
 aoostar-rs`), then optionally remove the user directories above. Replug the
