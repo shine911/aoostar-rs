@@ -42,7 +42,7 @@ where
 /// Cache for loaded images to avoid repeated file I/O
 pub struct ImageCache {
     img_path: PathBuf,
-    cache: HashMap<PathBuf, Option<RgbaImage>>,
+    cache: HashMap<(PathBuf, Option<Size>), Option<RgbaImage>>,
 }
 
 impl ImageCache {
@@ -62,19 +62,21 @@ impl ImageCache {
             self.img_path.join(path)
         };
 
-        if !self.cache.contains_key(&path) {
-            let image_result = match load_image(&path, size) {
+        // The cached pixels depend on the requested size, so it is part of the key.
+        let key = (path, size);
+        if !self.cache.contains_key(&key) {
+            let image_result = match load_image(&key.0, size) {
                 Ok(img) => Some(img.to_rgba8()),
                 Err(e) => {
-                    warn!("Failed to load image {:?}: {:?}", path, e);
+                    warn!("Failed to load image {:?}: {:?}", key.0, e);
                     None
                 }
             };
 
-            self.cache.insert(path.clone(), image_result);
+            self.cache.insert(key.clone(), image_result);
         }
 
-        self.cache.get(&path).and_then(|opt| opt.as_ref())
+        self.cache.get(&key).and_then(|opt| opt.as_ref())
     }
 
     #[allow(dead_code)]
@@ -172,4 +174,33 @@ pub fn rotate_180_degrees(image: &RgbaImage) -> RgbaImage {
     }
 
     rotated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_cache_keys_by_requested_size() {
+        let dir = tempfile::tempdir().unwrap();
+        RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255]))
+            .save(dir.path().join("pic.png"))
+            .unwrap();
+        let mut cache = ImageCache::new(dir.path());
+
+        assert_eq!(
+            cache.get("pic.png", Some((4, 4))).unwrap().dimensions(),
+            (4, 4)
+        );
+        assert_eq!(
+            cache.get("pic.png", Some((16, 2))).unwrap().dimensions(),
+            (16, 2)
+        );
+        assert_eq!(cache.get("pic.png", None).unwrap().dimensions(), (8, 8));
+        // Repeat request is served from cache with the matching size.
+        assert_eq!(
+            cache.get("pic.png", Some((4, 4))).unwrap().dimensions(),
+            (4, 4)
+        );
+    }
 }
