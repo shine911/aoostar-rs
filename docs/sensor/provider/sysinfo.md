@@ -37,6 +37,12 @@ Options:
           Requires smartctl and password-less sudo!
 ```
 
+Slowly changing values (disk list and usage, `total_processes`, the per-disk
+`storage_*` sensors) are refreshed every `--disk-refresh` seconds, or every 30
+seconds if the option is not set, and republished unchanged on every tick in
+between. Drives that are in standby are not woken up for `--smartctl`; their
+last temperature is kept until they spin up again.
+
 Single test run with printing all sensors in the console:
 ```shell
 aster-sysinfo --console
