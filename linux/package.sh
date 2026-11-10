@@ -9,11 +9,11 @@ if [[ -n "${APP_VERSION:-}" ]]; then
   raw_version="$APP_VERSION"
 else
   command -v git >/dev/null || { echo "git is required to determine the package version (or set APP_VERSION)" >&2; exit 2; }
-  raw_version="$(git -c safe.directory="$root" -C "$root" describe --match 'v[0-9]*' --tags HEAD --always)"
+  raw_version="$(git -c safe.directory="$root" -C "$root" describe --tags --match 'v[0-9]*' --match '[0-9]*' HEAD --always)"
 fi
 if [[ -n "${PACKAGE_VERSION:-}" ]]; then
   package_version="$PACKAGE_VERSION"
-elif [[ "$raw_version" == v[0-9]* ]]; then
+elif [[ "$raw_version" =~ ^v?[0-9]+\.[0-9]+ ]]; then
   package_version="${raw_version#v}"
 else
   package_version="0.0.0.git.$raw_version"

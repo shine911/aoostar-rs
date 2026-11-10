@@ -2,6 +2,12 @@ name: Rust
 
 on:
   push:
+    # Path filters are not evaluated for tag pushes, so version tags always
+    # build. `branches` must be listed explicitly once `tags` is present.
+    branches: [ '**' ]
+    tags:
+      - 'v[0-9]*'
+      - '[0-9]*'
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -12,6 +18,13 @@ on:
   pull_request:
     branches: [ main ]
     types: [ opened, synchronize, reopened ]
+  # Backfill Linux packages for an existing release tag, e.g. `0.7.0`.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and attach packages to (e.g. 0.7.0)'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -96,22 +109,56 @@ jobs:
     needs: lint
     # using an older Ubuntu release on purpose to link against an older libc version for greater compatibility
     runs-on: ubuntu-22.04
+    outputs:
+      mode: ${{ steps.version.outputs.mode }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          # Empty for push/PR events (default ref); the tag for backfill runs.
+          ref: ${{ inputs.tag }}
           # History of 200 should be more than enough to calculate commit count since last release tag.
           fetch-depth: 200
       - name: Fetch all tags to determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           git fetch origin '+refs/tags/*:refs/tags/*'
-          APP_VERSION="$(git describe --match "v[0-9]*" --tags HEAD --always)"
-          if [[ "$APP_VERSION" == v[0-9]* ]]; then
+          # mode: release  = version-tag push (`v1.2.3` or `1.2.3`, never `latest`)
+          #       backfill = manual run attaching packages to an existing release
+          #       dev      = push to main (rolling "Development Build" on `latest`)
+          #       none     = anything else (PRs, other branches): build only
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            mode=backfill
+            if [[ ! "$INPUT_TAG" =~ ^v?[0-9]+\.[0-9]+ ]]; then
+              echo "::error::tag '$INPUT_TAG' is not a version tag (vX.Y.Z or X.Y.Z)"
+              exit 1
+            fi
+            # The tag's own linux/package.sh may predate this logic, so the
+            # version is passed explicitly instead of being re-derived.
+            APP_VERSION="$INPUT_TAG"
+          else
+            if [[ "$REF_TYPE" == tag && "$REF_NAME" != latest ]]; then
+              mode=release
+            elif [[ "$EVENT_NAME" == push && "$REF" == refs/heads/main ]]; then
+              mode=dev
+            else
+              mode=none
+            fi
+            APP_VERSION="$(git describe --tags --match 'v[0-9]*' --match '[0-9]*' HEAD --always)"
+          fi
+          if [[ "$APP_VERSION" =~ ^v?[0-9]+\.[0-9]+ ]]; then
             PACKAGE_VERSION="${APP_VERSION#v}"
           else
             PACKAGE_VERSION="0.0.0.git.$APP_VERSION"
           fi
           PACKAGE_VERSION="${PACKAGE_VERSION//-/.}"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
           {
             echo "APP_VERSION=$APP_VERSION"
             echo "PACKAGE_VERSION=$PACKAGE_VERSION"
@@ -161,7 +208,7 @@ jobs:
 
   release:
     name: GitHub release
-    if: github.ref == 'refs/heads/main' || contains(github.ref, 'tags/v')
+    if: needs.build.outputs.mode != 'none'
     needs: [ build ]
     runs-on: ubuntu-24.04
 
@@ -188,7 +235,7 @@ jobs:
 
       # Add timestamp to development builds
       - name: Prepare GitHub development packages
-        if: "!contains(github.ref, 'tags/v')"
+        if: needs.build.outputs.mode == 'dev'
         run: |
           echo "append timestamp for development builds"
           for filename in *.deb *.rpm; do
@@ -201,6 +248,7 @@ jobs:
 
       # Checkout is required for the next `gh release delete` step
       - name: Checkout
+        if: needs.build.outputs.mode == 'dev'
         uses: actions/checkout@v4
         with:
           path: main
@@ -208,6 +256,7 @@ jobs:
       # We have to delete the "latest" release, otherwise `softprops/action-gh-release` will only append the new artifact.
       # This simulates the old marvinpinto/action-automatic-releases action.
       - name: Remove previous pre-release
+        if: needs.build.outputs.mode == 'dev'
         run: |
           cd main
           gh release delete latest --cleanup-tag -y || true
@@ -216,7 +265,7 @@ jobs:
 
       - name: Create Pre-Release
         uses: softprops/action-gh-release@v2
-        if: "!contains(github.ref, 'tags/v')"
+        if: needs.build.outputs.mode == 'dev'
         with:
           prerelease: true
           tag_name: latest
@@ -228,7 +277,7 @@ jobs:
             ${{ env.HASH_FILENAME }}
 
       - name: Prepare GitHub release packages
-        if: "contains(github.ref, 'tags/v')"
+        if: needs.build.outputs.mode == 'release' || needs.build.outputs.mode == 'backfill'
         run: |
           echo "create hashes"
           sha256sum ./*.deb ./*.rpm > "$HASH_FILENAME"
@@ -236,10 +285,30 @@ jobs:
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
-        if: "contains(github.ref, 'tags/v')"
+        if: needs.build.outputs.mode == 'release'
         with:
           prerelease: false
           generate_release_notes: true
+          files: |
+            *.deb
+            *.rpm
+            ${{ env.HASH_FILENAME }}
+
+      # Backfill only appends assets to a release that already exists: no
+      # generate_release_notes/prerelease/name inputs, so softprops leaves the
+      # existing notes and flags untouched.
+      - name: Ensure release exists
+        if: needs.build.outputs.mode == 'backfill'
+        run: gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+
+      - name: Attach packages to existing release
+        uses: softprops/action-gh-release@v2
+        if: needs.build.outputs.mode == 'backfill'
+        with:
+          tag_name: ${{ inputs.tag }}
           files: |
             *.deb
             *.rpm
