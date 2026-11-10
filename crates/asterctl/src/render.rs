@@ -109,9 +109,12 @@ pub struct PanelRenderer {
     frame: RgbaImage,
     /// Overlay layers in [`LAYER_MODES`] order, allocated on first use.
     layers: [Option<Layer>; 3],
-    /// Sensors that failed to render, with the last logged error message.
-    /// Used to log a failing sensor once instead of on every frame.
-    sensor_errors: HashMap<String, String>,
+    /// Sensors that failed to render, keyed by sensor instance (address),
+    /// with the last logged error message. Used to log a failing sensor once
+    /// instead of on every frame. Keyed per instance, not per label: a text
+    /// and a progress sensor commonly share one label, and only one of them
+    /// may fail for a given value.
+    sensor_errors: HashMap<usize, String>,
     font_handler: FontHandler,
     image_cache: ImageCache,
     // for debugging: save images for inspection
@@ -307,28 +310,45 @@ impl PanelRenderer {
             let unit = resolved_sensor_unit(sensor, values);
 
             if let Some(value) = resolved_sensor_value(sensor, values, now) {
-                match self.render_sensor(background, sensor, &value, &unit) {
-                    Ok(()) => {
-                        if self.sensor_errors.remove(&sensor.label).is_some() {
-                            info!("Sensor '{}' renders again", sensor.label);
-                        }
-                    }
-                    Err(e) => {
-                        let msg = format!("{e:?}");
-                        if self.sensor_errors.get(&sensor.label) != Some(&msg) {
-                            warn!(
-                                "Skipping sensor '{}' (value '{value}'): {msg}",
-                                sensor.label
-                            );
-                            self.sensor_errors.insert(sensor.label.clone(), msg);
-                        }
-                    }
-                }
+                let result = self.render_sensor(background, sensor, &value, &unit);
+                self.track_sensor_result(sensor, &value, result);
             }
         }
 
         // Final compositing
         self.composite_layers(background);
+    }
+
+    /// Log a sensor render failure once (until the error changes or the
+    /// sensor renders again). Returns `true` when something was logged.
+    fn track_sensor_result(
+        &mut self,
+        sensor: &Sensor,
+        value: &str,
+        result: Result<(), ImageProcessingError>,
+    ) -> bool {
+        let id = sensor as *const Sensor as usize;
+        match result {
+            Ok(()) => {
+                let recovered = self.sensor_errors.remove(&id).is_some();
+                if recovered {
+                    info!("Sensor '{}' renders again", sensor.label);
+                }
+                recovered
+            }
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if self.sensor_errors.get(&id) == Some(&msg) {
+                    return false;
+                }
+                warn!(
+                    "Skipping sensor '{}' (value '{value}'): {msg}",
+                    sensor.label
+                );
+                self.sensor_errors.insert(id, msg);
+                true
+            }
+        }
     }
 
     /// Render a single sensor element based on its mode
@@ -972,13 +992,35 @@ mod tests {
 
         let mut r = renderer();
         let image = r.render(&full, &vals).unwrap().clone();
-        assert!(r.sensor_errors.contains_key("p"));
+        assert_eq!(r.sensor_errors.len(), 1);
         let expected = renderer().render(&text_only, &vals).unwrap().clone();
         assert!(image == expected, "text sensor must still be rendered");
 
         // the sensor recovers once its value parses again
         r.render(&full, &values(&[("t", "42"), ("p", "50")]))
             .unwrap();
+        assert!(r.sensor_errors.is_empty());
+    }
+
+    #[test]
+    fn failing_sensor_sharing_a_label_is_logged_once() {
+        // a text value and a progress bar on the same label: "N/A" only
+        // breaks the bar, and the working text must not reset its state
+        let p = panel(&[text("cpu"), progress("cpu", 50, 150)]);
+        let mut r = renderer();
+        let invalid = || Err(ImageProcessingError::MathError("Invalid value".into()));
+        for frame in 0..3 {
+            assert!(!r.track_sensor_result(&p.sensor[0], "N/A", Ok(())));
+            let logged = r.track_sensor_result(&p.sensor[1], "N/A", invalid());
+            assert_eq!(logged, frame == 0, "frame {frame}");
+        }
+        // full render path keeps exactly the one entry
+        let vals = values(&[("cpu", "N/A")]);
+        r.render(&p, &vals).unwrap();
+        r.render(&p, &vals).unwrap();
+        assert_eq!(r.sensor_errors.len(), 1);
+        // recovery is logged once
+        assert!(r.track_sensor_result(&p.sensor[1], "5", Ok(())));
         assert!(r.sensor_errors.is_empty());
     }
 
