@@ -39,7 +39,8 @@
 #          overwrite dist\aster-launcher.exe (quit it via the tray icon first).
 #   8. Not buildable at all from WSL:
 #        - hwbridge/HwBridge.exe is C#, not Rust. It IS buildable from WSL via
-#          csc.exe (see windows-build); no .NET SDK needed, just .NET Framework.
+#          hwbridge/build.ps1 (fetches pinned NuGet DLLs, then csc.exe; see
+#          windows-build); no .NET SDK needed, just .NET Framework.
 
 set -euo pipefail
 
@@ -86,13 +87,11 @@ windows_check() {
 # aster-launcher.exe NOT running (package-dist.ps1 refuses to overwrite a
 # running exe; quit it via the tray icon first).
 windows_build() {
-    local csc="/mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe"
-
     echo "== windows release build (cargo.exe) =="
     cargo.exe build --release || return 1
 
-    echo "== hwbridge build (csc.exe) =="
-    (cd "$REPO_ROOT/hwbridge" && "$csc" /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs) || return 1
+    echo "== hwbridge build (powershell.exe + csc.exe) =="
+    (cd "$REPO_ROOT" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File hwbridge/build.ps1) || return 1
 
     echo "== package dist (powershell.exe) =="
     (cd "$REPO_ROOT" && powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/package-dist.ps1) || return 1

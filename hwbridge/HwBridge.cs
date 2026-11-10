@@ -1,6 +1,7 @@
-// HwBridge: a small standalone bridge that loads AOOSTAR-X's own
-// LibreHardwareMonitorLib.dll (same DLL, same PawnIO-backed sensor access)
-// and publishes CPU/GPU/motherboard/memory temperature and GPU load.
+// HwBridge: a small standalone bridge that loads LibreHardwareMonitorLib
+// (the upstream NuGet package, fetched by build.ps1; PawnIO-backed sensor
+// access, same library AOOSTAR-X uses) and publishes CPU/GPU/motherboard/
+// memory temperature and GPU load.
 //
 // Two output modes:
 //   --shm             write sensor values into the "AOOSTAR_HW_STATS" shared
@@ -29,6 +30,7 @@
 // Written in a deliberately old-style C# (no tuples, no string
 // interpolation, no LINQ) to compile with the plain .NET Framework
 // compiler that ships with Windows, without needing the .NET SDK.
+// Build with hwbridge\build.ps1 (fetches the pinned dependencies, then csc).
 
 using System;
 using System.Collections.Generic;
@@ -198,7 +200,11 @@ namespace HwBridge
                             new string[] { "System", "Motherboard", "CPU" });
                     }
 
-                    AddBestPick(values, allSensors, "memory_Temperature", HardwareType.Memory, SensorType.Temperature, new string[0]);
+                    // Average of the per-DIMM readings ("DIMM #0", "DIMM #1", ...),
+                    // matching AOOSTAR-X's "Average Temperature". A plain highest-value
+                    // pick would grab the SPD hub's "Thermal Sensor Critical High Limit"
+                    // (a fixed 85 C threshold), not a real temperature.
+                    AddAverage(values, allSensors, "memory_Temperature", HardwareType.Memory, SensorType.Temperature, "DIMM");
 
                     AddBestPick(values, allSensors, "gpu_core", HardwareType.GpuNvidia, SensorType.Load, new string[] { "GPU Core", "D3D" });
                     AddBestPick(values, allSensors, "gpu_temperature", HardwareType.GpuNvidia, SensorType.Temperature, new string[] { "GPU Core", "GPU Hot Spot" });
@@ -312,6 +318,31 @@ namespace HwBridge
                 }
             }
             values[outKey] = best.Value.Value.ToString("F1", CultureInfo.InvariantCulture);
+            return true;
+        }
+
+        // Writes the mean of every sensor of the given hardware/sensor type whose
+        // name contains nameContains. Returns false (writes nothing) if none has a value.
+        private static bool AddAverage(Dictionary<string, string> values, List<SensorEntry> all,
+            string outKey, HardwareType hwType, SensorType sensorType, string nameContains)
+        {
+            float sum = 0;
+            int count = 0;
+            for (int i = 0; i < all.Count; i++)
+            {
+                SensorEntry entry = all[i];
+                if (entry.Hardware.HardwareType == hwType && entry.Sensor.SensorType == sensorType && entry.Sensor.Value.HasValue
+                    && entry.Sensor.Name.IndexOf(nameContains, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    sum += entry.Sensor.Value.Value;
+                    count++;
+                }
+            }
+            if (count == 0)
+            {
+                return false;
+            }
+            values[outKey] = (sum / count).ToString("F1", CultureInfo.InvariantCulture);
             return true;
         }
 

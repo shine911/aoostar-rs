@@ -27,8 +27,9 @@ on Windows a small C# bridge (`hwbridge`) fills in sensors `aster-sysinfo` canno
 - Windows (deployables): build on Windows (`cargo build --release`), then `windows/package-dist.ps1`.
   `cargo test -p aster-launcher` on Windows needs an elevated shell or `__COMPAT_LAYER=RunAsInvoker`
   (the crate links a `requireAdministrator` manifest).
-- hwbridge (C#, built on Windows, not from WSL):
-  `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs`
+- hwbridge (C#, Windows `powershell.exe`, also works from WSL): `.\hwbridge\build.ps1` — downloads the pinned
+  NuGet deps (LibreHardwareMonitorLib 0.9.6 + net472 closure, SHA256-checked) into `hwbridge/lib/` (gitignored),
+  then compiles with `csc.exe`. `HwBridge.exe.config` probes `lib\`. Bumping LHM = edit the table in `build.ps1`.
 - aster-sysinfo flags: `--out <file> --temp-dir <dir> --refresh <2|5|10|30> [--disk-refresh <secs>] [--smartctl] [--console]`
 - asterctl: `asterctl --config Monitor3.json` (configs + images in `cfg/`, sensor files in `cfg/sensors/`);
   add `--shm` to also read the `AOOSTAR_HW_STATS` shared-memory region (HwBridge slot).
@@ -48,7 +49,8 @@ on Windows a small C# bridge (`hwbridge`) fills in sensors `aster-sysinfo` canno
   into the shared-memory SysInfo slot (the launcher's Windows default).
 - `crates/asterctl` — LCD display: parses AOOSTAR-X `Monitor*.json` panels, renders, rotates, reads sensor
   values from text files and (with `--shm`) from the shared-memory region, speaks the serial protocol (`asterctl-lcd`).
-- `hwbridge/HwBridge.cs` — loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X uses, writes
+- `hwbridge/HwBridge.cs` — loads `LibreHardwareMonitorLib` (upstream NuGet, same library AOOSTAR-X uses; no
+  AOOSTAR-X binaries are redistributed — see `hwbridge/NOTICE.md`), writes
   CPU/GPU/mobo/memory temps + GPU load. `--shm` mode (used by the launcher) publishes into the
   `AOOSTAR_HW_STATS` region slot 0; legacy mode writes `cfg/sensors/hwbridge.txt`; needs Administrator.
 - `cfg/` — `Monitor3.json` (default panel config), `sensor-mapping.cfg`, `sensors/*.txt` (runtime output,
