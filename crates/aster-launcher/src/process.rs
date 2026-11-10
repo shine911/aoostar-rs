@@ -256,10 +256,20 @@ fn sleep_until_quit(quit: &std::sync::atomic::AtomicBool, total: std::time::Dura
     }
 }
 
+/// Rotates a child's log to `<log>.1` when it has grown past
+/// [`crate::logging::MAX_LOG_BYTES`]. Called before every spawn: the log is
+/// truncated only once per launcher session (see `spawn_and_watch`), so a
+/// child that keeps crashing — or a launcher that runs for weeks — would
+/// otherwise append to it without bound. Best effort; never fails a spawn.
+fn rotate_child_log(log_path: &Path) {
+    crate::logging::rotate_if_larger(log_path, crate::logging::MAX_LOG_BYTES);
+}
+
 #[cfg(windows)]
 fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
 
+    rotate_child_log(&spec.log_path);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -277,6 +287,7 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
 
 #[cfg(unix)]
 fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
+    rotate_child_log(&spec.log_path);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

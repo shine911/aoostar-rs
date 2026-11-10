@@ -102,6 +102,11 @@ fn windows_main() {
         }
     };
 
+    // Rotate launcher.log (never truncated, the launcher runs 24/7) only
+    // after the single-instance check, so an accidental second launch
+    // cannot rotate the log out from under the running instance.
+    logging::rotate_if_larger(&launcher_log, logging::MAX_LOG_BYTES);
+
     let cfg = config::LauncherConfig::load(&base_dir.join("launcher.toml"));
     let config_path = base_dir.join("launcher.toml");
     // Shared, mutable child specs: the tray's refresh menu rewrites them and
@@ -227,6 +232,8 @@ fn linux_main() {
         return;
     }
     let _instance_lock = lock_file;
+    // Rotate only once the instance lock is held (see windows_main).
+    logging::rotate_if_larger(&log, logging::MAX_LOG_BYTES);
     let config_path = paths.launcher_config();
     if !config_path.exists() {
         let default = paths.assets.join("launcher.default.toml");
