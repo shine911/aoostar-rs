@@ -10,12 +10,14 @@ use crate::img::{ImageCache, Size, rotate_image};
 use crate::sensors::get_date_time_value;
 use ab_glyph::Font;
 use chrono::{DateTime, Local};
-use image::{ImageBuffer, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 use imageproc::drawing::{draw_text_mut, text_size};
-use log::{debug, error};
+use log::{debug, error, info, warn};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -36,13 +38,80 @@ impl From<std::io::Error> for ImageProcessingError {
     }
 }
 
+/// Pixel rectangle `[x0, x1) x [y0, y1)`, clipped to the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+/// Overlay layer for one graphic sensor mode (fan, progress, pointer).
+///
+/// The layer buffer is kept across frames. Every draw records its target
+/// rectangle in `dirty`, so the next frame only clears (and compositing only
+/// visits) the area that was drawn, instead of reallocating and scanning the
+/// whole panel-sized layer every frame. Outside `dirty` the layer is always
+/// fully transparent.
+struct Layer {
+    image: RgbaImage,
+    dirty: Option<Rect>,
+}
+
+impl Layer {
+    /// Record a draw to the `w` x `h` rectangle at (`x`, `y`), clipped to the layer.
+    fn mark(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        let (lw, lh) = self.image.dimensions();
+        let clip = |v: i64, max: u32| v.clamp(0, max as i64) as u32;
+        let rect = Rect {
+            x0: clip(x as i64, lw),
+            y0: clip(y as i64, lh),
+            x1: clip(x as i64 + w as i64, lw),
+            y1: clip(y as i64 + h as i64, lh),
+        };
+        if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
+            return;
+        }
+        self.dirty = Some(match self.dirty {
+            None => rect,
+            Some(d) => Rect {
+                x0: d.x0.min(rect.x0),
+                y0: d.y0.min(rect.y0),
+                x1: d.x1.max(rect.x1),
+                y1: d.y1.max(rect.y1),
+            },
+        });
+    }
+
+    /// Make the layer fully transparent again.
+    fn clear(&mut self) {
+        if let Some(r) = self.dirty.take() {
+            for y in r.y0..r.y1 {
+                for x in r.x0..r.x1 {
+                    self.image.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+                }
+            }
+        }
+    }
+}
+
+/// Graphic sensor modes with an overlay layer, in compositing order.
+const LAYER_MODES: [SensorMode; 3] = [SensorMode::Fan, SensorMode::Progress, SensorMode::Pointer];
+
 /// Sensor panel renderer.
 ///
 /// Renders a final display image from a sensor panel configuration and current sensor values.
 /// All defined fonts and images of a sensor panel are cached after first use.
 pub struct PanelRenderer {
     size: Size,
-    composite_layer_map: HashMap<SensorMode, RgbaImage>,
+    /// Rendered panel image, reused across frames.
+    frame: RgbaImage,
+    /// Overlay layers in [`LAYER_MODES`] order, allocated on first use.
+    layers: [Option<Layer>; 3],
+    /// Sensors that failed to render, with the last logged error message.
+    /// Used to log a failing sensor once instead of on every frame.
+    sensor_errors: HashMap<String, String>,
     font_handler: FontHandler,
     image_cache: ImageCache,
     // for debugging: save images for inspection
@@ -66,7 +135,9 @@ impl PanelRenderer {
     pub fn new(size: Size, font_dir: impl Into<PathBuf>, img_dir: impl Into<PathBuf>) -> Self {
         Self {
             size,
-            composite_layer_map: HashMap::new(),
+            frame: RgbaImage::new(0, 0),
+            layers: [None, None, None],
+            sensor_errors: HashMap::new(),
             font_handler: FontHandler::new(font_dir),
             image_cache: ImageCache::new(img_dir),
             save_render_img: false,
@@ -108,17 +179,32 @@ impl PanelRenderer {
 
     /// Render a sensor panel with the given values and return the final panel image.
     ///
+    /// `DATE_*` sensors without a value in `values` show the current local time.
+    ///
     /// # Arguments
     ///
     /// * `panel`: the panel configuration
     /// * `values`: current values for the defined panel sensors in a shared HashMap
     ///
-    /// returns: a rendered panel image in [RgbaImage] format, or an [ImageProcessingError] in case of an error.
+    /// returns: the rendered panel image, or an [ImageProcessingError] in case of an error.
+    /// The image buffer is owned by the renderer and reused for the next frame.
     pub fn render(
         &mut self,
         panel: &Panel,
         values: &HashMap<String, String>,
-    ) -> Result<RgbaImage, ImageProcessingError> {
+    ) -> Result<&RgbaImage, ImageProcessingError> {
+        self.render_at(panel, values, &Local::now())
+    }
+
+    /// Like [`PanelRenderer::render`], with an explicit time for `DATE_*` sensors.
+    ///
+    /// Use the same `now` for [`PanelRenderer::content_key`] to decide whether a frame changed.
+    pub fn render_at(
+        &mut self,
+        panel: &Panel,
+        values: &HashMap<String, String>,
+        now: &DateTime<Local>,
+    ) -> Result<&RgbaImage, ImageProcessingError> {
         debug!(
             "Rendering panel {}...",
             panel
@@ -127,19 +213,28 @@ impl PanelRenderer {
                 .unwrap_or_else(|| panel.id.as_deref().unwrap_or_default())
         );
 
-        let now = Instant::now();
-        let background = if let Some(img) = &panel.img
+        let start = Instant::now();
+        let mut frame = std::mem::take(&mut self.frame);
+        let (w, h) = self.size;
+        if let Some(img) = &panel.img
             && let Some(background) = self.image_cache.get(img, Some(self.size))
         {
-            background.clone()
+            if background.dimensions() == frame.dimensions() {
+                frame.copy_from_slice(background);
+            } else {
+                // e.g. the same file was cached earlier at another size
+                frame.clone_from(background);
+            }
+        } else if frame.dimensions() == (w, h) {
+            frame.fill(0);
         } else {
-            RgbaImage::new(self.size.0, self.size.1)
-        };
-        self.composite_layer_map.clear();
+            frame = RgbaImage::new(w, h);
+        }
 
-        let final_image = self.render_all_sensors(panel, values, background)?;
+        self.render_sensors(panel, values, now, &mut frame);
+        self.frame = frame;
 
-        debug!("Rendered panel in {}ms", now.elapsed().as_millis());
+        debug!("Rendered panel in {}ms", start.elapsed().as_millis());
 
         if self.save_render_img {
             let name = format!(
@@ -147,12 +242,12 @@ impl PanelRenderer {
                 panel.friendly_name(),
                 self.img_suffix.as_deref().unwrap_or_default()
             );
-            if let Err(e) = final_image.save(self.img_save_path.join(name)) {
+            if let Err(e) = self.frame.save(self.img_save_path.join(name)) {
                 error!("Error saving rendered panel image: {e}");
             }
         }
 
-        Ok(final_image)
+        Ok(&self.frame)
     }
 
     /// Render all panel sensors with the given values on a background image
@@ -162,23 +257,78 @@ impl PanelRenderer {
         values: &HashMap<String, String>,
         mut background: RgbaImage,
     ) -> Result<RgbaImage, ImageProcessingError> {
-        let now: DateTime<Local> = Local::now();
+        self.render_sensors(panel, values, &Local::now(), &mut background);
+        Ok(background)
+    }
+
+    /// Cheap fingerprint of everything that changes the rendered image of `panel`:
+    /// the displayed text of text sensors and the raw value of graphic sensors,
+    /// with `DATE_*` sensors resolved at `now`.
+    ///
+    /// Two calls with the same panel and equal keys render identical images, so
+    /// an unchanged key means the frame does not need to be rendered and sent again.
+    pub fn content_key(
+        &self,
+        panel: &Panel,
+        values: &HashMap<String, String>,
+        now: &DateTime<Local>,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        panel.sensor.len().hash(&mut hasher);
+        for sensor in &panel.sensor {
+            let value = resolved_sensor_value(sensor, values, now);
+            match (&value, sensor.mode) {
+                (Some(value), SensorMode::Text) => {
+                    let unit = resolved_sensor_unit(sensor, values);
+                    Some(sensor_text(sensor, value, &unit)).hash(&mut hasher);
+                }
+                _ => value.hash(&mut hasher),
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Render all sensors of `panel` onto `background`, then composite the layers.
+    ///
+    /// A sensor that fails to render (e.g. a non-numeric progress value) is
+    /// skipped and logged once; the remaining sensors are still rendered.
+    fn render_sensors(
+        &mut self,
+        panel: &Panel,
+        values: &HashMap<String, String>,
+        now: &DateTime<Local>,
+        background: &mut RgbaImage,
+    ) {
+        for layer in self.layers.iter_mut().flatten() {
+            layer.clear();
+        }
 
         for sensor in &panel.sensor {
-            let value = values.get(&sensor.label).cloned();
             let unit = resolved_sensor_unit(sensor, values);
 
-            if let Some(value) = value {
-                self.render_sensor(&mut background, sensor, &value, &unit)?;
-            } else if let Some(value) = get_date_time_value(&sensor.label, &now) {
-                self.render_sensor(&mut background, sensor, &value, &unit)?;
+            if let Some(value) = resolved_sensor_value(sensor, values, now) {
+                match self.render_sensor(background, sensor, &value, &unit) {
+                    Ok(()) => {
+                        if self.sensor_errors.remove(&sensor.label).is_some() {
+                            info!("Sensor '{}' renders again", sensor.label);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:?}");
+                        if self.sensor_errors.get(&sensor.label) != Some(&msg) {
+                            warn!(
+                                "Skipping sensor '{}' (value '{value}'): {msg}",
+                                sensor.label
+                            );
+                            self.sensor_errors.insert(sensor.label.clone(), msg);
+                        }
+                    }
+                }
             }
         }
 
         // Final compositing
-        self.composite_layers(&mut background);
-
-        Ok(background)
+        self.composite_layers(background);
     }
 
     /// Render a single sensor element based on its mode
@@ -220,12 +370,7 @@ impl PanelRenderer {
         let adjustment_hack = 0.75;
         let scale = font.pt_to_px_scale(font_size * adjustment_hack).unwrap();
 
-        let text = format_value(
-            value,
-            sensor.integer_digits.into(),
-            sensor.decimal_digits.unwrap_or_default() as usize,
-            unit,
-        );
+        let text = sensor_text(sensor, value, unit);
         let size = text_size(scale, &font, &text);
         let width = sensor.width.unwrap_or_default() as i32;
         let height = sensor.height.unwrap_or_default() as i32;
@@ -273,18 +418,15 @@ impl PanelRenderer {
             ImageProcessingError::ImageLoadError("No picture specified".to_string())
         })?;
 
-        let target_image = self
-            .image_cache
-            .get(pic_path, None)
-            .ok_or_else(|| {
-                ImageProcessingError::ImageLoadError(format!("Failed to load: {:?}", pic_path))
-            })?
-            .clone();
-
         let min_angle = sensor.min_angle.unwrap_or(0) as f32;
         let max_angle = sensor.max_angle.unwrap_or(180) as f32;
         let min_value = sensor.min_value.unwrap_or(0.0);
         let max_value = sensor.max_value.unwrap_or(100.0);
+
+        // borrow the cached pic and the layer separately instead of cloning the pic
+        let target_image = self.image_cache.get(pic_path, None).ok_or_else(|| {
+            ImageProcessingError::ImageLoadError(format!("Failed to load: {:?}", pic_path))
+        })?;
 
         let current_value = value
             .parse::<f32>()
@@ -312,16 +454,23 @@ impl PanelRenderer {
             (start, end)
         };
 
-        if let Some(sector_layer) = self.get_layer(SensorMode::Fan) {
-            PanelRenderer::draw_pie_slice(
-                sector_layer,
-                &target_image,
-                pos_x,
-                pos_y,
-                start_angle,
-                end_angle,
-            );
-        }
+        let sector_layer = Self::layer(&mut self.layers, self.size, SensorMode::Fan);
+        PanelRenderer::draw_pie_slice(
+            &mut sector_layer.image,
+            target_image,
+            pos_x,
+            pos_y,
+            start_angle,
+            end_angle,
+        );
+        // superset of the pixels draw_pie_slice can touch
+        let (src_w, src_h) = target_image.dimensions();
+        sector_layer.mark(
+            pos_x - src_w as i32 / 2,
+            pos_y - src_h as i32 / 2,
+            src_w,
+            src_h,
+        );
 
         Ok(())
     }
@@ -339,13 +488,9 @@ impl PanelRenderer {
             ImageProcessingError::ImageLoadError("No picture specified".to_string())
         })?;
 
-        let mut processed_img = self
-            .image_cache
-            .get(pic_path, None)
-            .ok_or_else(|| {
-                ImageProcessingError::ImageLoadError(format!("Failed to load: {:?}", pic_path))
-            })?
-            .clone();
+        let pic = self.image_cache.get(pic_path, None).ok_or_else(|| {
+            ImageProcessingError::ImageLoadError(format!("Failed to load: {:?}", pic_path))
+        })?;
 
         let min_val = sensor.min_value.unwrap_or(0.0);
         let max_val = sensor.max_value.unwrap_or(100.0);
@@ -357,9 +502,9 @@ impl PanelRenderer {
         let clamped_value = current_value.clamp(min_val, max_val);
         let progress = ((clamped_value - min_val) / (max_val - min_val)).clamp(0.0, 1.0);
 
-        let (img_w, img_h) = processed_img.dimensions();
+        let (img_w, img_h) = pic.dimensions();
 
-        // Create progress mask based on direction
+        // Visible part of the progress graphic as (x0, y0, x1, y1), based on direction
         let crop_rect = match direction {
             SensorDirection::LeftToRight => {
                 let crop_w = (img_w as f32 * progress).round() as u32;
@@ -379,32 +524,34 @@ impl PanelRenderer {
             }
         };
 
-        // Apply crop mask to image
-        self.apply_progress_mask(&mut processed_img, crop_rect, direction);
-
-        if self.save_processed_pic {
-            let name = format!(
-                "processed_img-{}{}.png",
-                sensor.label,
-                self.img_suffix.as_deref().unwrap_or_default()
-            );
-            if let Err(e) = processed_img.save(self.img_save_path.join(name)) {
-                error!("Error saving processed image: {e}");
-            }
-        }
-
         let pos_x = sensor.x;
         let pos_y = sensor.y;
 
-        if let Some(progress_layer) = self.get_layer(SensorMode::Progress) {
-            PanelRenderer::paste_image(progress_layer, &processed_img, pos_x, pos_y);
+        // Only the visible part is pasted: the masked-out pixels of the full
+        // graphic are fully transparent, and pasting a transparent pixel
+        // leaves the layer unchanged.
+        let progress_layer = Self::layer(&mut self.layers, self.size, SensorMode::Progress);
+        let region = Rect {
+            x0: crop_rect.0,
+            y0: crop_rect.1,
+            x1: crop_rect.2,
+            y1: crop_rect.3,
+        };
+        PanelRenderer::paste_image_region(progress_layer, pic, region, pos_x, pos_y);
 
+        if self.save_processed_pic || self.save_progress_layer {
+            // debugging only: materialize the masked graphic
+            let mut processed_img = pic.clone();
+            Self::apply_progress_mask(&mut processed_img, crop_rect, direction);
+            let suffix = self.img_suffix.as_deref().unwrap_or_default();
+            if self.save_processed_pic {
+                let name = format!("processed_img-{}{suffix}.png", sensor.label);
+                if let Err(e) = processed_img.save(self.img_save_path.join(name)) {
+                    error!("Error saving processed image: {e}");
+                }
+            }
             if self.save_progress_layer {
-                let name = format!(
-                    "progress_layer-{}{}.png",
-                    sensor.label,
-                    self.img_suffix.as_deref().unwrap_or_default()
-                );
+                let name = format!("progress_layer-{}{suffix}.png", sensor.label);
                 if let Err(e) = processed_img.save(self.img_save_path.join(name)) {
                     error!("Error saving progress layer image: {e}");
                 }
@@ -443,13 +590,9 @@ impl PanelRenderer {
         } else {
             None
         };
-        let pic = self
-            .image_cache
-            .get(pic_path, size)
-            .ok_or_else(|| {
-                ImageProcessingError::ImageLoadError(format!("Failed to load: {:?}", pic_path))
-            })?
-            .clone();
+        let pic = self.image_cache.get(pic_path, size).ok_or_else(|| {
+            ImageProcessingError::ImageLoadError(format!("Failed to load: {:?}", pic_path))
+        })?;
 
         let min_val = sensor.min_value.unwrap_or(0.0);
         let max_val = sensor.max_value.unwrap_or(100.0);
@@ -482,17 +625,20 @@ impl PanelRenderer {
         let offset_x = (xz_x as f32 * angle_rad.cos() - xz_y as f32 * angle_rad.sin()) as i32;
         let offset_y = (xz_x as f32 * angle_rad.sin() + xz_y as f32 * angle_rad.cos()) as i32;
 
-        // Rotate the image
+        // Rotate the image (no copy needed for an unrotated pointer)
         let angle = angle.round() as i32;
-        let rotated_pic = rotate_image(&pic, -angle);
+        let rotated_pic = if angle == 0 {
+            Cow::Borrowed(pic)
+        } else {
+            Cow::Owned(rotate_image(pic, -angle))
+        };
 
         // Calculate final position
         let final_x = x_center + offset_x - (rotated_pic.width() / 2) as i32;
         let final_y = y_center + offset_y - (rotated_pic.height() / 2) as i32;
 
-        if let Some(pointer_layer) = self.get_layer(SensorMode::Pointer) {
-            PanelRenderer::paste_image(pointer_layer, &rotated_pic, final_x, final_y);
-        }
+        let pointer_layer = Self::layer(&mut self.layers, self.size, SensorMode::Pointer);
+        PanelRenderer::paste_image(pointer_layer, &rotated_pic, final_x, final_y);
         Ok(())
     }
 
@@ -584,7 +730,6 @@ impl PanelRenderer {
 
     /// Apply progress mask to image based on crop rectangle and direction
     fn apply_progress_mask(
-        &self,
         image: &mut RgbaImage,
         crop_rect: (u32, u32, u32, u32),
         direction: SensorDirection,
@@ -610,13 +755,32 @@ impl PanelRenderer {
         }
     }
 
-    /// Paste an image onto another image at specified position
-    fn paste_image(target: &mut RgbaImage, source: &RgbaImage, x: i32, y: i32) {
-        let (target_w, target_h) = target.dimensions();
+    /// Paste an image onto a layer at specified position
+    fn paste_image(target: &mut Layer, source: &RgbaImage, x: i32, y: i32) {
         let (source_w, source_h) = source.dimensions();
+        let region = Rect {
+            x0: 0,
+            y0: 0,
+            x1: source_w,
+            y1: source_h,
+        };
+        PanelRenderer::paste_image_region(target, source, region, x, y);
+    }
 
-        for sy in 0..source_h {
-            for sx in 0..source_w {
+    /// Paste the `region` of `source` onto a layer, with the source origin at
+    /// position (`x`, `y`): source pixel (sx, sy) lands on (x + sx, y + sy).
+    fn paste_image_region(target: &mut Layer, source: &RgbaImage, region: Rect, x: i32, y: i32) {
+        target.mark(
+            x + region.x0 as i32,
+            y + region.y0 as i32,
+            region.x1.saturating_sub(region.x0),
+            region.y1.saturating_sub(region.y0),
+        );
+        let target = &mut target.image;
+        let (target_w, target_h) = target.dimensions();
+
+        for sy in region.y0..region.y1 {
+            for sx in region.x0..region.x1 {
                 let target_x = x + sx as i32;
                 let target_y = y + sy as i32;
 
@@ -656,46 +820,43 @@ impl PanelRenderer {
         }
     }
 
-    fn get_layer(&mut self, mode: SensorMode) -> Option<&mut RgbaImage> {
-        if !self.composite_layer_map.contains_key(&mode) {
-            self.composite_layer_map.insert(mode, self.create_layer());
-        }
-
-        self.composite_layer_map.get_mut(&mode)
-    }
-
-    /// Create an overlay image buffer with the same dimensions as the panel
-    fn create_layer(&self) -> RgbaImage {
-        ImageBuffer::from_fn(self.size.0, self.size.1, |_, _| Rgba([0, 0, 0, 0]))
+    /// The overlay layer of a graphic sensor mode, allocated on first use.
+    ///
+    /// Takes the layer array instead of `&mut self` so callers can hold a
+    /// cached image from `image_cache` at the same time.
+    fn layer(layers: &mut [Option<Layer>; 3], size: Size, mode: SensorMode) -> &mut Layer {
+        let idx = LAYER_MODES
+            .iter()
+            .position(|m| *m == mode)
+            .expect("graphic sensor mode");
+        layers[idx].get_or_insert_with(|| Layer {
+            image: RgbaImage::new(size.0, size.1),
+            dirty: None,
+        })
     }
 
     /// Composite all layers into final image
     fn composite_layers(&mut self, background: &mut RgbaImage) {
-        // quick and dirty, this should be an ordered enum variant list
-        let modes = [SensorMode::Fan, SensorMode::Progress, SensorMode::Pointer];
-        for mode in modes {
-            if let Some(layer) = self.composite_layer_map.get(&mode) {
-                // Find bounding box of non-transparent pixels
-                let bbox = PanelRenderer::get_bounding_box(layer);
+        for layer in self.layers.iter().flatten() {
+            // Only the drawn area can contain non-transparent pixels
+            if let Some(r) = layer.dirty {
+                let layer = &layer.image;
+                // Composite the layer onto final image
+                for y in r.y0..r.y1 {
+                    for x in r.x0..r.x1 {
+                        let layer_pixel = *layer.get_pixel(x, y);
+                        if layer_pixel[3] > 0 {
+                            // If not fully transparent
+                            let final_pixel = background.get_pixel_mut(x, y);
 
-                if let Some((min_x, min_y, max_x, max_y)) = bbox {
-                    // Composite the layer onto final image
-                    for y in min_y..=max_y {
-                        for x in min_x..=max_x {
-                            let layer_pixel = *layer.get_pixel(x, y);
-                            if layer_pixel[3] > 0 {
-                                // If not fully transparent
-                                let final_pixel = background.get_pixel_mut(x, y);
+                            // Alpha compositing
+                            let alpha = layer_pixel[3] as f32 / 255.0;
+                            let inv_alpha = 1.0 - alpha;
 
-                                // Alpha compositing
-                                let alpha = layer_pixel[3] as f32 / 255.0;
-                                let inv_alpha = 1.0 - alpha;
-
-                                for i in 0..4 {
-                                    final_pixel[i] = ((layer_pixel[i] as f32 * alpha)
-                                        + (final_pixel[i] as f32 * inv_alpha))
-                                        as u8;
-                                }
+                            for i in 0..4 {
+                                final_pixel[i] = ((layer_pixel[i] as f32 * alpha)
+                                    + (final_pixel[i] as f32 * inv_alpha))
+                                    as u8;
                             }
                         }
                     }
@@ -703,36 +864,29 @@ impl PanelRenderer {
             }
         }
     }
+}
 
-    /// Get bounding box of non-transparent pixels
-    fn get_bounding_box(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
-        let (width, height) = image.dimensions();
-        let mut min_x = width;
-        let mut min_y = height;
-        let mut max_x = 0;
-        let mut max_y = 0;
-        let mut found_pixel = false;
+/// The value a sensor displays: its value from `values`, or the current
+/// date/time for `DATE_*` labels without a provided value.
+fn resolved_sensor_value<'a>(
+    sensor: &Sensor,
+    values: &'a HashMap<String, String>,
+    now: &DateTime<Local>,
+) -> Option<Cow<'a, str>> {
+    values
+        .get(&sensor.label)
+        .map(|v| Cow::Borrowed(v.as_str()))
+        .or_else(|| get_date_time_value(&sensor.label, now).map(Cow::Owned))
+}
 
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = image.get_pixel(x, y);
-                if pixel[3] > 0 {
-                    // Non-transparent
-                    found_pixel = true;
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                }
-            }
-        }
-
-        if found_pixel {
-            Some((min_x, min_y, max_x, max_y))
-        } else {
-            None
-        }
-    }
+/// The text a text sensor draws for `value`.
+fn sensor_text(sensor: &Sensor, value: &str, unit: &str) -> String {
+    format_value(
+        value,
+        sensor.integer_digits.into(),
+        sensor.decimal_digits.unwrap_or_default() as usize,
+        unit,
+    )
 }
 
 /// Resolve the unit shown by a sensor. Provider metadata wins over the panel
@@ -769,6 +923,113 @@ mod tests {
             ),
             "68"
         );
+    }
+
+    const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+
+    fn renderer() -> PanelRenderer {
+        PanelRenderer::new(
+            (960, 376),
+            format!("{ASSETS}/fonts"),
+            format!("{ASSETS}/cfg"),
+        )
+    }
+
+    fn sensor_json(mode: u8, label: &str, x: i32, y: i32, extra: &str) -> String {
+        format!(
+            r#"{{"mode":{mode},"label":"{label}","x":{x},"y":{y},"value":"","unit":"","integerDigits":-1,"decimalDigits":0{extra}}}"#
+        )
+    }
+
+    fn panel(sensors: &[String]) -> Panel {
+        serde_json::from_str(&format!(
+            r#"{{"img":"default_1_hdd.jpg","sensor":[{}]}}"#,
+            sensors.join(",")
+        ))
+        .unwrap()
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn text(label: &str) -> String {
+        sensor_json(1, label, 100, 100, r#","fontSize":40,"pic":"""#)
+    }
+
+    fn progress(label: &str, x: i32, y: i32) -> String {
+        sensor_json(3, label, x, y, r#","direction":1,"pic":"progress1.png""#)
+    }
+
+    #[test]
+    fn unparseable_sensor_value_skips_only_that_sensor() {
+        let full = panel(&[text("t"), progress("p", 50, 150)]);
+        let text_only = panel(&[text("t")]);
+        let vals = values(&[("t", "42"), ("p", "N/A")]);
+
+        let mut r = renderer();
+        let image = r.render(&full, &vals).unwrap().clone();
+        assert!(r.sensor_errors.contains_key("p"));
+        let expected = renderer().render(&text_only, &vals).unwrap().clone();
+        assert!(image == expected, "text sensor must still be rendered");
+
+        // the sensor recovers once its value parses again
+        r.render(&full, &values(&[("t", "42"), ("p", "50")]))
+            .unwrap();
+        assert!(r.sensor_errors.is_empty());
+    }
+
+    #[test]
+    fn reused_layers_match_a_fresh_renderer() {
+        // high then low progress on the same renderer: the persistent layer
+        // must be cleared exactly, compared to a fresh renderer
+        let p = panel(&[progress("a", 50, 150), progress("b", -100, 300)]);
+        let high = values(&[("a", "95"), ("b", "90")]);
+        let low = values(&[("a", "10"), ("b", "60")]);
+        let mut reused = renderer();
+        reused.render(&p, &high).unwrap();
+        let image = reused.render(&p, &low).unwrap().clone();
+        let fresh = renderer().render(&p, &low).unwrap().clone();
+        assert!(image == fresh);
+        // and a panel without graphic sensors leaves no layer remnants
+        let plain = panel(&[text("t")]);
+        let vals = values(&[("t", "1")]);
+        assert!(
+            *reused.render(&plain, &vals).unwrap() == *renderer().render(&plain, &vals).unwrap()
+        );
+    }
+
+    #[test]
+    fn content_key_tracks_displayed_content() {
+        let p = panel(&[text("t"), progress("p", 50, 150)]);
+        let r = renderer();
+        let now = Local::now();
+        let key = |pairs: &[(&str, &str)]| r.content_key(&p, &values(pairs), &now);
+
+        let base = key(&[("t", "42.1"), ("p", "50")]);
+        assert_eq!(base, key(&[("t", "42.1"), ("p", "50"), ("other", "1")]));
+        // decimalDigits 0: same displayed text, same key
+        assert_eq!(base, key(&[("t", "42.3"), ("p", "50")]));
+        assert_ne!(base, key(&[("t", "43"), ("p", "50")]));
+        assert_ne!(base, key(&[("t", "42.1"), ("p", "51")]));
+        assert_ne!(base, key(&[("t", "42.1")]), "missing value");
+        assert_ne!(base, key(&[("t", "42.1"), ("t#unit", "%"), ("p", "50")]));
+    }
+
+    #[test]
+    fn content_key_follows_the_clock_for_date_sensors() {
+        use chrono::TimeZone;
+        let p = panel(&[text("DATE_h_m_3")]);
+        let r = renderer();
+        let vals = HashMap::new();
+        let t1 = Local.with_ymd_and_hms(2026, 11, 10, 12, 30, 5).unwrap();
+        let t2 = Local.with_ymd_and_hms(2026, 11, 10, 12, 30, 55).unwrap();
+        let t3 = Local.with_ymd_and_hms(2026, 11, 10, 12, 31, 0).unwrap();
+        assert_eq!(r.content_key(&p, &vals, &t1), r.content_key(&p, &vals, &t2));
+        assert_ne!(r.content_key(&p, &vals, &t1), r.content_key(&p, &vals, &t3));
     }
 
     #[test]

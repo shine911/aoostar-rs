@@ -642,7 +642,7 @@ fn update_panel(
     debug!("Displaying panel '{}'...", panel.friendly_name());
 
     match renderer.render(panel, values) {
-        Ok(image) => screen.send_image(&image)?,
+        Ok(image) => screen.send_image(image)?,
         Err(e) => error!("Error rendering panel '{}': {e:?}", panel.friendly_name()),
     }
 
