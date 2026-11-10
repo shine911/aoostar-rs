@@ -423,8 +423,6 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         .map(|v| Duration::from_millis((v * 1000.0) as u64))
         .unwrap_or(Duration::from_secs(5));
 
-    // Skips rendering and sending frames whose content did not change.
-    let mut frame_gate = FrameGate::default();
     let mut render_error_log = RepeatLogLimiter::default();
     // Identity (address) of the panel currently shown.
     let mut current_panel: Option<usize> = None;
@@ -439,7 +437,6 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         if current_panel != Some(panel_id) {
             info!("Switching panel: {}", panel.friendly_name());
             current_panel = Some(panel_id);
-            frame_gate.invalidate();
         } else {
             debug!("Keeping panel: {}", panel.friendly_name());
         }
@@ -466,11 +463,6 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                 }
                 skip_render = !display_on;
             }
-            if skip_render {
-                // the display must be refreshed once it is switched on again
-                frame_gate.invalidate();
-            }
-
             if !skip_render {
                 if img_save_path.is_some() {
                     renderer.set_img_suffix(format!("-{refresh_count:02}"));
@@ -487,45 +479,37 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                 // watcher is never blocked by display I/O.
                 let now = Local::now();
                 let values = sensor_values.read().expect("RwLock is poisoned");
-                let key = renderer.content_key(panel, &values, &now);
-                if img_save_path.is_none()
-                    && !frame_gate.needs_send(key, screen.generation(), Instant::now())
-                {
-                    drop(values);
-                    debug!("Panel content unchanged, frame skipped");
-                } else {
-                    debug!("Displaying panel '{}'...", panel.friendly_name());
-                    let rendered = renderer.render_at(panel, &values, &now);
-                    drop(values);
-                    match rendered {
-                        Ok(image) => match screen.send_image(image) {
-                            Ok(()) => frame_gate.sent(key, screen.generation(), Instant::now()),
-                            Err(e) => {
-                                // Serial communication failed (e.g. after resume).
-                                // Don't exit — drop the stale handle, reopen +
-                                // re-init the port with backoff, and continue the
-                                // panel loop. The frame cache was cleared by
-                                // `reconnect` (and the screen generation changed),
-                                // so the next send is a full frame that repairs
-                                // whatever the display was left showing. Report
-                                // the failure so the launcher can escalate (USB
-                                // remove+rescan) instead of letting the backoff
-                                // loop spin against a panel that needs a USB-level
-                                // reset.
-                                error!(
-                                    "Display communication failed: {e:?} — reconnecting with backoff"
-                                );
-                                report_stuck_if_set(stuck_file.as_deref());
-                                screen.reconnect_with_retry();
-                                clear_stuck_if_set(stuck_file.as_deref());
-                            }
-                        },
-                        Err(e) => {
-                            let msg =
-                                format!("Error rendering panel '{}': {e:?}", panel.friendly_name());
-                            if render_error_log.should_log(&msg, Instant::now()) {
-                                error!("{msg}");
-                            }
+                // Every tick renders and sends a frame (the screen's diff cache
+                // still skips unchanged image blocks on the wire).
+                debug!("Displaying panel '{}'...", panel.friendly_name());
+                let rendered = renderer.render_at(panel, &values, &now);
+                drop(values);
+                match rendered {
+                    Ok(image) => {
+                        if let Err(e) = screen.send_image(image) {
+                            // Serial communication failed (e.g. after resume).
+                            // Don't exit — drop the stale handle, reopen +
+                            // re-init the port with backoff, and continue the
+                            // panel loop. The frame cache was cleared by
+                            // `reconnect`, so the next send is a full frame
+                            // that repairs whatever the display was left
+                            // showing. Report the failure so the launcher can
+                            // escalate (USB remove+rescan) instead of letting
+                            // the backoff loop spin against a panel that needs
+                            // a USB-level reset.
+                            error!(
+                                "Display communication failed: {e:?} — reconnecting with backoff"
+                            );
+                            report_stuck_if_set(stuck_file.as_deref());
+                            screen.reconnect_with_retry();
+                            clear_stuck_if_set(stuck_file.as_deref());
+                        }
+                    }
+                    Err(e) => {
+                        let msg =
+                            format!("Error rendering panel '{}': {e:?}", panel.friendly_name());
+                        if render_error_log.should_log(&msg, Instant::now()) {
+                            error!("{msg}");
                         }
                     }
                 }
@@ -554,9 +538,6 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                             );
                             return Ok(());
                         }
-                        if !display_on {
-                            frame_gate.invalidate();
-                        }
                     }
                 } else {
                     sleep(remaining);
@@ -569,48 +550,6 @@ fn run_sensor_panel<B: Into<PathBuf>>(
 
             refresh_count += 1;
         }
-    }
-}
-
-/// Longest time an unchanged frame is skipped: after this, the frame is
-/// rendered and sent again even if no sensor value changed. Unchanged image
-/// blocks are still skipped by the screen's diff cache, so this resend is
-/// only the frame headers on the wire — enough to notice a serial port that
-/// went stale (e.g. after resume) within seconds and reconnect, and to keep
-/// the panel seeing regular traffic as it did with per-tick sends.
-const FORCED_RESEND_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Skip-unchanged logic for the panel loop: a frame is only rendered and
-/// sent when its content key changed, the display needs a refresh (screen
-/// generation changed, e.g. after a reconnect, or the gate was invalidated
-/// by a panel switch / display off), or [`FORCED_RESEND_INTERVAL`] passed.
-#[derive(Debug, Default)]
-struct FrameGate {
-    /// (content key, screen generation, time) of the last frame sent.
-    last_sent: Option<(u64, u64, Instant)>,
-}
-
-impl FrameGate {
-    /// Forget the last frame: the next one is sent unconditionally.
-    fn invalidate(&mut self) {
-        self.last_sent = None;
-    }
-
-    /// Whether a frame with content `key` must be rendered and sent.
-    fn needs_send(&self, key: u64, generation: u64, now: Instant) -> bool {
-        match self.last_sent {
-            Some((last_key, last_generation, at)) => {
-                last_key != key
-                    || last_generation != generation
-                    || now.saturating_duration_since(at) >= FORCED_RESEND_INTERVAL
-            }
-            None => true,
-        }
-    }
-
-    /// Record a successfully sent frame.
-    fn sent(&mut self, key: u64, generation: u64, now: Instant) {
-        self.last_sent = Some((key, generation, now));
     }
 }
 
@@ -910,9 +849,7 @@ mod tests {
     fn display_stays_off_while_state_file_is_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("display.state");
-        let mut screen = AooScreenBuilder::new()
-            .simulate_with_port(asterctl_lcd::FakeSerialPort::new().without_delay())
-            .unwrap();
+        let mut screen = AooScreenBuilder::new().simulate().unwrap();
         let mut display_on = true;
         fs::write(&path, "off\n").unwrap();
         assert!(poll_display_state(
@@ -942,42 +879,6 @@ mod tests {
             &mut display_on
         ));
         assert!(display_on);
-    }
-
-    #[test]
-    fn frame_gate_sends_first_and_changed_frames_only() {
-        let t0 = Instant::now();
-        let mut gate = FrameGate::default();
-        assert!(gate.needs_send(1, 0, t0), "first frame");
-        gate.sent(1, 0, t0);
-        assert!(!gate.needs_send(1, 0, t0 + Duration::from_secs(1)));
-        assert!(
-            gate.needs_send(2, 0, t0 + Duration::from_secs(1)),
-            "content"
-        );
-        assert!(
-            gate.needs_send(1, 1, t0 + Duration::from_secs(1)),
-            "reconnect"
-        );
-    }
-
-    #[test]
-    fn frame_gate_forces_periodic_resend() {
-        let t0 = Instant::now();
-        let mut gate = FrameGate::default();
-        gate.sent(7, 3, t0);
-        let just_before = t0 + FORCED_RESEND_INTERVAL - Duration::from_millis(1);
-        assert!(!gate.needs_send(7, 3, just_before));
-        assert!(gate.needs_send(7, 3, t0 + FORCED_RESEND_INTERVAL));
-    }
-
-    #[test]
-    fn frame_gate_invalidate_forces_send() {
-        let t0 = Instant::now();
-        let mut gate = FrameGate::default();
-        gate.sent(7, 3, t0);
-        gate.invalidate();
-        assert!(gate.needs_send(7, 3, t0));
     }
 
     #[test]
