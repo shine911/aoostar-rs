@@ -19,6 +19,7 @@ use std::io::BufReader;
 use std::num::ParseIntError;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::{fmt, fs};
 
 pub fn load_cfg<P: AsRef<Path>>(path: P) -> anyhow::Result<MonitorConfig> {
@@ -310,6 +311,30 @@ pub struct Setup {
     #[serde(rename = "ha_token")]
     pub ha_token: Option<String>, // "" in JSON ⇒ Option<String>
     */
+}
+
+/// Shortest accepted panel refresh interval. Smaller, zero, negative or
+/// non-numeric `refresh` values would make the panel loop spin.
+pub const MIN_REFRESH: Duration = Duration::from_secs(1);
+
+impl Setup {
+    /// The panel redraw interval from `refresh`, clamped to at least
+    /// [`MIN_REFRESH`] (with a warning) for invalid or too small values.
+    pub fn refresh_interval(&self) -> Duration {
+        refresh_interval(self.refresh)
+    }
+}
+
+fn refresh_interval(refresh: f32) -> Duration {
+    if refresh.is_finite() && refresh >= MIN_REFRESH.as_secs_f32() {
+        Duration::from_millis((refresh * 1000f32) as u64)
+    } else {
+        warn!(
+            "Invalid panel refresh interval {refresh}s, using {}s",
+            MIN_REFRESH.as_secs()
+        );
+        MIN_REFRESH
+    }
 }
 
 /// Language setting.
@@ -703,6 +728,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_interval_keeps_valid_values() {
+        assert_eq!(refresh_interval(1.0), Duration::from_secs(1));
+        assert_eq!(refresh_interval(2.5), Duration::from_millis(2500));
+        assert_eq!(refresh_interval(30.0), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn refresh_interval_clamps_invalid_values() {
+        for refresh in [0.0, -1.0, 0.2, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(refresh_interval(refresh), MIN_REFRESH, "refresh {refresh}");
+        }
+    }
 
     #[test]
     fn theme_maps_panels_exactly_like_official_software() {

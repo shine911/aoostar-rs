@@ -413,7 +413,7 @@ fn run_sensor_panel<B: Into<PathBuf>>(
         None
     };
 
-    let refresh = Duration::from_millis((cfg.setup.refresh * 1000f32) as u64);
+    let refresh = cfg.setup.refresh_interval();
 
     let switch_time = cfg
         .setup
@@ -425,6 +425,7 @@ fn run_sensor_panel<B: Into<PathBuf>>(
 
     // Skips rendering and sending frames whose content did not change.
     let mut frame_gate = FrameGate::default();
+    let mut render_error_log = RepeatLogLimiter::default();
     // Identity (address) of the panel currently shown.
     let mut current_panel: Option<usize> = None;
 
@@ -520,7 +521,11 @@ fn run_sensor_panel<B: Into<PathBuf>>(
                             }
                         },
                         Err(e) => {
-                            error!("Error rendering panel '{}': {e:?}", panel.friendly_name())
+                            let msg =
+                                format!("Error rendering panel '{}': {e:?}", panel.friendly_name());
+                            if render_error_log.should_log(&msg, Instant::now()) {
+                                error!("{msg}");
+                            }
                         }
                     }
                 }
@@ -609,6 +614,30 @@ impl FrameGate {
     }
 }
 
+/// How often an identical error message is repeated in the log.
+const REPEAT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for an error that would otherwise be logged on every frame:
+/// a new message is logged at once, the same message again only after
+/// [`REPEAT_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct RepeatLogLimiter {
+    last: Option<(String, Instant)>,
+}
+
+impl RepeatLogLimiter {
+    fn should_log(&mut self, msg: &str, now: Instant) -> bool {
+        if let Some((last_msg, at)) = &self.last
+            && last_msg == msg
+            && now.saturating_duration_since(*at) < REPEAT_LOG_INTERVAL
+        {
+            return false;
+        }
+        self.last = Some((msg.to_string(), now));
+        true
+    }
+}
+
 /// How long the display-state file may go without being rewritten before
 /// asterctl considers its writer (aster-launcher) dead. The launcher
 /// rewrites the file roughly every 2s while it runs; keep this at a
@@ -620,21 +649,33 @@ const LAUNCHER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// quickly even when the panel refresh interval is long (up to 30s).
 const STATE_POLL_STEP: Duration = Duration::from_secs(1);
 
-/// Reads the display-state file written by aster-launcher. Returns `true`
-/// when the display should be on. A missing or unreadable file means "on":
-/// launchers without this feature never write the file, and a transient
-/// read error must not blank the display.
-fn read_display_state(path: &Path) -> bool {
+/// Reads the display-state file written by aster-launcher. Returns
+/// `Some(true)` when the display should be on, `Some(false)` for off and
+/// `None` when the file is empty (keep the current state).
+///
+/// A missing or unreadable file means "on": launchers without this feature
+/// never write the file, and a transient read error must not blank the
+/// display.
+fn read_display_state(path: &Path) -> Option<bool> {
     match std::fs::read_to_string(path) {
-        Ok(text) => display_state_text_is_on(&text),
-        Err(_) => true,
+        Ok(text) => display_state_from_text(&text),
+        Err(_) => Some(true),
     }
 }
 
 /// Parses the content of a display-state file: exactly `off` (after
-/// trimming) turns the display off; anything else keeps it on.
-fn display_state_text_is_on(text: &str) -> bool {
-    text.trim() != "off"
+/// trimming) turns the display off, empty or whitespace-only content keeps
+/// the current state (`None`), anything else turns it on.
+///
+/// Empty content is what a read sees between the launcher truncating and
+/// rewriting the file; treating it as "on" flashed the display on while it
+/// was supposed to stay off.
+fn display_state_from_text(text: &str) -> Option<bool> {
+    match text.trim() {
+        "" => None,
+        "off" => Some(false),
+        _ => Some(true),
+    }
 }
 
 /// True when the display-state file's writer (aster-launcher) is gone:
@@ -695,7 +736,7 @@ fn poll_display_state(
         return false;
     }
 
-    let want_on = read_display_state(state_file);
+    let want_on = read_display_state(state_file).unwrap_or(*display_on);
     if want_on != *display_on {
         let (action, result) = if want_on {
             ("on", screen.on())
@@ -823,25 +864,34 @@ mod tests {
 
     #[test]
     fn display_state_text_off_turns_display_off() {
-        assert!(!display_state_text_is_on("off\n"));
-        assert!(!display_state_text_is_on("off"));
-        assert!(!display_state_text_is_on("  off  \n"));
+        assert_eq!(display_state_from_text("off\n"), Some(false));
+        assert_eq!(display_state_from_text("off"), Some(false));
+        assert_eq!(display_state_from_text("  off  \n"), Some(false));
     }
 
     #[test]
-    fn display_state_text_on_or_garbage_keeps_display_on() {
-        assert!(display_state_text_is_on("on\n"));
-        assert!(display_state_text_is_on("on"));
-        assert!(display_state_text_is_on(""));
-        assert!(display_state_text_is_on("garbage"));
+    fn display_state_text_on_or_garbage_turns_display_on() {
+        assert_eq!(display_state_from_text("on\n"), Some(true));
+        assert_eq!(display_state_from_text("on"), Some(true));
+        assert_eq!(display_state_from_text("garbage"), Some(true));
         // case-sensitive: anything but exactly "off" means on
-        assert!(display_state_text_is_on("OFF"));
+        assert_eq!(display_state_from_text("OFF"), Some(true));
+    }
+
+    #[test]
+    fn display_state_text_empty_keeps_current_state() {
+        // a read between the launcher's truncate and write
+        assert_eq!(display_state_from_text(""), None);
+        assert_eq!(display_state_from_text(" \n\t"), None);
     }
 
     #[test]
     fn read_display_state_missing_file_keeps_display_on() {
         let dir = tempdir().unwrap();
-        assert!(read_display_state(&dir.path().join("no-such-file")));
+        assert_eq!(
+            read_display_state(&dir.path().join("no-such-file")),
+            Some(true)
+        );
     }
 
     #[test]
@@ -849,9 +899,49 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("display.state");
         fs::write(&path, "off\n").unwrap();
-        assert!(!read_display_state(&path));
+        assert_eq!(read_display_state(&path), Some(false));
         fs::write(&path, "on\n").unwrap();
-        assert!(read_display_state(&path));
+        assert_eq!(read_display_state(&path), Some(true));
+        fs::write(&path, "").unwrap();
+        assert_eq!(read_display_state(&path), None);
+    }
+
+    #[test]
+    fn display_stays_off_while_state_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("display.state");
+        let mut screen = AooScreenBuilder::new()
+            .simulate_with_port(asterctl_lcd::FakeSerialPort::new().without_delay())
+            .unwrap();
+        let mut display_on = true;
+        fs::write(&path, "off\n").unwrap();
+        assert!(poll_display_state(
+            &mut screen,
+            &path,
+            None,
+            &mut display_on
+        ));
+        assert!(!display_on);
+        // truncated by the launcher, not yet rewritten
+        fs::write(&path, "").unwrap();
+        assert!(poll_display_state(
+            &mut screen,
+            &path,
+            None,
+            &mut display_on
+        ));
+        assert!(
+            !display_on,
+            "empty state file must not switch the display on"
+        );
+        fs::write(&path, "on\n").unwrap();
+        assert!(poll_display_state(
+            &mut screen,
+            &path,
+            None,
+            &mut display_on
+        ));
+        assert!(display_on);
     }
 
     #[test]
@@ -888,6 +978,18 @@ mod tests {
         gate.sent(7, 3, t0);
         gate.invalidate();
         assert!(gate.needs_send(7, 3, t0));
+    }
+
+    #[test]
+    fn repeat_log_limiter_dedupes_identical_messages() {
+        let t0 = Instant::now();
+        let mut limiter = RepeatLogLimiter::default();
+        assert!(limiter.should_log("a", t0));
+        assert!(!limiter.should_log("a", t0 + Duration::from_secs(1)));
+        assert!(limiter.should_log("b", t0 + Duration::from_secs(2)));
+        assert!(limiter.should_log("a", t0 + Duration::from_secs(3)));
+        assert!(!limiter.should_log("a", t0 + Duration::from_secs(4)));
+        assert!(limiter.should_log("a", t0 + Duration::from_secs(3) + REPEAT_LOG_INTERVAL));
     }
 
     #[test]
