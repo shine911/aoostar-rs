@@ -568,12 +568,6 @@ impl PanelRenderer {
                                 let dst_px = layer.get_pixel_mut(dest_x as u32, dest_y as u32);
                                 // alpha‐blend: out = src.a*src + (1−src.a)*dst
                                 let alpha = src_px[3] as f32 / 255.0;
-                                for i in 0..3 {
-                                    dst_px[i] = ((src_px[i] as f32 * alpha)
-                                        + (dst_px[i] as f32 * (1.0 - alpha)))
-                                        .round()
-                                        as u8;
-                                }
                                 for i in 0..4 {
                                     dst_px[i] = ((src_px[i] as f32 * alpha)
                                         + (dst_px[i] as f32 * (1.0 - alpha)))
@@ -785,5 +779,27 @@ mod tests {
         .unwrap();
         let values = HashMap::new();
         assert_eq!(resolved_sensor_unit(&sensor, &values), " ℃");
+    }
+
+    #[test]
+    fn pie_slice_blends_each_channel_exactly_once() {
+        // Half-transparent orange over opaque blue.
+        let mut source = RgbaImage::new(2, 2);
+        for p in source.pixels_mut() {
+            *p = Rgba([200, 100, 0, 128]);
+        }
+        let mut layer = RgbaImage::from_pixel(2, 2, Rgba([0, 0, 200, 255]));
+        // Full circle so the pixel at the source center (1,1) is inside.
+        PanelRenderer::draw_pie_slice(&mut layer, &source, 1, 1, 0.0, 359.9);
+
+        let alpha = 128.0_f32 / 255.0;
+        let blend = |s: f32, d: f32| (s * alpha + d * (1.0 - alpha)).round() as u8;
+        let expected = Rgba([
+            blend(200.0, 0.0),
+            blend(100.0, 0.0),
+            blend(0.0, 200.0),
+            blend(128.0, 255.0),
+        ]);
+        assert_eq!(*layer.get_pixel(1, 1), expected);
     }
 }
