@@ -327,13 +327,17 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
         .open(&spec.log_path)?;
     let log_file_err = log_file.try_clone()?;
 
-    std::process::Command::new(&spec.exe_path)
+    let child = std::process::Command::new(&spec.exe_path)
         .args(&spec.args)
         .current_dir(&spec.base_dir)
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(log_file)
         .stderr(log_file_err)
-        .spawn()
+        .spawn()?;
+    // Sensor children die with the launcher even if it crashes (job
+    // object); asterctl is left out so it can blank the LCD. See job.rs.
+    crate::job::adopt(&child, spec.name, &spec.log_path);
+    Ok(child)
 }
 
 #[cfg(unix)]
@@ -344,12 +348,17 @@ fn spawn_child(spec: &ChildSpec) -> std::io::Result<std::process::Child> {
         .append(true)
         .open(&spec.log_path)?;
     let log_file_err = log_file.try_clone()?;
-    std::process::Command::new(&spec.exe_path)
+    let mut command = std::process::Command::new(&spec.exe_path);
+    command
         .args(&spec.args)
         .current_dir(&spec.base_dir)
         .stdout(log_file)
-        .stderr(log_file_err)
-        .spawn()
+        .stderr(log_file_err);
+    // Sensor children get SIGTERM if the launcher dies (PR_SET_PDEATHSIG);
+    // asterctl is left out so it can blank the LCD. See job.rs.
+    #[cfg(target_os = "linux")]
+    crate::job::configure_command(&mut command, spec.name);
+    command.spawn()
 }
 
 /// Spawns the child at `index` of the shared `specs` in a background thread

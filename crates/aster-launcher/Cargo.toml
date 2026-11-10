@@ -26,6 +26,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_JobObjects",
     "Win32_System_Power",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
@@ -37,6 +38,8 @@ windows-sys = { version = "0.60", features = [
 tray-item = { version = "0.10.0", features = ["ksni"] }
 signal-hook = "0.3"
 fs2 = "0.4"
+# PR_SET_PDEATHSIG for the sensor children (see src/job.rs).
+libc = "0.2"
 
 [package.metadata.deb]
 name = "aoostar-rs"

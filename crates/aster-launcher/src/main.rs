@@ -7,6 +7,7 @@
 mod config;
 mod device;
 mod display;
+mod job;
 mod logging;
 #[cfg(target_os = "linux")]
 mod paths;
@@ -127,6 +128,11 @@ fn windows_main() {
         base_dir.join("cfg").join("display.state"),
         launcher_log.clone(),
     );
+
+    // Kill-on-close job for the sensor children, created before the first
+    // spawn so a crashed or killed launcher takes aster-sysinfo and
+    // HwBridge down with it instead of orphaning them (see job.rs).
+    job::init(&launcher_log);
 
     let quit = Arc::new(AtomicBool::new(false));
     let suspended = Arc::new(AtomicBool::new(false));
