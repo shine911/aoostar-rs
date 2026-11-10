@@ -92,6 +92,13 @@ impl Mapping {
         })
     }
 
+    /// Test helper mirroring the POSIX backend: a Windows named mapping
+    /// already disappears with its last handle, so this is plain `open`.
+    #[cfg(test)]
+    pub fn open_scoped(name: &str, size: usize) -> Result<Self, Error> {
+        Self::open(name, size)
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr`/`len` describe a valid mapping owned by `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }

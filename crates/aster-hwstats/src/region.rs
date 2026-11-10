@@ -6,7 +6,7 @@
 use std::fmt;
 
 use crate::slot;
-use crate::{Producer, REGION_NAME, REGION_SIZE, SlotSnapshot};
+use crate::{Producer, REGION_NAME, REGION_SIZE, SlotSnapshot, SlotUpdate};
 
 #[cfg(windows)]
 mod win;
@@ -62,8 +62,10 @@ impl Error {
 /// A handle to the `AOOSTAR_HW_STATS` shared-memory region.
 ///
 /// The region is created on demand (create-or-open semantics, matching the
-/// C# writer's `MemoryMappedFile.CreateOrOpen`) and stays alive as long as
-/// at least one process holds a handle.
+/// C# writer's `MemoryMappedFile.CreateOrOpen`). On Windows it stays alive
+/// as long as at least one process holds a handle; the POSIX backend never
+/// unlinks its name, so it lives until reboot and every process — including
+/// a respawned reader — keeps seeing the same object.
 pub struct SharedStatsRegion {
     mapping: Mapping,
 }
@@ -81,12 +83,40 @@ impl SharedStatsRegion {
         })
     }
 
+    /// [`Self::open_named`] that removes a region it created when dropped
+    /// (POSIX), so this crate's tests leave nothing behind in `/dev/shm`.
+    #[cfg(test)]
+    fn open_named_scoped(name: &str) -> Result<Self, Error> {
+        Ok(Self {
+            mapping: Mapping::open_scoped(name, REGION_SIZE)?,
+        })
+    }
+
     /// Reads a consistent snapshot of the given producer's slot.
     ///
     /// Returns `Ok(None)` when the slot has not been written yet (producer
     /// not started). Use [`SlotSnapshot::sequence`] to detect new data.
     pub fn read_snapshot(&self, producer: Producer) -> Result<Option<SlotSnapshot>, Error> {
         slot::read_slot(self.mapping.as_slice(), producer.slot_offset())
+    }
+
+    /// Change-aware variant of [`Self::read_snapshot`] for pollers: when the
+    /// slot's sequence still equals `last_sequence` (the
+    /// [`SlotSnapshot::sequence`] seen last time) it returns
+    /// [`SlotUpdate::Unchanged`] after reading only the header — no payload
+    /// copy, no allocation. Pass `None` to always read. The timestamp only
+    /// changes together with the sequence, so a caller can keep using the
+    /// last snapshot's `timestamp_ms` for staleness checks.
+    pub fn read_if_changed(
+        &self,
+        producer: Producer,
+        last_sequence: Option<u64>,
+    ) -> Result<SlotUpdate, Error> {
+        slot::read_slot_if_changed(
+            self.mapping.as_slice(),
+            producer.slot_offset(),
+            last_sequence,
+        )
     }
 
     /// Writes `payload` into the given producer's slot.
@@ -124,7 +154,7 @@ mod tests {
     /// Unique region name per test run (parallel tests must not collide).
     fn unique_name(tag: &str) -> String {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("aoostar_hwstats_test_{}_{n}", tag)
+        format!("aoostar_hwstats_test_{}_{}_{n}", tag, std::process::id())
     }
 
     fn now_ms() -> u64 {
@@ -137,7 +167,7 @@ mod tests {
     #[test]
     fn write_then_read_roundtrip() {
         let name = unique_name("roundtrip");
-        let mut region = SharedStatsRegion::open_named(&name).unwrap();
+        let mut region = SharedStatsRegion::open_named_scoped(&name).unwrap();
         assert!(matches!(
             region.read_snapshot(Producer::HwBridge).unwrap(),
             None
@@ -165,22 +195,65 @@ mod tests {
     #[test]
     fn two_handles_share_the_region() {
         let name = unique_name("twohandles");
-        let mut writer = SharedStatsRegion::open_named(&name).unwrap();
+        let mut writer = SharedStatsRegion::open_named_scoped(&name).unwrap();
         writer
             .write_payload(Producer::HwBridge, b"gpu_core: 12\n", 2, now_ms())
             .unwrap();
 
         // second handle, opened afterwards, sees the same snapshot
-        let reader = SharedStatsRegion::open_named(&name).unwrap();
+        let reader = SharedStatsRegion::open_named_scoped(&name).unwrap();
         let snap = reader.read_snapshot(Producer::HwBridge).unwrap().unwrap();
         assert_eq!(snap.sequence, 2);
         assert_eq!(snap.payload, b"gpu_core: 12\n");
     }
 
     #[test]
+    fn read_if_changed_through_the_region() {
+        let name = unique_name("ifchanged");
+        let mut region = SharedStatsRegion::open_named_scoped(&name).unwrap();
+        assert_eq!(
+            region.read_if_changed(Producer::SysInfo, None).unwrap(),
+            SlotUpdate::Empty
+        );
+        region
+            .write_payload(Producer::SysInfo, b"cpu: 1\n", 2, now_ms())
+            .unwrap();
+        let SlotUpdate::Changed(snap) = region.read_if_changed(Producer::SysInfo, None).unwrap()
+        else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(
+            region
+                .read_if_changed(Producer::SysInfo, Some(snap.sequence))
+                .unwrap(),
+            SlotUpdate::Unchanged
+        );
+    }
+
+    /// The POSIX region must outlive its creator: a respawned asterctl (or
+    /// any later opener) has to see the object the surviving writer keeps
+    /// filling, not a fresh empty one.
+    #[cfg(unix)]
+    #[test]
+    fn posix_region_survives_its_creator() {
+        let name = unique_name("persist");
+        {
+            let mut creator = SharedStatsRegion::open_named(&name).unwrap();
+            creator
+                .write_payload(Producer::SysInfo, b"cpu: 7\n", 2, now_ms())
+                .unwrap();
+        }
+        let reopened = SharedStatsRegion::open_named(&name).unwrap();
+        let snap = reopened.read_snapshot(Producer::SysInfo).unwrap();
+        drop(reopened);
+        super::unix::unlink(&name);
+        assert_eq!(snap.unwrap().payload, b"cpu: 7\n");
+    }
+
+    #[test]
     fn producer_slots_are_independent() {
         let name = unique_name("slots");
-        let mut region = SharedStatsRegion::open_named(&name).unwrap();
+        let mut region = SharedStatsRegion::open_named_scoped(&name).unwrap();
         region
             .write_payload(Producer::HwBridge, b"hw: 1\n", 2, now_ms())
             .unwrap();

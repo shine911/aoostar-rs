@@ -36,8 +36,9 @@
 //! ```
 //!
 //! Readers detect new data by comparing `sequence` to the previously seen
-//! value; the odd/even protocol plus a double-read of `sequence` guarantee a
-//! consistent snapshot even while the writer is mid-update. `timestamp_ms`
+//! value ([`SharedStatsRegion::read_if_changed`] does that before copying
+//! anything); the odd/even protocol plus a double-read of `sequence`
+//! guarantee a consistent snapshot even while the writer is mid-update. `timestamp_ms`
 //! is used only to detect stale data (e.g. a producer frozen after
 //! sleep/resume).
 
@@ -48,7 +49,7 @@ mod slot;
 
 pub use payload::parse_key_value;
 pub use region::{Error, SharedStatsRegion};
-pub use slot::SlotSnapshot;
+pub use slot::{SlotSnapshot, SlotUpdate};
 
 // === Protocol constants (must match hwbridge/HwBridge.cs) ===
 
