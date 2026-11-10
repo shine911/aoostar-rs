@@ -131,15 +131,21 @@ The choice is persisted as `display_mode = "on" | "off" | "follow"` in `dist\lau
 (survives restarts; the key is optional — when absent the LCD stays on). Internally the launcher
 writes the mode to `dist\cfg\display.state`, which `asterctl --display-state` polls on every refresh.
 
-**The LCD always turns off when the launcher stops.** The launcher rewrites `display.state` roughly
-every 2 seconds as a heartbeat; if `asterctl` sees the file go stale (~10s) — the launcher was
+**The LCD always turns off when the launcher stops.** The launcher touches `display.state` roughly
+every 2 seconds as a heartbeat (only its timestamp; the `on`/`off` content is rewritten, atomically,
+only when the state changes); if `asterctl` sees the file go stale (~10s) — the launcher was
 closed, killed in Task Manager, or crashed — it switches the display off and exits to free the
 serial port. Quitting from the tray (or `Quit` in the menu) blanks the display the same way before
-the child processes are stopped.
+the child processes are stopped. If the launcher crashes or is killed, `aster-sysinfo` and
+`HwBridge.exe` stop with it immediately (they run in a kill-on-close Job Object), so a relaunch
+never ends up with two sets of sensor processes; `asterctl` is left out on purpose so it can
+blank the LCD first, then it exits on its own.
 
 Each process's own output goes to `dist\logs\aster-sysinfo.log`, `dist\logs\asterctl.log`, and
 `dist\logs\hwbridge.log`; these are truncated at every launcher start, so a log always covers just
-the current run. If a process crashes while the launcher is running, it's automatically restarted
+the current run. A log that grows past 5 MB is moved to `<name>.log.1` (replacing the previous
+`.1`) — `launcher.log` at launcher start, a child's log whenever that child is (re)started — so
+the logs stay bounded on a machine that runs for weeks. If a process crashes while the launcher is running, it's automatically restarted
 and a marker line is appended to its log. The launcher's own problems (e.g. it couldn't create the
 tray icon) go to `dist\logs\launcher.log` — it has no console window to print them to.
 
@@ -171,8 +177,10 @@ but does not clear the stale link). Recovery does not stop at wake:
 `asterctl` writes `cfg/uart.stuck` on every display-communication failure
 ("The semaphore timeout period has expired" included), and a launcher
 daemon re-enumerates the USB UART each time the marker appears (30s
-cooldown) and lets the watcher respawn `asterctl` — so a panel that wedges
-again minutes after wake (deep sleep) still recovers. Units whose panel
+cooldown, doubling up to 10 minutes while consecutive rescans do not bring
+the panel back, e.g. while it is unplugged; back to 30s once the marker has
+stayed away for 3 minutes) and lets the watcher respawn `asterctl` — so a
+panel that wedges again minutes after wake (deep sleep) still recovers. Units whose panel
 recovers from the soft re-init alone (fresh handle + OpenTFT, no USB
 disturbance) can set `restart_uart_on_resume = false` in `launcher.toml`.
 
