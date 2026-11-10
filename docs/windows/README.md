@@ -58,6 +58,13 @@ plain .NET Framework compiler that ships with Windows — no .NET SDK install re
 3. Run `HwBridge.exe` **as Administrator** — required because the underlying `LibreHardwareMonitorLib`/PawnIO stack
    needs elevated access to read hardware registers, the same requirement AOOSTAR-X itself has.
 
+   Usage: `HwBridge.exe --shm [refresh] [--raw] [--verbose]` or `HwBridge.exe <file> [refresh] [--raw] [--verbose]`.
+   By default only the keys the panels use are published (`cpu_temperature`, `motherboard_temperature`,
+   `memory_Temperature`, `gpu_core`, `gpu_temperature`) and the console/log summary is printed on the first
+   tick and when the sensor count changes. `--raw` additionally publishes every individual sensor as
+   `hw_<HardwareType>_<SensorType>_<Name>` (diagnostics, e.g. comparing against AOOSTAR-X), and `--verbose`
+   prints the summary on every tick.
+
 > **Prerequisite:** install [PawnIO](https://pawnio.eu/) first. `LibreHardwareMonitorLib` reads
 > hardware registers through the PawnIO driver stack; without it the CPU / motherboard / memory
 > temperature sensors stay empty.
