@@ -25,7 +25,8 @@ $RequiredFiles = @(
     (Join-Path $ReleaseDir "aster-launcher.exe"),
     (Join-Path $ReleaseDir "aster-sysinfo.exe"),
     (Join-Path $ReleaseDir "asterctl.exe"),
-    (Join-Path $RepoRoot "hwbridge\HwBridge.exe")
+    (Join-Path $RepoRoot "hwbridge\HwBridge.exe"),
+    (Join-Path $RepoRoot "hwbridge\lib\LibreHardwareMonitorLib.dll")
 )
 foreach ($file in $RequiredFiles) {
     if (-not (Test-Path $file)) {
@@ -77,8 +78,13 @@ Copy-Item (Join-Path $ReleaseDir "aster-sysinfo.exe") (Join-Path $Dist "bin")
 Copy-Item (Join-Path $ReleaseDir "asterctl.exe") (Join-Path $Dist "bin")
 
 Write-Host "Copying hwbridge..."
-Copy-Item (Join-Path $RepoRoot "hwbridge\*.exe") (Join-Path $Dist "hwbridge")
-Copy-Item (Join-Path $RepoRoot "hwbridge\*.dll") (Join-Path $Dist "hwbridge")
+# Only what HwBridge.exe needs at runtime: the exe, its config (probes lib\),
+# the NuGet DLLs build.ps1 fetched, and the third-party notices/licenses.
+Copy-Item (Join-Path $RepoRoot "hwbridge\HwBridge.exe") (Join-Path $Dist "hwbridge")
+Copy-Item (Join-Path $RepoRoot "hwbridge\HwBridge.exe.config") (Join-Path $Dist "hwbridge")
+Copy-Item (Join-Path $RepoRoot "hwbridge\NOTICE.md") (Join-Path $Dist "hwbridge")
+Copy-Item (Join-Path $RepoRoot "hwbridge\lib") (Join-Path $Dist "hwbridge\lib") -Recurse
+Copy-Item (Join-Path $RepoRoot "hwbridge\licenses") (Join-Path $Dist "hwbridge\licenses") -Recurse
 
 Write-Host "Copying cfg..."
 Copy-Item (Join-Path $RepoRoot "cfg") (Join-Path $Dist "cfg") -Recurse

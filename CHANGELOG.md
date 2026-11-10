@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+- HwBridge now uses the official LibreHardwareMonitorLib **0.9.6** NuGet package (was a modified
+  0.9.5 build copied from AOOSTAR-X). `hwbridge\build.ps1` downloads the 12 pinned, SHA256-checked
+  dependency DLLs into `hwbridge\lib\` and compiles HwBridge; the 31 vendored AOOSTAR-X DLLs
+  (including `inpoutx64.dll` and `libryzenadj.dll`, which HwBridge never used) are removed from the
+  repository and from `dist\hwbridge\`. Third-party licenses ship in `dist\hwbridge\licenses\`.
+
+### Fixed
+- `memory_Temperature` now reports the average of the DIMM temperature sensors. It previously
+  picked the highest memory "temperature", which is the SPD hub's fixed 85 °C critical-limit
+  threshold, so the LCD always showed RAM at 85 °C.
+
 ## v0.5.0 - 2026-09-06
 
 - Fixed Linux KDE tray choices persisting/applying, including repair of legacy concatenated or duplicate `launcher.toml` entries and correct async menu IDs/checkmarks.

@@ -14,11 +14,14 @@ Cargo.lock.tmp
 # Linux DEB/RPM package output
 /dist-linux
 
-# hwbridge: track source, vendored DLLs (see hwbridge/NOTICE.md), and notice; exclude build output
+# hwbridge: track source, build script, config, and notices; exclude build output
+# (HwBridge.exe) and the NuGet dependencies build.ps1 fetches (lib/, packages/)
 /hwbridge/*
 !/hwbridge/*.cs
-!/hwbridge/*.dll
+!/hwbridge/build.ps1
+!/hwbridge/HwBridge.exe.config
 !/hwbridge/NOTICE.md
+!/hwbridge/licenses/
 
 # private sensor value files
 /cfg/sensors/sysinfo.txt

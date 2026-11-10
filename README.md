@@ -50,9 +50,7 @@ git clone https://github.com/shine911/aoostar-rs.git
 cd aoostar-rs
 cargo build --release
 
-cd hwbridge
-& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs
-cd ..
+.\hwbridge\build.ps1
 
 .\windows\package-dist.ps1
 ```

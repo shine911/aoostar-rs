@@ -31,11 +31,9 @@ jobs:
         run: cargo build --release --bins
 
       - name: Build HwBridge.exe
-        shell: pwsh
-        working-directory: hwbridge
-        run: |
-          $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-          & $csc /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs
+        # Windows PowerShell 5.1, same as local builds (build-from-wsl.sh).
+        shell: powershell
+        run: .\hwbridge\build.ps1
 
       - name: Assemble dist folder
         shell: pwsh

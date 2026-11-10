@@ -34,33 +34,33 @@ in a normal shell. Run it from an elevated shell, or prefix it with `__COMPAT_LA
 `aster-sysinfo` can only read the sensors exposed by the [sysinfo](https://github.com/GuillaumeGomez/sysinfo) crate.
 On Windows, this does not include per-component temperatures, GPU load, or motherboard/memory sensors.
 [hwbridge](https://github.com/shine911/aoostar-rs/blob/main/hwbridge/HwBridge.cs) is a small standalone tool that
-loads the same `LibreHardwareMonitorLib.dll` AOOSTAR-X itself uses, and writes those additional sensor values into
+loads [LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (the same library
+AOOSTAR-X itself uses, taken from its official NuGet package), and writes those additional sensor values into
 a text file that `asterctl` picks up like any other sensor source (see
 [Text File Data Source](../sensor/provider/text_file.md)).
 
 It is written in deliberately old-style C# (no tuples, no string interpolation, no LINQ), so it compiles with the
 plain .NET Framework compiler that ships with Windows — no .NET SDK install required.
 
-1. Locate the .NET Framework C# compiler, typically:
+1. Build `HwBridge.exe` from the repository root:
 
-```shell
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+```powershell
+.\hwbridge\build.ps1
 ```
 
-2. Build `HwBridge.exe`, referencing the vendored DLLs in the `hwbridge` folder:
+   The script downloads the pinned NuGet packages (LibreHardwareMonitorLib 0.9.6 and its .NET Framework
+   dependencies), verifies their SHA256, extracts the DLLs into `hwbridge\lib\`, and compiles `HwBridge.cs`
+   with `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`. Licenses are listed in
+   [hwbridge/NOTICE.md](https://github.com/shine911/aoostar-rs/blob/main/hwbridge/NOTICE.md).
 
-```shell
-cd hwbridge
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /r:LibreHardwareMonitorLib.dll /out:HwBridge.exe HwBridge.cs
-```
+2. Keep `HwBridge.exe.config` next to `HwBridge.exe`; it tells .NET to load the DLLs from `lib\`.
 
 3. Run `HwBridge.exe` **as Administrator** — required because the underlying `LibreHardwareMonitorLib`/PawnIO stack
    needs elevated access to read hardware registers, the same requirement AOOSTAR-X itself has.
 
-> **Prerequisite:** install the official AOOSTAR-X **`PawnIO.exe`** first (download and install it
-> per the AOOSTAR-X software requirements). `HwBridge.exe` loads AOOSTAR-X's
-> `LibreHardwareMonitorLib.dll`, which reads hardware registers through the PawnIO driver stack;
-> without it the temperature / GPU sensors stay empty.
+> **Prerequisite:** install [PawnIO](https://pawnio.eu/) first. `LibreHardwareMonitorLib` reads
+> hardware registers through the PawnIO driver stack; without it the CPU / motherboard / memory
+> temperature sensors stay empty.
 
 See [sensor-mapping.cfg](https://github.com/shine911/aoostar-rs/blob/main/cfg/sensor-mapping.cfg) for an example
 mapping between AOOSTAR-X panel sensor labels and the labels `aster-sysinfo`/`hwbridge` produce on Windows.

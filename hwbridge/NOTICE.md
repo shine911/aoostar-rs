@@ -1,16 +1,32 @@
-# Third-Party Binaries Notice
+# Third-Party Components
 
-The `.dll` files in this folder are **not** part of this project. They are copied as-is from the
-official AOOSTAR-X installation directory (the vendor software this project reverse-engineers), so
-that `HwBridge.cs` can load the same hardware-sensor stack AOOSTAR-X itself uses.
+`HwBridge.exe` uses the open-source libraries below. They are not stored in this repository:
+`build.ps1` downloads each pinned package from [nuget.org](https://www.nuget.org/), checks its SHA256,
+and extracts the DLL into `lib\`. These DLLs are byte-identical to the ones shipped in the official
+[LibreHardwareMonitor v0.9.6](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/tag/v0.9.6)
+release.
 
-| File | Origin |
-|---|---|
-| `LibreHardwareMonitorLib.dll` | [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor), bundled by AOOSTAR-X |
-| `DiskInfoToolkit.dll`, `RAMSPDToolkit-NDD.dll`, `Aga.Controls.dll`, `BlackSharp.Core.dll`, `OxyPlot.dll`, `OxyPlot.WindowsForms.dll`, `HidSharp.dll`, `Microsoft.Win32.TaskScheduler.dll`, `inpoutx64.dll`, `libryzenadj.dll` | Bundled dependencies of the AOOSTAR-X installation |
-| Remaining `System.*.dll` / `Microsoft.Bcl.*.dll` | .NET BCL polyfill packages, bundled by AOOSTAR-X |
+| Component | Version | License | Source |
+|---|---|---|---|
+| LibreHardwareMonitorLib | 0.9.6 | MPL-2.0 | <https://github.com/LibreHardwareMonitor/LibreHardwareMonitor> |
+| DiskInfoToolkit | 1.1.2 | MPL-2.0 | <https://github.com/Blacktempel/DiskInfoToolkit> |
+| BlackSharp.Core | 1.0.7 | MPL-2.0 | <https://github.com/Blacktempel/BlackSharp> |
+| RAMSPDToolkit-NDD | 1.4.2 | MPL-2.0 | <https://github.com/Blacktempel/RAMSPDToolkit> |
+| HidSharp | 2.6.4 | Apache-2.0 | <https://software.seekye.com/hidsharp> |
+| System.Memory | 4.6.3 | MIT | <https://github.com/dotnet/maintenance-packages> |
+| System.Buffers | 4.6.1 | MIT | <https://github.com/dotnet/maintenance-packages> |
+| System.Numerics.Vectors | 4.6.1 | MIT | <https://github.com/dotnet/maintenance-packages> |
+| System.Runtime.CompilerServices.Unsafe | 6.1.2 | MIT | <https://github.com/dotnet/maintenance-packages> |
+| System.Threading.AccessControl | 10.0.3 | MIT | <https://github.com/dotnet/runtime> |
+| System.Security.AccessControl | 6.0.0 | MIT | <https://github.com/dotnet/runtime> |
+| System.Security.Principal.Windows | 5.0.0 | MIT | <https://github.com/dotnet/runtime> |
 
-They are included here only to make `HwBridge.cs` buildable without hunting down each dependency
-separately. No claim of authorship or license is made over these files — all rights remain with
-their respective owners (AOOSTAR-X / LibreHardwareMonitor / their upstream authors). Use, redistribute,
-or remove them at your own judgment and risk; this project takes no responsibility for them.
+The MPL-2.0 components are distributed unmodified; their source code is available at the
+repositories above. License texts are in `licenses\`:
+
+- `MPL-2.0.txt` — Mozilla Public License 2.0
+- `HidSharp-Apache-2.0.txt` — HidSharp's Apache License 2.0 notice
+- `MIT-dotnet.txt` — MIT License, .NET Foundation and Contributors
+
+Hardware access goes through the [PawnIO](https://pawnio.eu/) driver, which is not bundled and must be
+installed separately.
