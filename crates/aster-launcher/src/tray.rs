@@ -398,11 +398,11 @@ pub fn run(
     while !quit.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(2));
 
-        // Heartbeat for asterctl's launcher-death watchdog: rewrite
-        // cfg/display.state (idempotent content) so its mtime stays fresh
-        // while the launcher runs. If this loop stops — launcher closed or
-        // killed — asterctl sees the stale file, switches the display off
-        // and exits.
+        // Heartbeat for asterctl's launcher-death watchdog: refresh the
+        // mtime of cfg/display.state (content rewritten only when the
+        // state changed) while the launcher runs. If this loop stops —
+        // launcher closed or killed — asterctl sees the stale file,
+        // switches the display off and exits.
         display.heartbeat();
 
         // Move the check mark when the interval changed (e.g. the user
