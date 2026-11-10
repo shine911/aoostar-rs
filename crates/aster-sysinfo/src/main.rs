@@ -6,9 +6,7 @@
 
 use clap::Parser;
 use env_logger::Env;
-use itertools::Itertools;
 use log::{debug, error, info};
-use regex::Regex;
 use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -24,8 +22,46 @@ use std::process::{Command, exit};
 use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use sysinfo::{Components, DiskKind, Disks, Networks, System};
+#[cfg(not(windows))]
+use sysinfo::Components;
+use sysinfo::{
+    CpuRefreshKind, DiskKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind,
+    ProcessesToUpdate, RefreshKind, System,
+};
 use tempfile::Builder;
+
+/// Cadence of the slow refresh group (disk list/usage, process count, Linux
+/// per-disk storage sensors) when `--disk-refresh` is not given.
+const DEFAULT_SLOW_REFRESH: Duration = Duration::from_secs(30);
+
+/// Decides when the slow refresh group is due again.
+#[derive(Debug)]
+struct SlowCadence {
+    interval: Duration,
+    last: Option<Instant>,
+}
+
+impl SlowCadence {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    /// Due on the first call and then whenever `interval` has elapsed since
+    /// the last [`Self::mark`].
+    fn is_due(&self, now: Instant) -> bool {
+        match self.last {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.interval,
+        }
+    }
+
+    fn mark(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+}
 
 /// Allowed `--refresh` intervals, in seconds.
 const REFRESH_OPTIONS: [u16; 4] = [2, 5, 10, 30];
@@ -99,7 +135,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         fs::create_dir_all(parent)?;
     }
-    let mut sensors = HashMap::with_capacity(64);
+    // Fast group: rebuilt from scratch every tick, so vanished interfaces or
+    // components stop being published.
+    let mut sensors: HashMap<String, String> = HashMap::with_capacity(64);
+    // Slow group: rebuilt on the slow cadence and republished every tick.
+    let mut slow_sensors: HashMap<String, String> = HashMap::with_capacity(32);
+    let mut storage_state = StorageState::default();
     let mut sysinfo_source = SysinfoSource::new();
 
     // Shared-memory writer (SysInfo slot), used instead of the output file
@@ -117,10 +158,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refresh = Duration::from_secs(args.refresh.unwrap_or_default() as u64);
 
     let disk_refresh = Duration::from_secs(args.disk_refresh.unwrap_or_default() as u64);
-    let mut disk_refresh_time = Instant::now();
-    if !disk_refresh.is_zero() {
-        update_linux_storage_sensors(&mut sensors, use_smartctl)?;
-    }
+    let mut slow_cadence = SlowCadence::new(if disk_refresh.is_zero() {
+        DEFAULT_SLOW_REFRESH
+    } else {
+        disk_refresh
+    });
 
     if !refresh.is_zero() {
         info!(
@@ -132,14 +174,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let upd_start_time = Instant::now();
 
-        sysinfo_source.refresh();
-        sysinfo_source.update_sensors(&mut sensors)?;
+        let slow_due = slow_cadence.is_due(upd_start_time);
+        sysinfo_source.refresh(slow_due);
+        sensors.clear();
+        sysinfo_source.update_fast_sensors(&mut sensors);
 
-        if !disk_refresh.is_zero() && disk_refresh_time.elapsed() > disk_refresh {
-            debug!("Refreshing individual disks");
-            update_linux_storage_sensors(&mut sensors, use_smartctl)?;
-            disk_refresh_time = Instant::now();
+        if slow_due {
+            debug!("Refreshing slow sensor group (disks, processes)");
+            slow_sensors.clear();
+            sysinfo_source.update_slow_sensors(&mut slow_sensors);
+            if !disk_refresh.is_zero() {
+                update_linux_storage_sensors(&mut slow_sensors, use_smartctl, &mut storage_state);
+            }
+            slow_cadence.mark(upd_start_time);
         }
+        sensors.extend(slow_sensors.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         if let Some(writer) = shm_writer.as_mut() {
             writer.write(&sensors)?;
@@ -149,7 +198,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if args.console {
             // pretty print console output with sorted keys
-            for (label, value) in sensors.iter().sorted() {
+            let mut lines: Vec<_> = sensors.iter().collect();
+            lines.sort();
+            for (label, value) in lines {
                 println!("{}: {}", label, value);
             }
             println!();
@@ -224,6 +275,14 @@ fn serialize_payload(sensors: &HashMap<String, String>) -> Vec<u8> {
     payload
 }
 
+/// First sequence base for a writer: the previous slot sequence rounded up to
+/// even (an odd value means a write was in flight), or 0 for an empty slot.
+/// `write` adds 2 before every publish, so the next emitted sequence is
+/// always strictly greater than anything a reader may have seen.
+fn seed_sequence(previous: Option<u64>) -> u64 {
+    previous.map_or(0, |s| s.saturating_add(s & 1))
+}
+
 /// Publishes the sensor map into the SysInfo slot of the `AOOSTAR_HW_STATS`
 /// shared memory region, mirroring `HwBridge.exe --shm` (same protocol, same
 /// odd/even sequence pattern).
@@ -234,10 +293,23 @@ struct SharedMemoryWriter {
 
 impl SharedMemoryWriter {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            region: aster_hwstats::SharedStatsRegion::open()?,
-            sequence: 0,
-        })
+        Ok(Self::from_region(aster_hwstats::SharedStatsRegion::open()?))
+    }
+
+    /// Seeds the sequence from the SysInfo slot already in the region, so a
+    /// restarted writer never re-emits a sequence a reader has already seen.
+    fn from_region(region: aster_hwstats::SharedStatsRegion) -> Self {
+        let previous = match region.read_snapshot(aster_hwstats::Producer::SysInfo) {
+            Ok(snapshot) => snapshot.map(|s| s.sequence),
+            Err(e) => {
+                debug!("Unable to read previous SysInfo slot sequence: {e}");
+                None
+            }
+        };
+        Self {
+            region,
+            sequence: seed_sequence(previous),
+        }
     }
 
     fn write(
@@ -269,8 +341,14 @@ impl SharedMemoryWriter {
 pub struct SysinfoSource {
     sys: System,
     disks: Disks,
+    // Windows temperatures come from HwBridge; nothing consumes sysinfo's
+    // components there, and enumerating them costs a WMI round-trip.
+    #[cfg(not(windows))]
     components: Components,
     networks: Networks,
+    /// Static host metadata (`system_name`, ...), computed once.
+    static_info: Vec<(&'static str, String)>,
+    total_processes: usize,
     last_refresh: Option<Instant>,
     refresh_duration: Option<Duration>,
 }
@@ -284,22 +362,45 @@ impl Default for SysinfoSource {
 impl SysinfoSource {
     pub fn new() -> Self {
         Self {
-            sys: System::new_all(),
+            // Only CPU (usage + frequency) and RAM/swap are needed per tick;
+            // processes are never refreshed wholesale (see `refresh`).
+            sys: System::new_with_specifics(
+                RefreshKind::nothing()
+                    .with_cpu(CpuRefreshKind::everything())
+                    .with_memory(MemoryRefreshKind::everything()),
+            ),
             disks: Disks::new(),
+            #[cfg(not(windows))]
             components: Components::new(),
             networks: Networks::new(),
+            static_info: collect_static_info(),
+            total_processes: 0,
             last_refresh: None,
             refresh_duration: None,
         }
     }
 
-    pub fn refresh(&mut self) {
-        self.sys.refresh_all();
-        debug!("Refreshing disks, components, networks");
-        // TODO research "remove_not_listed_###" refresh parameter
-        self.disks.refresh(false);
-        self.components.refresh(false);
-        self.networks.refresh(false);
+    /// Refreshes the per-tick data (CPU, memory, components, networks).
+    /// With `slow` also the disk list/usage and the process count.
+    pub fn refresh(&mut self, slow: bool) {
+        self.sys.refresh_cpu_all();
+        self.sys.refresh_memory();
+        debug!("Refreshing components, networks");
+        // `true` drops entries that vanished (unplugged disk, removed NIC).
+        #[cfg(not(windows))]
+        self.components.refresh(true);
+        self.networks.refresh(true);
+        if slow {
+            debug!("Refreshing disks, process count");
+            self.disks.refresh(true);
+            // Only the count is published, so no per-process data is read.
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            self.total_processes = self.sys.processes().len();
+        }
 
         if let Some(last_refresh) = self.last_refresh {
             self.refresh_duration = Some(last_refresh.elapsed());
@@ -307,10 +408,7 @@ impl SysinfoSource {
         self.last_refresh = Some(Instant::now());
     }
 
-    fn update_sensors(
-        &self,
-        sensors: &mut HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn update_fast_sensors(&self, sensors: &mut HashMap<String, String>) {
         debug!("Refreshing sensors");
         for cpu in self.sys.cpus() {
             add_sensor(
@@ -406,21 +504,18 @@ impl SysinfoSource {
             format!("{day_string}{up_hours:02}:{up_mins:02}"),
         );
 
-        if let Some(name) = System::name() {
-            add_sensor(sensors, "system_name", name);
-        }
-        if let Some(kernel_version) = System::kernel_version() {
-            add_sensor(sensors, "system_kernel_version", kernel_version);
-        }
-        if let Some(os_version) = System::os_version() {
-            add_sensor(sensors, "system_os_version", os_version);
-        }
-        if let Some(host_name) = System::host_name() {
-            add_sensor(sensors, "system_hostname", host_name);
-        }
-
         add_sensor(sensors, "cpu_count", self.sys.cpus().len());
-        add_sensor(sensors, "total_processes", self.sys.processes().len());
+
+        self.update_component_sensors(sensors);
+        self.update_network_sensors(sensors);
+    }
+
+    /// Sensors that change slowly: static host metadata, process count, disks.
+    fn update_slow_sensors(&self, sensors: &mut HashMap<String, String>) {
+        for (label, value) in &self.static_info {
+            add_sensor(sensors, *label, value);
+        }
+        add_sensor(sensors, "total_processes", self.total_processes);
 
         // disks' information:
         let mut ssd_idx = 0;
@@ -442,7 +537,9 @@ impl SysinfoSource {
             add_sensor(
                 sensors,
                 format!("{label}_usage_percent"),
-                (disk.total_space() - disk.available_space()) * 100 / disk.total_space(),
+                (disk.total_space().saturating_sub(disk.available_space()) * 100)
+                    .checked_div(disk.total_space())
+                    .unwrap_or(0),
             );
 
             // using similar labels as AOOSTAR-X, but combining `{label2}_{label}`
@@ -457,7 +554,7 @@ impl SysinfoSource {
                 format!("disk_{device}_total"),
                 format_bytes(disk.total_space()),
             );
-            let used = disk.total_space() - disk.available_space();
+            let used = disk.total_space().saturating_sub(disk.available_space());
             add_sensor(sensors, format!("disk_{device}_used_bytes"), used);
             add_sensor(sensors, format!("disk_{device}_used"), format_bytes(used));
             add_sensor(
@@ -475,12 +572,18 @@ impl SysinfoSource {
                 format!("disk_{device}_usage_percent"),
                 format!(
                     "{:.1}",
-                    (disk.total_space() - disk.available_space()) as f64 * 100.0
+                    disk.total_space().saturating_sub(disk.available_space()) as f64 * 100.0
                         / disk.total_space() as f64
                 ),
             );
         }
+    }
 
+    #[cfg(windows)]
+    fn update_component_sensors(&self, _sensors: &mut HashMap<String, String>) {}
+
+    #[cfg(not(windows))]
+    fn update_component_sensors(&self, sensors: &mut HashMap<String, String>) {
         // Components temperature:
         for component in &self.components {
             if let Some(temperature) = component.temperature() {
@@ -521,14 +624,14 @@ impl SysinfoSource {
 
         #[cfg(target_os = "linux")]
         {
-            sensors.remove("gpu_core#unit");
-            sensors.remove("gpu_core");
             if let Some(gpu_busy) = read_gpu_busy_percent(Path::new("/sys/class/drm")) {
                 add_sensor(sensors, "gpu_core#unit", "%");
                 add_sensor(sensors, "gpu_core", gpu_busy);
             }
         }
+    }
 
+    fn update_network_sensors(&self, sensors: &mut HashMap<String, String>) {
         // Network interfaces name, total data received and total data transmitted:
         #[cfg(target_os = "linux")]
         let mut network_candidates = Vec::new();
@@ -569,13 +672,11 @@ impl SysinfoSource {
             }
             // Sort by address to avoid random order in refreshes
             #[allow(unreachable_code)]
-            for (idx, addr) in data
-                .ip_networks()
-                .iter()
-                .map(|net| net.addr)
-                .sorted()
-                .enumerate()
-            {
+            let mut addrs: Vec<_> = data.ip_networks().iter().map(|net| net.addr).collect();
+            #[allow(unreachable_code)]
+            addrs.sort();
+            #[allow(unreachable_code)]
+            for (idx, addr) in addrs.into_iter().enumerate() {
                 add_sensor(
                     sensors,
                     format!("network_{interface_name}_address{idx}"),
@@ -623,14 +724,6 @@ impl SysinfoSource {
 
         #[cfg(target_os = "linux")]
         {
-            for label in [
-                "network_interface_name",
-                "network_ip_address",
-                "network_download_speed",
-                "network_upload_speed",
-            ] {
-                sensors.remove(label);
-            }
             if let Some(network) = select_network_candidate(&network_candidates) {
                 add_sensor(sensors, "network_interface_name", &network.name);
                 if let Some(address) = network
@@ -658,9 +751,20 @@ impl SysinfoSource {
                 }
             }
         }
-
-        Ok(())
     }
+}
+
+/// Host metadata that cannot change while the process runs.
+fn collect_static_info() -> Vec<(&'static str, String)> {
+    [
+        ("system_name", System::name()),
+        ("system_kernel_version", System::kernel_version()),
+        ("system_os_version", System::os_version()),
+        ("system_hostname", System::host_name()),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.map(|v| (label, v)))
+    .collect()
 }
 
 fn add_sensor(
@@ -739,48 +843,26 @@ fn read_gpu_busy_percent(root: &Path) -> Option<String> {
     None
 }
 
+/// State carried between slow refreshes of the Linux storage sensors.
+#[derive(Debug, Default)]
+struct StorageState {
+    /// Last known smartctl temperature per device (kept while it sleeps).
+    last_temperatures: HashMap<String, i32>,
+}
+
 fn update_linux_storage_sensors(
     sensors: &mut HashMap<String, String>,
     use_smartctl: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    state: &mut StorageState,
+) {
+    // One `df` run serves every device.
+    let mounts = read_df_mounts();
+
     // Note: AOOSTAR-X only considered spinning Rust. Too bad if you're using SSDs in the HD bays...
     if let Ok(hdd_devices) = get_storage_devices(StorageDevice::HddOrSsd) {
         debug!("HDD devices : {:?}", hdd_devices);
         for (idx, device) in hdd_devices.iter().enumerate() {
-            let usage = get_disk_usage(device)?;
-            add_sensor(
-                sensors,
-                format!("storage_hdd[{idx}]_total_size_bytes"),
-                usage.total_size,
-            );
-            add_sensor(
-                sensors,
-                format!("storage_hdd[{idx}]_total_size"),
-                format_bytes(usage.total_size),
-            );
-            add_sensor(
-                sensors,
-                format!("storage_hdd[{idx}]_total_used_bytes"),
-                usage.total_used,
-            );
-            add_sensor(
-                sensors,
-                format!("storage_hdd[{idx}]_total_used"),
-                format_bytes(usage.total_used),
-            );
-            add_sensor(
-                sensors,
-                format!("storage_hdd[{idx}]_usage_percent"),
-                usage.usage_percent,
-            );
-
-            if use_smartctl && let Some(temperature) = get_smartctl_disk_temperature(device)? {
-                add_sensor(
-                    sensors,
-                    format!("storage_hdd[{idx}]_temperature"),
-                    temperature,
-                );
-            }
+            add_storage_sensors(sensors, "hdd", idx, device, &mounts, use_smartctl, state);
         }
     }
 
@@ -788,44 +870,63 @@ fn update_linux_storage_sensors(
     if let Ok(nvme_devices) = get_storage_devices(StorageDevice::Nvme) {
         debug!("NVME devices: {:?}", nvme_devices);
         for (idx, device) in nvme_devices.iter().enumerate() {
-            let usage = get_disk_usage(device)?;
-            add_sensor(
-                sensors,
-                format!("storage_ssd[{idx}]_total_size_bytes"),
-                usage.total_size,
-            );
-            add_sensor(
-                sensors,
-                format!("storage_ssd[{idx}]_total_size"),
-                format_bytes(usage.total_size),
-            );
-            add_sensor(
-                sensors,
-                format!("storage_ssd[{idx}]_total_used_bytes"),
-                usage.total_used,
-            );
-            add_sensor(
-                sensors,
-                format!("storage_ssd[{idx}]_total_used"),
-                format_bytes(usage.total_used),
-            );
-            add_sensor(
-                sensors,
-                format!("storage_ssd[{idx}]_usage_percent"),
-                usage.usage_percent,
-            );
-
-            if use_smartctl && let Some(temperature) = get_smartctl_disk_temperature(device)? {
-                add_sensor(
-                    sensors,
-                    format!("storage_ssd[{idx}]_temperature"),
-                    temperature,
-                );
-            }
+            add_storage_sensors(sensors, "ssd", idx, device, &mounts, use_smartctl, state);
         }
     }
+}
 
-    Ok(())
+fn add_storage_sensors(
+    sensors: &mut HashMap<String, String>,
+    kind: &str,
+    idx: usize,
+    device: &str,
+    mounts: &[DfMount],
+    use_smartctl: bool,
+    state: &mut StorageState,
+) {
+    let usage = disk_usage_from_mounts(device, mounts);
+    let prefix = format!("storage_{kind}[{idx}]");
+    add_sensor(
+        sensors,
+        format!("{prefix}_total_size_bytes"),
+        usage.total_size,
+    );
+    add_sensor(
+        sensors,
+        format!("{prefix}_total_size"),
+        format_bytes(usage.total_size),
+    );
+    add_sensor(
+        sensors,
+        format!("{prefix}_total_used_bytes"),
+        usage.total_used,
+    );
+    add_sensor(
+        sensors,
+        format!("{prefix}_total_used"),
+        format_bytes(usage.total_used),
+    );
+    add_sensor(
+        sensors,
+        format!("{prefix}_usage_percent"),
+        usage.usage_percent,
+    );
+
+    if use_smartctl {
+        match get_smartctl_disk_temperature(device) {
+            SmartctlTemperature::Value(t) => {
+                state.last_temperatures.insert(device.to_string(), t);
+            }
+            // Asleep: keep the last value instead of waking the drive.
+            SmartctlTemperature::Standby => {}
+            SmartctlTemperature::Unavailable => {
+                state.last_temperatures.remove(device);
+            }
+        }
+        if let Some(t) = state.last_temperatures.get(device) {
+            add_sensor(sensors, format!("{prefix}_temperature"), t);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -874,17 +975,14 @@ pub fn get_storage_devices(kind: StorageDevice) -> Result<Vec<String>, Box<dyn s
         return Ok(devices);
     }
 
-    let device_regex = Regex::new(r"^sd[a-z]+$")?;
-    let nvme_regex = Regex::new(r"^nvme[0-9]+n[0-9]+$")?;
-
     for entry in fs::read_dir(sys_block)? {
         let entry = entry?;
         let dev_name = entry.file_name();
         let dev_str = dev_name.to_string_lossy();
 
         // filter out all non sd* and nvme* devices
-        let is_nvme = nvme_regex.is_match(&dev_str);
-        let is_storage = device_regex.is_match(&dev_str);
+        let is_nvme = is_nvme_device_name(&dev_str);
+        let is_storage = is_sd_device_name(&dev_str);
         if !(is_nvme || is_storage) {
             continue;
         }
@@ -943,113 +1041,171 @@ pub fn get_storage_devices(kind: StorageDevice) -> Result<Vec<String>, Box<dyn s
     Ok(devices)
 }
 
-/// Retrieve temperature from NVMe or SDD/HDD with smartctl
-pub fn get_smartctl_disk_temperature(dev: &str) -> Result<Option<i32>, Box<dyn std::error::Error>> {
-    let temp_regex =
-        Regex::new(r"194\s+Temperature_Celsius\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+-\s+(\d+)")?;
-    let nvme_temp_regex = Regex::new(r"Temperature:\s+(\d+)\s")?;
+/// Outcome of a smartctl temperature query.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SmartctlTemperature {
+    Value(i32),
+    /// Device is in a low-power mode and was deliberately not woken up.
+    Standby,
+    Unavailable,
+}
 
+/// Retrieve temperature from NVMe or SDD/HDD with smartctl.
+///
+/// `-n standby` makes smartctl skip drives that are spun down (exit status 2)
+/// instead of waking them for every poll.
+pub fn get_smartctl_disk_temperature(dev: &str) -> SmartctlTemperature {
     let dev = format!("/dev/{}", dev);
     match Command::new("sudo")
-        .arg("-n")
-        .arg("smartctl")
-        .arg("-A")
+        .args(["-n", "smartctl", "-n", "standby", "-A"])
         .arg(&dev)
         .output()
     {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-
-            if let Some(temp_captures) = temp_regex
-                .captures(&stdout)
-                .or_else(|| nvme_temp_regex.captures(&stdout))
-                && let Some(temp_match) = temp_captures.get(1)
-            {
-                let temperature = temp_match.as_str().parse::<i32>()?;
-                return Ok(Some(temperature));
-            }
+            parse_smartctl_output(output.status.code(), &stdout)
         }
         Err(e) => {
             error!("Device {dev} acquisition failed, error: {e}");
+            SmartctlTemperature::Unavailable
         }
     }
-
-    Ok(None)
 }
 
-/// Calculate actual filesystem usage rate of hard disk (based on df command)
-pub fn get_disk_usage(dev: &str) -> Result<DiskUsage, Box<dyn std::error::Error>> {
-    let mut tmp = DiskUsage {
+fn parse_smartctl_output(exit_code: Option<i32>, stdout: &str) -> SmartctlTemperature {
+    // smartctl prints "Device is in STANDBY mode, exit(2)" for `-n standby`.
+    if exit_code == Some(2) && stdout.contains("Device is in") {
+        return SmartctlTemperature::Standby;
+    }
+    match parse_smartctl_temperature(stdout) {
+        Some(t) => SmartctlTemperature::Value(t),
+        None => SmartctlTemperature::Unavailable,
+    }
+}
+
+/// Extracts the temperature from `smartctl -A` output: the SATA attribute
+/// `194 Temperature_Celsius ... - <raw>` first, then the NVMe
+/// `Temperature: <n> Celsius` line.
+fn parse_smartctl_temperature(stdout: &str) -> Option<i32> {
+    let sata = stdout.lines().find_map(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // ID NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW
+        if tokens.len() > 9 && tokens[0] == "194" && tokens[1] == "Temperature_Celsius" {
+            if tokens[8] != "-" {
+                return None;
+            }
+            let digits: String = tokens[9].chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<i32>().ok()
+        } else {
+            None
+        }
+    });
+    sata.or_else(|| {
+        stdout.lines().find_map(|line| {
+            let rest = line.split_once("Temperature:")?.1;
+            let mut tokens = rest.split_whitespace();
+            let value = tokens.next()?.parse::<i32>().ok()?;
+            // the value must be followed by a unit
+            tokens.next()?;
+            Some(value)
+        })
+    })
+}
+
+/// A mounted filesystem as reported by `df`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DfMount {
+    pub source: String,
+    pub size: u64,
+    pub used: u64,
+}
+
+/// Runs `df` once for all filesystems (no shell involved).
+fn read_df_mounts() -> Vec<DfMount> {
+    match Command::new("df")
+        .args(["--block-size=1", "--output=source,size,used"])
+        .output()
+    {
+        // df exits non-zero when some filesystem is inaccessible but still
+        // prints the rest, so the status is deliberately not checked.
+        Ok(output) => parse_df_output(&String::from_utf8_lossy(&output.stdout)),
+        Err(e) => {
+            error!("Unable to run df: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Parses `df --output=source,size,used` lines; the header is skipped because
+/// its size/used columns are not numeric.
+fn parse_df_output(stdout: &str) -> Vec<DfMount> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace().rev();
+            let used = tokens.next()?.parse::<u64>().ok()?;
+            let size = tokens.next()?.parse::<u64>().ok()?;
+            let source = tokens.rev().collect::<Vec<_>>().join(" ");
+            (!source.is_empty()).then_some(DfMount { source, size, used })
+        })
+        .collect()
+}
+
+/// Whether `/dev/...` `source` is the block device `dev` itself or one of its
+/// partitions: `sda` -> `sda`, `sda1`; `nvme0n1` -> `nvme0n1`, `nvme0n1p1`.
+/// Unlike a prefix match, `sda` does not match `sdab1`.
+fn is_device_or_partition(source: &str, dev: &str) -> bool {
+    let Some(name) = source.strip_prefix("/dev/") else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix(dev) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let partition = if is_nvme_device_name(dev) {
+        rest.strip_prefix('p')
+    } else {
+        Some(rest)
+    };
+    partition.is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `sd` followed by one or more letters (`sda`, `sdab`).
+fn is_sd_device_name(name: &str) -> bool {
+    name.strip_prefix("sd")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
+/// `nvme<N>n<M>` (`nvme0n1`).
+fn is_nvme_device_name(name: &str) -> bool {
+    let Some((ctrl, ns)) = name.strip_prefix("nvme").and_then(|r| r.split_once('n')) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(ctrl) && digits(ns)
+}
+
+/// Sums size/used over all filesystems mounted from `dev` or its partitions.
+fn disk_usage_from_mounts(dev: &str, mounts: &[DfMount]) -> DiskUsage {
+    let mut usage = DiskUsage {
         usage_percent: 0.0,
         total_used: 0,
         total_size: 0,
     };
-
-    // Get mounted partitions for this device
-    let cmd = format!(
-        "df -h --output=source,target,pcent | grep '/dev/{}[0-9]*'",
-        dev
-    );
-
-    match Command::new("sh").arg("-c").arg(&cmd).output() {
-        Ok(output) => {
-            if !output.status.success() {
-                return Ok(tmp);
-            }
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut total_used: u64 = 0;
-            let mut total_size: u64 = 0;
-
-            for line in stdout.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 3 {
-                    continue;
-                }
-
-                let mountpoint = parts[1];
-
-                // Get size in bytes
-                let size_cmd = format!(
-                    "df --block-size=1 {} | awk 'NR==2 {{print $2}}'",
-                    mountpoint
-                );
-                if let Ok(size_output) = Command::new("sh").arg("-c").arg(&size_cmd).output()
-                    && let Ok(size_str) = String::from_utf8(size_output.stdout)
-                    && let Ok(size) = size_str.trim().parse::<u64>()
-                {
-                    total_size += size;
-                }
-
-                // Get used space in bytes
-                let used_cmd = format!(
-                    "df --block-size=1 {} | awk 'NR==2 {{print $3}}'",
-                    mountpoint
-                );
-                if let Ok(used_output) = Command::new("sh").arg("-c").arg(&used_cmd).output()
-                    && let Ok(used_str) = String::from_utf8(used_output.stdout)
-                    && let Ok(used) = used_str.trim().parse::<u64>()
-                {
-                    total_used += used;
-                }
-            }
-
-            if total_size != 0 {
-                tmp.usage_percent =
-                    ((total_used as f64 / total_size as f64) * 100.0 * 100.0).round() / 100.0;
-                tmp.total_used = total_used;
-                tmp.total_size = total_size;
-            }
-
-            Ok(tmp)
-        }
-        Err(_) => Ok(tmp),
+    for mount in mounts
+        .iter()
+        .filter(|m| is_device_or_partition(&m.source, dev))
+    {
+        usage.total_size += mount.size;
+        usage.total_used += mount.used;
     }
+    if usage.total_size != 0 {
+        usage.usage_percent =
+            ((usage.total_used as f64 / usage.total_size as f64) * 100.0 * 100.0).round() / 100.0;
+    }
+    usage
 }
 
 /// Format bytes into human-readable string
@@ -1117,6 +1273,114 @@ mod tests {
         for (label, value) in &sensors {
             assert_eq!(parsed.get(label).unwrap(), value);
         }
+    }
+
+    #[test]
+    fn slow_cadence_is_due_first_then_after_interval() {
+        let mut c = SlowCadence::new(Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert!(c.is_due(t0));
+        c.mark(t0);
+        assert!(!c.is_due(t0 + Duration::from_secs(2)));
+        assert!(!c.is_due(t0 + Duration::from_secs(29)));
+        assert!(c.is_due(t0 + Duration::from_secs(30)));
+        // clock going backwards must not be due
+        assert!(!c.is_due(t0));
+    }
+
+    #[test]
+    fn seed_sequence_rounds_up_to_even() {
+        assert_eq!(seed_sequence(None), 0);
+        assert_eq!(seed_sequence(Some(0)), 0);
+        assert_eq!(seed_sequence(Some(10)), 10);
+        assert_eq!(seed_sequence(Some(11)), 12);
+        assert_eq!(seed_sequence(Some(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
+    fn writer_resumes_after_previous_sequence() {
+        let name = format!("aster-sysinfo-test-{}", std::process::id());
+        let mut first = aster_hwstats::SharedStatsRegion::open_named(&name).unwrap();
+        first
+            .write_payload(aster_hwstats::Producer::SysInfo, b"a: 1\n", 42, 1)
+            .unwrap();
+        let second = aster_hwstats::SharedStatsRegion::open_named(&name).unwrap();
+        let mut writer = SharedMemoryWriter::from_region(second);
+        assert_eq!(writer.sequence, 42);
+        writer.write(&HashMap::new()).unwrap();
+        assert_eq!(writer.sequence, 44);
+    }
+
+    #[test]
+    fn partition_matching_is_exact() {
+        assert!(is_device_or_partition("/dev/sda", "sda"));
+        assert!(is_device_or_partition("/dev/sda1", "sda"));
+        assert!(is_device_or_partition("/dev/sda12", "sda"));
+        assert!(!is_device_or_partition("/dev/sdab1", "sda"));
+        assert!(!is_device_or_partition("/dev/sdab", "sda"));
+        assert!(!is_device_or_partition("/dev/sdb1", "sda"));
+        assert!(!is_device_or_partition("sda1", "sda"));
+        assert!(is_device_or_partition("/dev/nvme0n1", "nvme0n1"));
+        assert!(is_device_or_partition("/dev/nvme0n1p2", "nvme0n1"));
+        assert!(!is_device_or_partition("/dev/nvme0n11p2", "nvme0n1"));
+        assert!(!is_device_or_partition("/dev/nvme0n12", "nvme0n1"));
+    }
+
+    #[test]
+    fn device_name_checks() {
+        assert!(is_sd_device_name("sda"));
+        assert!(is_sd_device_name("sdab"));
+        assert!(!is_sd_device_name("sd"));
+        assert!(!is_sd_device_name("sda1"));
+        assert!(is_nvme_device_name("nvme0n1"));
+        assert!(is_nvme_device_name("nvme10n12"));
+        assert!(!is_nvme_device_name("nvme0n1p1"));
+        assert!(!is_nvme_device_name("nvme0"));
+    }
+
+    #[test]
+    fn df_output_sums_partitions_only() {
+        let out = "Filesystem 1B-blocks Used\n\
+                   /dev/sda1 1000 250\n\
+                   /dev/sda2 3000 750\n\
+                   /dev/sdab1 5000 5000\n\
+                   tmpfs 10 1\n";
+        let mounts = parse_df_output(out);
+        assert_eq!(mounts.len(), 4);
+        let usage = disk_usage_from_mounts("sda", &mounts);
+        assert_eq!(usage.total_size, 4000);
+        assert_eq!(usage.total_used, 1000);
+        assert_eq!(usage.usage_percent, 25.0);
+        let none = disk_usage_from_mounts("sdc", &mounts);
+        assert_eq!(none.total_size, 0);
+        assert_eq!(none.usage_percent, 0.0);
+    }
+
+    #[test]
+    fn smartctl_parsing() {
+        let sata = "ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE\n\
+                    194 Temperature_Celsius     0x0022   036   045   000    Old_age   Always       -       36 (Min/Max 20/45)\n";
+        assert_eq!(
+            parse_smartctl_output(Some(0), sata),
+            SmartctlTemperature::Value(36)
+        );
+        let nvme = "Temperature Sensor 1:               40 Celsius\nTemperature:                        38 Celsius\n";
+        assert_eq!(
+            parse_smartctl_output(Some(0), nvme),
+            SmartctlTemperature::Value(38)
+        );
+        assert_eq!(
+            parse_smartctl_output(Some(2), "Device is in STANDBY mode, exit(2)\n"),
+            SmartctlTemperature::Standby
+        );
+        assert_eq!(
+            parse_smartctl_output(Some(2), ""),
+            SmartctlTemperature::Unavailable
+        );
+        assert_eq!(
+            parse_smartctl_output(Some(0), "garbage"),
+            SmartctlTemperature::Unavailable
+        );
     }
 
     #[cfg(target_os = "linux")]
