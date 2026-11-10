@@ -2,8 +2,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Markus Zehnder
 
 use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBits};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
+
+/// Bytes and write calls captured by a [`FakeSerialPort`] (test aid).
+#[derive(Debug, Default)]
+pub struct WriteRecord {
+    /// Every byte accepted by the port, in order.
+    pub bytes: Vec<u8>,
+    /// Number of `write` calls that accepted at least one byte.
+    pub writes: usize,
+}
+
+/// Scripted outcome of one upcoming `write` call (test injection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteStep {
+    /// Fail with an error; no bytes are accepted.
+    Fail,
+    /// Accept at most this many bytes (a short write; 0 = accepts nothing).
+    Partial(usize),
+}
 
 pub struct FakeSerialPort {
     baud_rate: u32,
@@ -14,6 +34,12 @@ pub struct FakeSerialPort {
     timeout: Duration,
     /// Number of upcoming writes that will fail (test injection).
     fail_writes: u32,
+    /// Scripted outcomes for upcoming writes, consumed after `fail_writes`.
+    script: VecDeque<WriteStep>,
+    /// Simulate the UART transfer time with a sleep (default on).
+    delay: bool,
+    /// Optional capture of everything written.
+    record: Option<Arc<Mutex<WriteRecord>>>,
 }
 
 impl Default for FakeSerialPort {
@@ -32,7 +58,28 @@ impl FakeSerialPort {
             stop_bits: StopBits::One,
             timeout: Default::default(),
             fail_writes: 0,
+            script: VecDeque::new(),
+            delay: true,
+            record: None,
         }
+    }
+
+    /// Skip the simulated transfer delay (fast unit tests).
+    pub fn without_delay(mut self) -> FakeSerialPort {
+        self.delay = false;
+        self
+    }
+
+    /// Capture all accepted bytes and write calls into `record`.
+    pub fn with_record(mut self, record: Arc<Mutex<WriteRecord>>) -> FakeSerialPort {
+        self.record = Some(record);
+        self
+    }
+
+    /// Script the outcomes of the next write calls (after any `with_failures`).
+    pub fn with_script(mut self, steps: impl IntoIterator<Item = WriteStep>) -> FakeSerialPort {
+        self.script.extend(steps);
+        self
     }
 
     /// Simulates a wedged serial port: the next `fail_writes` writes fail
@@ -59,12 +106,31 @@ impl std::io::Write for FakeSerialPort {
                 "injected write failure",
             ));
         }
-        // just some approximation, additional overhead like flushing etc is not considered
-        let byte_rate =
-            self.baud_rate / (1 + u8::from(self.data_bits) + u8::from(self.stop_bits)) as u32;
-        let delay = Duration::from_micros((buf.len() * 1000 * 1000 / byte_rate as usize) as u64);
-        sleep(delay);
-        Ok(buf.len())
+        let accepted = match self.script.pop_front() {
+            Some(WriteStep::Fail) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted write failure",
+                ));
+            }
+            Some(WriteStep::Partial(n)) => n.min(buf.len()),
+            None => buf.len(),
+        };
+        if self.delay {
+            // just some approximation, additional overhead like flushing etc is not considered
+            let byte_rate =
+                self.baud_rate / (1 + u8::from(self.data_bits) + u8::from(self.stop_bits)) as u32;
+            let delay = Duration::from_micros((accepted * 1000 * 1000 / byte_rate as usize) as u64);
+            sleep(delay);
+        }
+        if accepted > 0
+            && let Some(record) = &self.record
+        {
+            let mut record = record.lock().expect("write record lock poisoned");
+            record.bytes.extend_from_slice(&buf[..accepted]);
+            record.writes += 1;
+        }
+        Ok(accepted)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
