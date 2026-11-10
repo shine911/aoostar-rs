@@ -17,7 +17,8 @@ aster-hwstats = { path = "../aster-hwstats", version = "0.1.0" }
 anyhow = "1.0.98"
 clap = { version = "4.5.42", features = ["derive"] }
 chrono = "0.4"
-image = "0.25.6"
+# Only the decoders/encoders themes can use; the defaults pull in AVIF (rav1e), EXR, TIFF, WebP, ...
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
 imageproc = { version = "0.25.0", default-features = false }
 ab_glyph = { version = "0.2.31", default-features = false, features = ["std"] }
 log = "0.4.27"

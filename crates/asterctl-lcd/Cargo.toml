@@ -13,6 +13,7 @@ repository.workspace = true
 anyhow = "1.0.98"
 bytes = "1.10.1"
 # TODO make image an optional feature
-image = "0.25.6"
+# Only the pixel buffer types are used; no codecs needed.
+image = { version = "0.25.6", default-features = false }
 log = "0.4.27"
 serialport = "4.7.3"
