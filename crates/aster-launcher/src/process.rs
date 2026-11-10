@@ -131,6 +131,34 @@ pub struct ChildHandle {
     pub name: &'static str,
     pub healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub current_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    /// Set (under the `current_child` lock, only while a child exists) by
+    /// every deliberate kill — tray restarts, suspend, stuck-marker rescan,
+    /// shutdown — and consumed by the watcher when that child exits, so a
+    /// kill is not mistaken for a crash: `TerminateProcess` makes the child
+    /// exit with code 1, which within [`QUICK_EXIT_THRESHOLD`] of its spawn
+    /// would otherwise grow the restart backoff.
+    pub killed_on_purpose: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Locks `mutex`, recovering the data if a previous holder panicked. The
+/// guarded values here (child specs, the current `Child`) stay valid after
+/// a panic elsewhere, and a watcher must keep supervising — and be able to
+/// kill — its child instead of dying on a poisoned lock (never-panic
+/// contract).
+pub(crate) fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Kills `child` as a deliberate act (see [`ChildHandle::killed_on_purpose`]).
+/// Must be called with the `current_child` lock held.
+fn kill_on_purpose(
+    child: &mut std::process::Child,
+    killed_on_purpose: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
+    killed_on_purpose.store(true, std::sync::atomic::Ordering::SeqCst);
+    child.kill()
 }
 
 /// Best-effort force-kill of every currently running child (used on power
@@ -142,15 +170,13 @@ pub struct ChildHandle {
 /// (see `spawn_and_watch`). Safe to call with children already dead.
 pub(crate) fn kill_all(handles: &[ChildHandle], log_path: &Path) {
     for handle in handles {
-        if let Ok(mut guard) = handle.current_child.lock()
-            && let Some(child) = guard.as_mut()
+        if let Some(child) = lock_recover(&handle.current_child).as_mut()
+            && let Err(err) = kill_on_purpose(child, &handle.killed_on_purpose)
         {
-            if let Err(err) = child.kill() {
-                crate::logging::append_line(
-                    log_path,
-                    &format!("kill_all: failed to kill {}: {err}", handle.name),
-                );
-            }
+            crate::logging::append_line(
+                log_path,
+                &format!("kill_all: failed to kill {}: {err}", handle.name),
+            );
         }
     }
 }
@@ -165,12 +191,8 @@ pub(crate) fn kill_named(handles: &[ChildHandle], names: &[&str]) -> Result<(), 
         if !names.contains(&handle.name) {
             continue;
         }
-        let Ok(mut guard) = handle.current_child.lock() else {
-            errors.push(format!("{} child mutex is poisoned", handle.name));
-            continue;
-        };
-        if let Some(child) = guard.as_mut()
-            && let Err(err) = child.kill()
+        if let Some(child) = lock_recover(&handle.current_child).as_mut()
+            && let Err(err) = kill_on_purpose(child, &handle.killed_on_purpose)
         {
             errors.push(format!("failed to restart {}: {err}", handle.name));
         }
@@ -228,6 +250,32 @@ fn is_quick_failure(status: Option<std::process::ExitStatus>, uptime: std::time:
     }
 }
 
+/// Next value of a watcher's consecutive-failure counter after its child
+/// exited: grows on a quick failing exit (see [`is_quick_failure`]), resets
+/// otherwise — and always resets when the launcher itself killed the child
+/// (`killed_on_purpose`: tray restart, suspend, stuck-marker rescan), since
+/// a deliberate `TerminateProcess` exits with code 1 and would otherwise
+/// look like a crash right after spawn.
+fn next_consecutive_failures(
+    previous: u32,
+    status: Option<std::process::ExitStatus>,
+    uptime: std::time::Duration,
+    killed_on_purpose: bool,
+) -> u32 {
+    if !killed_on_purpose && is_quick_failure(status, uptime) {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// How often a watcher checks its running child (`try_wait`) and the
+/// quit/suspend flags. 1s keeps the 24/7 launcher at ~1 wakeup/s per
+/// watcher (it was ~3-5/s) while staying well inside the shutdown budget:
+/// the clean-quit path already waits [`QUIT_KILL_GRACE_SECS`] and suspend
+/// kills the children directly via `kill_all`.
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Retry delay for the given number of consecutive spawn failures: the base
 /// delay up to the threshold, then doubling, capped at [`MAX_BACKOFF_SECS`].
 fn retry_delay(consecutive_failures: u32) -> std::time::Duration {
@@ -246,13 +294,16 @@ fn retry_delay(consecutive_failures: u32) -> std::time::Duration {
 fn sleep_until_quit(quit: &std::sync::atomic::AtomicBool, total: std::time::Duration) {
     use std::sync::atomic::Ordering;
 
-    const STEP: std::time::Duration = std::time::Duration::from_millis(200);
     let deadline = std::time::Instant::now() + total;
-    while std::time::Instant::now() < deadline {
+    loop {
         if quit.load(Ordering::SeqCst) {
             return;
         }
-        std::thread::sleep(STEP);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::sleep(WATCH_POLL.min(remaining));
     }
 }
 
@@ -330,17 +381,29 @@ pub fn spawn_and_watch(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    let spec = specs.lock().unwrap()[index].clone();
-    let name = spec.name;
-    let log_path = spec.log_path.clone();
-
     let healthy = Arc::new(AtomicBool::new(false));
     let current_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+    let killed_on_purpose = Arc::new(AtomicBool::new(false));
+
+    // Callers iterate over the specs they built, so `index` is always
+    // valid; still, never panic over it — report an inert "unknown" child.
+    let Some(spec) = lock_recover(&specs).get(index).cloned() else {
+        let handle = ChildHandle {
+            name: "unknown",
+            healthy,
+            current_child,
+            killed_on_purpose,
+        };
+        return (handle, std::thread::spawn(|| {}));
+    };
+    let name = spec.name;
+    let log_path = spec.log_path.clone();
 
     let handle = ChildHandle {
         name,
         healthy: healthy.clone(),
         current_child: current_child.clone(),
+        killed_on_purpose: killed_on_purpose.clone(),
     };
 
     let watcher = std::thread::spawn(move || {
@@ -365,19 +428,27 @@ pub fn spawn_and_watch(
             // the power monitor killed the children on suspend and will
             // clear this flag after wake, at which point we start fresh.
             if suspended.load(Ordering::SeqCst) {
-                sleep_until_quit(&quit, std::time::Duration::from_millis(250));
+                sleep_until_quit(&quit, WATCH_POLL);
                 continue;
             }
 
             // Read the spec fresh each spawn so a tray refresh change is
-            // picked up on the next restart.
-            let spec = specs.lock().unwrap()[index].clone();
+            // picked up on the next restart. (The specs vector is only ever
+            // replaced wholesale with the same layout, so `index` stays
+            // valid; the fallback just keeps the never-panic contract.)
+            let Some(spec) = lock_recover(&specs).get(index).cloned() else {
+                sleep_until_quit(&quit, retry_delay(consecutive_failures));
+                continue;
+            };
 
             match spawn_child(&spec) {
                 Ok(child) => {
                     let spawn_time = std::time::Instant::now();
                     healthy.store(true, Ordering::SeqCst);
-                    *current_child.lock().unwrap() = Some(child);
+                    // Clear a stale flag (a kill that raced the previous
+                    // child's exit) before the new child becomes reachable.
+                    killed_on_purpose.store(false, Ordering::SeqCst);
+                    *lock_recover(&current_child) = Some(child);
 
                     // Block until the child exits — or, on quit/suspend,
                     // until it has been force-killed (see below). The lock
@@ -403,7 +474,7 @@ pub fn spawn_and_watch(
                             grace_done = true;
                         }
 
-                        let mut guard = current_child.lock().unwrap();
+                        let mut guard = lock_recover(&current_child);
                         match guard.as_mut() {
                             Some(child) => {
                                 if quit.load(Ordering::SeqCst) || suspended.load(Ordering::SeqCst) {
@@ -417,7 +488,7 @@ pub fn spawn_and_watch(
                                     match child.try_wait() {
                                         Ok(Some(status)) => break Some(status),
                                         _ => {
-                                            let result = child.kill();
+                                            let result = kill_on_purpose(child, &killed_on_purpose);
                                             if !kill_notice_logged {
                                                 match result {
                                                     Ok(()) => crate::logging::append_line(
@@ -448,11 +519,12 @@ pub fn spawn_and_watch(
                             None => break None,
                         }
                         drop(guard);
-                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        std::thread::sleep(WATCH_POLL);
                     };
 
-                    *current_child.lock().unwrap() = None;
+                    *lock_recover(&current_child) = None;
                     healthy.store(false, Ordering::SeqCst);
+                    let deliberate = killed_on_purpose.swap(false, Ordering::SeqCst);
 
                     if quit.load(Ordering::SeqCst) {
                         break;
@@ -463,14 +535,16 @@ pub fn spawn_and_watch(
                     // init after resume): a crash-exit loop must not be
                     // restarted at the base delay forever, hammering the
                     // serial port every few seconds. A child that ran past
-                    // QUICK_EXIT_THRESHOLD (or exited cleanly / was killed
-                    // deliberately, e.g. by the tray menus) resets the
-                    // counter so a normal restart stays immediate.
-                    if is_quick_failure(status, spawn_time.elapsed()) {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                    } else {
-                        consecutive_failures = 0;
-                    }
+                    // QUICK_EXIT_THRESHOLD, exited cleanly, or was killed
+                    // deliberately (tray menus, suspend, stuck-marker
+                    // rescan) resets the counter so a normal restart stays
+                    // immediate.
+                    consecutive_failures = next_consecutive_failures(
+                        consecutive_failures,
+                        status,
+                        spawn_time.elapsed(),
+                        deliberate,
+                    );
 
                     crate::logging::append_line(
                         &spec.log_path,
@@ -728,6 +802,112 @@ mod tests {
         ));
         // No status (spawn-level error path) never counts either.
         assert!(!is_quick_failure(None, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn deliberate_kill_resets_the_failure_counter() {
+        // TerminateProcess → exit code 1 two seconds after spawn: a crash
+        // by the numbers, but the launcher killed it (tray restart, ...).
+        assert_eq!(
+            next_consecutive_failures(
+                3,
+                Some(exit_status_non_success()),
+                Duration::from_secs(2),
+                true
+            ),
+            0
+        );
+        // The same exit without the flag is a crash and grows the backoff.
+        assert_eq!(
+            next_consecutive_failures(
+                3,
+                Some(exit_status_non_success()),
+                Duration::from_secs(2),
+                false
+            ),
+            4
+        );
+        // A long-running child resets the counter either way.
+        assert_eq!(
+            next_consecutive_failures(
+                3,
+                Some(exit_status_non_success()),
+                Duration::from_secs(60),
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            next_consecutive_failures(
+                u32::MAX,
+                Some(exit_status_non_success()),
+                Duration::ZERO,
+                false
+            ),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn lock_recover_survives_a_poisoned_mutex() {
+        let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1, 2, 3]));
+        let poisoner = mutex.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(mutex.is_poisoned());
+        // The data is still usable: a watcher keeps working.
+        assert_eq!(lock_recover(&mutex).get(1).copied(), Some(2));
+    }
+
+    // Unix-only: needs a long-running stand-in child (`sleep`).
+    #[cfg(unix)]
+    #[test]
+    fn kill_named_marks_only_matching_running_children_as_deliberate() {
+        let spawn = || {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        };
+        let handle = |name: &'static str, child: Option<std::process::Child>| ChildHandle {
+            name,
+            healthy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            current_child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+            killed_on_purpose: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let handles = vec![
+            handle("aster-sysinfo", Some(spawn())),
+            handle("asterctl", Some(spawn())),
+            handle("hwbridge", None),
+        ];
+
+        kill_named(&handles, &["aster-sysinfo", "hwbridge"]).unwrap();
+
+        let flag = |i: usize| {
+            handles[i]
+                .killed_on_purpose
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        assert!(flag(0), "killed child is marked deliberate");
+        assert!(!flag(1), "untouched child stays unmarked");
+        assert!(!flag(2), "no child, nothing to mark");
+        let status = lock_recover(&handles[0].current_child)
+            .as_mut()
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!status.success());
+
+        let dir = tempfile::tempdir().unwrap();
+        kill_all(&handles, &dir.path().join("launcher.log"));
+        assert!(flag(1));
+        let _ = lock_recover(&handles[1].current_child)
+            .as_mut()
+            .unwrap()
+            .wait();
     }
 
     #[cfg(unix)]
